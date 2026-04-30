@@ -10,7 +10,7 @@ import torch
 import librosa
 import numpy as np
 
-from utils.infer_utils import (
+from OralService.utils.infer_utils import (
     CharTokenizer,
     Hypothesis,
     ONNXRuntimeError,
@@ -19,8 +19,8 @@ from utils.infer_utils import (
     get_logger,
     read_yaml,
 )
-from utils.frontend import WavFrontend
-from utils.infer_utils import pad_list
+from OralService.utils.frontend import WavFrontend
+from OralService.utils.infer_utils import pad_list
 
 logging = get_logger()
 
