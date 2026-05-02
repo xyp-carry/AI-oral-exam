@@ -22,6 +22,7 @@ class BaseTool(BaseObject):
         await self.event_signal.wait()
 
     async def execute(self, *args, **kwargs) -> Any:
+        await self.start_heartbeat()
         # 1. 审批等待逻辑
         await self.request_approval()
 
@@ -34,11 +35,17 @@ class BaseTool(BaseObject):
         if iscoroutinefunction(run_method):
             # 【异步监测模式】：判定为非密集型 (如调接口、查库)，直接协程挂起等待
             print(f"[{self.name}] -> 启用 异步IO监测模式")
-            return await run_method(*args, **kwargs)
+            
+            res = await run_method(*args, **kwargs)
+            await self.stop_heartbeat()
+            return res
         else:
             # 【多线程监测模式】：判定为密集型 (如复杂计算)，扔进线程池保护事件循环
             print(f"[{self.name}] -> 启用 多线程CPU监测模式")
-            return await asyncio.to_thread(run_method, *args, **kwargs)
+            res = await asyncio.to_thread(run_method, *args, **kwargs)
+            await self.stop_heartbeat()
+            return res
+        
 
 
     @abstractmethod

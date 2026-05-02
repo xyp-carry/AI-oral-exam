@@ -94,6 +94,7 @@ class BaseObject(ABC):
         # Event context for carrying heartbeat and resource usage information.
         self._event_context = EventContext()
         self._heartbeat_interval: float = 5.0
+        self.show_heartbeat: bool = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._resource_collectors: List[Callable[[], Dict[str, Any]]] = []
 
@@ -299,8 +300,8 @@ class BaseObject(ABC):
 
         通常在对象执行关键操作时调用，也可由自动心跳任务定期调用。
         """
-        self._event_context.heartbeat = time.time()
-        # logger.debug(f"{self}: heartbeat updated")
+        # self._event_context.heartbeat = time.time()
+        logger.debug(f"{self}: heartbeat")
 
     def set_heartbeat_interval(self, interval: float):
         """设置自动心跳间隔。
@@ -320,7 +321,8 @@ class BaseObject(ABC):
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             logger.warning(f"{self}: heartbeat task already running")
             return
-
+        
+        self.task_start_time = time.time()
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logger.info(f"{self}: heartbeat started (interval={self._heartbeat_interval}s)")
 
@@ -329,7 +331,8 @@ class BaseObject(ABC):
         while True:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
-                self.update_heartbeat()
+                if self.show_heartbeat:
+                    self.update_heartbeat()
             except asyncio.CancelledError:
                 logger.debug(f"{self}: heartbeat loop cancelled")
                 break
@@ -343,7 +346,7 @@ class BaseObject(ABC):
             except asyncio.CancelledError:
                 pass
             self._heartbeat_task = None
-            logger.info(f"{self}: heartbeat stopped")
+            logger.info(f"{self}: heartbeat stopped and the task run {time.time() - self.task_start_time}s")
 
     def register_resource_collector(self, collector: Callable[[], Dict[str, Any]]):
         """注册资源采集函数。
