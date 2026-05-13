@@ -21,6 +21,15 @@ class Settings(BaseSettings):
 
     mineru_api_key: str = Field(..., description="Mineru API密钥")
 
+    deepseek_url: str = Field(..., description="Deepseek URL")
+    deepseek_model: str = Field(..., description="Deepseek模型名称")
+    deepseek_api_key: str = Field(..., description="Deepseek API密钥")
+
+    kimi_url: str = Field(..., description="Kimi URL")
+    kimi_model: str = Field(..., description="Kimi模型名称")
+    kimi_api_key: str = Field(..., description="Kimi API密钥")
+
+
 
 @lru_cache
 def get_settings() -> Settings:

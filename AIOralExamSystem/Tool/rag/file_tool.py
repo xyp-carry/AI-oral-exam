@@ -126,6 +126,7 @@ class FileParserTool(BaseTool):
             result = response.json()
             all_done = True
             for status in result["data"]["extract_result"]:
+                print(status)
                 if status["state"] != "done":
                     all_done = False
                     break

@@ -48,7 +48,7 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame, EndFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -71,7 +71,19 @@ from OralService.BaseService import save_audio_file
 from OralService.OralLLMService import LLMService
 from OralService.OralSTTService import MetricsFrameLogger
 from OralService.OralTTSService import TTSAudio
+from server import main
+import uvicorn
+import asyncio
 
+from fastapi import File, UploadFile, HTTPException, Depends
+from typing import List, Dict
+from AIOralExamSystem.Tool.rag.data_tool import SearchToolInput, SearchTool, InsertTool
+from AIOralExamSystem.utils.monitor import GlobalMonitor
+from config import get_settings
+from pathlib import Path
+import shutil
+from Authentication.main import auth
+from Authentication.auth import get_current_user
 
 # We use lambdas to defer transport parameter creation until the transport
 # type is selected at runtime.
@@ -91,12 +103,14 @@ transport_params = {
 }
 
 
-async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, current_user: dict):
     logger.info(f"Starting bot")
+    print("XXX", current_user)
+    monitor = GlobalMonitor()
 
-
-    metrics_frame_processor = MetricsFrameLogger()
-    llm = LLMService()
+    history: List[Dict[str, str]] = []
+    metrics_frame_processor = MetricsFrameLogger(history)
+    llm = LLMService(monitor, current_user, history)
     ttsaudio = TTSAudio()
 
     # Create audio buffer processor
@@ -117,15 +131,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline = Pipeline(
         [
             transport.input(),
-            # stt,
             metrics_frame_processor,
-            # llm,
             user_aggregator,
             llm,
+            assistant_aggregator,
             ttsaudio,
             transport.output(),
-            audiobuffer,  # Add audio buffer to pipeline
-            assistant_aggregator,
+            audiobuffer,
+              # Add audio buffer to pipeline
         ]
     )
 
@@ -135,73 +148,66 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
-        idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
+        idle_timeout_secs=100000000,
     )
-
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Start recording audio
-        await audiobuffer.start_recording()
-        # Start conversation - empty prompt to let LLM follow system instructions
-        await task.queue_frames([LLMRunFrame()])
-
-    # @transport.event_handler("on_client_disconnected")
-    # async def on_client_disconnected(transport, client):
-    #     logger.info(f"Client disconnected")
-    #     await task.cancel()
-    
-    # @audiobuffer.event_handler("on_user_turn_audio_data")
-    # async def on_user_turn_audio_data(buffer, audio: bytes, sample_rate: int, num_channels: int):
-    
-    #     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    #     filename = f"recordings1/{timestamp}.wav"
-    #     os.makedirs("recordings1", exist_ok=True)
-    #     print(type(audio), len(audio))
-    #     await save_audio_file(audio, filename, sample_rate, num_channels)
-    #     with open(filename, "rb") as f:
-    #         resp = requests.post(
-    #     "http://localhost:7777/asr" ,
-    #     files={"audio": (filename, f, "audio/wav")},
-    #     data={"language": "auto"},
-    # )
-
-    #     print(resp.json())
-
-
-    
-    @audiobuffer.event_handler("on_audio_data")
-    async def on_audio_data(buffer, audio, sample_rate, num_channels):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"recordings/merged_{timestamp}.wav"
-        os.makedirs("recordings", exist_ok=True)
-        await save_audio_file(audio, filename, sample_rate, num_channels)
-
-    # Handler for separate tracks
-    @audiobuffer.event_handler("on_track_audio_data")
-    async def on_track_audio_data(buffer, user_audio, bot_audio, sample_rate, num_channels):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        os.makedirs("recordings", exist_ok=True)
-
-        # Save user audio
-        user_filename = f"recordings/user_{timestamp}.wav"
-        await save_audio_file(user_audio, user_filename, sample_rate, 1)
-
-        # Save bot audio
-        bot_filename = f"recordings/bot_{timestamp}.wav"
-        await save_audio_file(bot_audio, bot_filename, sample_rate, 1)
+    monitor.task[current_user['uuid']] = task
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+    
     await runner.run(task)
 
 
-async def bot(runner_args: RunnerArguments):
+async def bot(runner_args: RunnerArguments, current_user: dict):
     """Main bot entry point compatible with Pipecat Cloud."""
+    
     transport = await create_transport(runner_args, transport_params)
-    await run_bot(transport, runner_args)
+    await run_bot(transport, runner_args, current_user)
 
+app, args = main()
+app = auth(app, args)
+
+
+settings = get_settings()
+async def setup_monitor(app, args):
+    monitor = GlobalMonitor()
+    await monitor.start()
+
+    config = uvicorn.Config(app, host="0.0.0.0", port=args.port, ssl_keyfile="./key.pem", ssl_certfile="./cert.pem")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+@app.post("/file/get_chunks")
+async def get_chunks(current_user: dict = Depends(get_current_user), files: List[UploadFile] = File(...)):
+    file_paths = []
+    print(current_user)
+    for file in files:
+        save_dir = "./File"
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        Path(f"{save_dir}/{current_user['uuid']}").mkdir(parents=True, exist_ok=True)
+        file_location = f"{save_dir}/{current_user['uuid']}/{file.filename}"
+        file_paths.append(file_location)
+    try:
+        for file_location in file_paths:
+            with open(file_location, "wb+") as file_object:
+                    # shutil.copyfileobj 高效地复制文件流
+                    shutil.copyfileobj(file.file, file_object)
+        file_tool = InsertTool("insert_tool", settings.mineru_api_key)
+        await file_tool.execute(data=file_paths, source=current_user['uuid'], type="file")
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        raise HTTPException(status_code=500, detail=f"处理文件时出错: {str(e)}")
+@app.post("/close")
+async def close(current_user: dict = Depends(get_current_user)):
+    monitor = GlobalMonitor()
+    task = monitor.task.get(current_user['uuid'])
+    if task:
+        await task.cancel()
+        await task.cleanup()
+        monitor.task.pop(current_user['uuid'])
 
 if __name__ == "__main__":
-    from pipecat.runner.run import main
+    asyncio.run(setup_monitor(app, args))
 
-    main()
+    # from pipecat.runner.run import main
+    # main()
+    

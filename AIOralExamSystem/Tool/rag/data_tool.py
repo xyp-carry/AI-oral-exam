@@ -67,7 +67,6 @@ class InsertTool(BaseTool):
         self.description = """将文档插入到索引中"""
         self.client = Client("http://localhost:7700")
         self.fileParser = FileParserTool(token, "file_parser")
-        self.token = token
 
     
     async def _run(self, data: list | str, source: str, type:str = "file") -> str:
@@ -100,7 +99,7 @@ class InsertTool(BaseTool):
                         ]
                     },
                     "headers": {
-                        "Authorization": f"Bearer {self.token}"
+                        "Authorization": "Bearer f3243c87fe4547698d5beee226f71452.3UGVyBevympxI2TA"
                     }
                 }
             },
