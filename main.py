@@ -32,14 +32,14 @@ import asyncio
 import json
 import re
 
-from fastapi import File, UploadFile, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import File, UploadFile, HTTPException, Depends, Form
 from typing import List, Dict
 from AIOralExamSystem.Tool.rag.data_tool import SearchToolInput, SearchTool, InsertTool
 from AIOralExamSystem.utils.monitor import GlobalMonitor
-from AIOralExamSystem.Exam.QAserver import QAserver
+from AIOralExamSystem.Exam.Examdata import get_available_exam_item_by_exam_id, get_exam_session_by_exam_id
 from AIOralExamSystem.Exam.examSetter import ExamSetterAgent
 from AIOralExamSystem.Exam.examObject import CandidateExamState, Question
+from AIOralExamSystem.url import exam_routes
 from config import get_settings
 from pathlib import Path
 import shutil
@@ -64,85 +64,7 @@ transport_params = {
 }
 
 
-DEFAULT_PREPARED_QUESTION_COUNT = 1
 DEFAULT_INITIAL_SCORE = 5.0
-
-
-class CourseCreateRequest(BaseModel):
-    course_name: str
-    description: str | None = None
-
-
-class CourseUpdateRequest(BaseModel):
-    course_name: str | None = None
-    description: str | None = None
-
-
-class ExamItemDimension(BaseModel):
-    name: str
-    score: float
-
-
-class ExamItemCreateRequest(BaseModel):
-    exam_item_name: str
-    dimensions: List[ExamItemDimension]
-    description: str | None = None
-    item_type: str | None = None
-
-
-class ExamItemUpdateRequest(BaseModel):
-    exam_item_name: str | None = None
-    dimensions: List[ExamItemDimension] | None = None
-    description: str | None = None
-    item_type: str | None = None
-
-
-def course_error_detail(code: str, message: str) -> dict:
-    return {
-        "code": code,
-        "message": message,
-    }
-
-
-def raise_course_value_error(error: ValueError) -> None:
-    message = str(error)
-    if message == "COURSE_NAME_EXISTS":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("COURSE_NAME_EXISTS", "课程名称已存在"),
-        )
-    if message == "COURSE_NAME_REQUIRED":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("COURSE_NAME_REQUIRED", "课程名称不能为空"),
-        )
-    if message == "EXAM_ITEM_NAME_EXISTS":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("EXAM_ITEM_NAME_EXISTS", "考试项名称已存在"),
-        )
-    if message == "EXAM_ITEM_NAME_REQUIRED":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("EXAM_ITEM_NAME_REQUIRED", "考试项名称不能为空"),
-        )
-    if message == "EXAM_ITEM_DIMENSIONS_REQUIRED":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("EXAM_ITEM_DIMENSIONS_REQUIRED", "考试项维度不能为空"),
-        )
-    if message == "EXAM_ITEM_DIMENSION_NAME_REQUIRED":
-        raise HTTPException(
-            status_code=400,
-            detail=course_error_detail("EXAM_ITEM_DIMENSION_NAME_REQUIRED", "考试项维度名称不能为空"),
-        )
-    raise HTTPException(status_code=400, detail=message)
-
-
-def dimensions_to_scores(dimensions: List[ExamItemDimension] | None) -> Dict[str, float] | None:
-    if dimensions is None:
-        return None
-    return {item.name: item.score for item in dimensions}
 
 
 def parse_outer_json_block(response: str) -> dict:
@@ -174,40 +96,69 @@ def get_agent_response_content(response) -> str:
 async def prepare_initial_questions(
     current_user: dict,
     exam_state: CandidateExamState,
-    question_count: int = DEFAULT_PREPARED_QUESTION_COUNT,
 ) -> CandidateExamState:
+    question_dimensions = exam_state.get_configured_dimensions()
+    if not question_dimensions:
+        raise ValueError("当前考试项没有配置考试维度")
+    question_count = len(question_dimensions)
     settings = get_settings()
+    course_id = current_user.get("course_id")
+    exam_id = current_user.get("exam_id")
+    file_local_address = current_user.get("file_local_address") or (
+        f"{course_id}/{exam_id}" if course_id and exam_id else None
+    )
+    code_local_address = current_user.get("code_local_address") or (
+        f"{course_id}/{exam_id}/main" if course_id and exam_id else None
+    )
     exam_setter = ExamSetterAgent(
         settings.model_dump(mode="json"),
         current_user["uuid"],
         thinking=False,
         response_format=True,
         temperature=0,
+        question_count=question_count,
+        question_dimensions=question_dimensions,
+        course_id=course_id,
+        exam_id=exam_id,
+        file_local_address=file_local_address,
+        code_local_address=code_local_address,
     )
 
-    response = await exam_setter.run(history=[{
-        "role": "user",
-        "content": (
-            f"请先读取当前用户全部相关资料，然后生成 {question_count} 个初始化口试问题。"
-            "这些问题需要覆盖不同考察维度，并用于放入 prepared_question_queue。"
-        ),
-    }])
+    response = await exam_setter.run(
+        history=[{
+            "role": "user",
+            "content": (
+                f"这是首次生成题目。请先调用 search，并使用 query=\"\" 读取当前用户全部相关资料，"
+                f"读完所需批次后生成 {question_count} 个初始化口试问题。"
+                "题目必须依次覆盖已配置的考试维度，并用于放入 prepared_question_queue。"
+            ),
+        }],
+        question_count=question_count,
+        question_dimensions=question_dimensions,
+        is_initial_generation=True,
+    )
     question_doc = parse_outer_json_block(get_agent_response_content(response))
     questions = question_doc.get("questions", [])[:question_count]
+    if len(questions) != question_count:
+        raise ValueError("初始题目数量与考试维度数量不一致")
 
     for index, item in enumerate(questions, start=1):
-        dimension = str(item.get("dimension", "initial"))
+        dimension = question_dimensions[index - 1]
+        content = str(item.get("Question", item.get("question", ""))).strip()
+        if not content:
+            raise ValueError(f"维度 {dimension} 未生成有效初始题目")
         question = Question(
             question_id=str(item.get("id", f"prepared-{index}")),
-            content=str(item.get("Question", item.get("question", ""))).strip(),
+            content=content,
             dimension=dimension,
+            question_blocks=item.get("question_blocks", []),
+            code_fragments=item.get("code_fragments", []),
             score=float(item.get("score", 1.0)),
             standard_answer=item.get("standard_answer"),
             based_on_record_index=-1,
             source_detail=str(item.get("reason", question_doc.get("project_summary", ""))),
         )
-        if question.content:
-            exam_state.add_prepared_question(question)
+        exam_state.add_prepared_question(question)
 
     logger.info(
         f"Prepared {len(exam_state.prepared_question_queue)} initial questions "
@@ -218,22 +169,45 @@ async def prepare_initial_questions(
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, exam_info: dict, current_user: dict):
     logger.info(f"Starting bot")
+
+    exam_id = str(exam_info.get("exam_id", "")).strip()
+    if not exam_id:
+        raise ValueError("exam_info 缺少 exam_id")
+    exam_session = await get_exam_session_by_exam_id(exam_id)
+    if not exam_session:
+        raise ValueError("考试记录不存在")
+    current_user_id = str(current_user.get("uuid") or current_user.get("id") or current_user.get("user_id") or "")
+    if current_user_id and str(exam_session.get("user_id")) != current_user_id:
+        raise ValueError("当前用户无权开启该考试")
+    exam_item = await get_available_exam_item_by_exam_id(exam_id)
+    if not exam_item:
+        raise ValueError("考试项不存在或不在可开启时间内")
+    dimensions = exam_item.get("dimension_names") or []
+    if not dimensions:
+        raise ValueError("当前考试项没有配置考试维度")
+    course_id = exam_item.get("course_id")
+    file_local_address = f"{course_id}/{exam_id}" if course_id and exam_id else None
+    code_local_address = f"{course_id}/{exam_id}/main" if course_id and exam_id else None
+    exam_user = {
+        **current_user,
+        "exam_id": exam_id,
+        "course_id": course_id,
+        "file_local_address": file_local_address,
+        "code_local_address": code_local_address,
+    }
     
     monitor = GlobalMonitor()
     
     history: List[Dict[str, str]] = []
     exam_state = CandidateExamState(
         initial_score=DEFAULT_INITIAL_SCORE,
+        dimensions=dimensions,
     )
 
-    await prepare_initial_questions(
-        current_user=current_user,
-        exam_state=exam_state,
-        question_count=DEFAULT_PREPARED_QUESTION_COUNT,
-    )
+
 
     metrics_frame_processor = MetricsFrameLogger(history)
-    llm = InterviewService(monitor, current_user, history, exam_state=exam_state)
+    llm = InterviewService(monitor, exam_user, history, exam_state=exam_state)
     ttsaudio = TTSAudio()
 
     # Create audio buffer processor
@@ -273,10 +247,14 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, exam_i
         ),
         idle_timeout_secs=100000000,
     )
-    monitor.task[current_user['uuid']] = task
+    monitor.task[exam_user['uuid']] = task
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
     
+    await prepare_initial_questions(
+        current_user=exam_user,
+        exam_state=exam_state,
+    )
     await runner.run(task)
 
 
@@ -288,6 +266,7 @@ async def bot(runner_args: RunnerArguments, exam_info: dict, current_user: dict)
 
 app, args = main()
 app = auth(app, args)
+app = exam_routes(app, args)
 
 
 settings = get_settings()
@@ -299,15 +278,24 @@ async def setup_monitor(app, args):
     server = uvicorn.Server(config)
     await server.serve()
 
+
+# ==================== 文件与会话控制 ====================
+# 上传资料文件并写入当前用户的检索数据源。
 @app.post("/file/get_chunks")
-async def get_chunks(current_user: dict = Depends(get_current_user), files: List[UploadFile] = File(...)):
+async def get_chunks(
+    course_id: str = Form(...),
+    exam_id: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+    files: List[UploadFile] = File(...),
+):
     file_paths = []
     print(current_user)
+    upload_work_dir = f"./updateFile/{current_user['uuid']}/{course_id}/{exam_id}"
     for file in files:
         save_dir = "./updateFile"
         Path(save_dir).mkdir(parents=True, exist_ok=True)
-        Path(f"{save_dir}/{current_user['uuid']}").mkdir(parents=True, exist_ok=True)
-        file_location = f"{save_dir}/{current_user['uuid']}/{file.filename}"
+        Path(upload_work_dir).mkdir(parents=True, exist_ok=True)
+        file_location = f"{upload_work_dir}/{file.filename}"
         file_paths.append(file_location)
     try:
         for file_location in file_paths:
@@ -315,245 +303,29 @@ async def get_chunks(current_user: dict = Depends(get_current_user), files: List
                     # shutil.copyfileobj 高效地复制文件流
                     shutil.copyfileobj(file.file, file_object)
         file_tool = InsertTool("insert_tool", settings.mineru_api_key)
-        await file_tool.execute(data=file_paths, source=current_user['uuid'], type="file")
+        await file_tool.execute(
+            data=file_paths,
+            source=current_user['uuid'],
+            type="file",
+            course_id=course_id,
+            exam_id=exam_id,
+            work_dir=upload_work_dir,
+        )
     except Exception as e:
         logger.error(f"Error processing file: {e}")
         raise HTTPException(status_code=500, detail=f"处理文件时出错: {str(e)}")
-    
+
+# 结束当前用户正在进行的口试任务并清理运行状态。
 @app.post("/close")
 async def close(current_user: dict = Depends(get_current_user)):
     monitor = GlobalMonitor()
+    print(monitor.task)
     task = monitor.task.get(current_user['uuid'])
     if task:
+        # await task.queue_frame(EndFrame())
         await task.cancel()
         await task.cleanup()
         monitor.task.pop(current_user['uuid'])
-
-
-@app.get("/exam_history")
-async def exam_history(current_user: dict = Depends(get_current_user)):
-    try:
-        history = await QAserver.get_exam_history(current_user)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("查询考试历史失败")
-        raise HTTPException(status_code=500, detail=f"查询考试历史失败: {str(e)}")
-    return {
-        "success": True,
-        "data": history,
-    }
-
-
-@app.get("/exam_record")
-async def exam_record(exam_id: str, current_user: dict = Depends(get_current_user)):
-    try:
-        records = await QAserver.get_exam_record(current_user, exam_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.exception("查询考试记录失败")
-        raise HTTPException(status_code=500, detail=f"查询考试记录失败: {str(e)}")
-    return {
-        "success": True,
-        "data": records,
-    }
-
-
-@app.post("/courses")
-async def create_course(req: CourseCreateRequest, current_user: dict = Depends(get_current_user)):
-    try:
-        result = await QAserver.create_course(
-            current_user=current_user,
-            course_name=req.course_name,
-            description=req.description,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except ValueError as e:
-        raise_course_value_error(e)
-    except Exception as e:
-        logger.exception("创建课程失败")
-        raise HTTPException(status_code=500, detail=f"创建课程失败: {str(e)}")
-    return {
-        "success": True,
-        "message": "课程创建成功",
-        "data": result,
-    }
-
-
-@app.get("/courses")
-async def list_courses(current_user: dict = Depends(get_current_user)):
-    try:
-        courses = await QAserver.list_courses(current_user)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except Exception as e:
-        logger.exception("查询课程失败")
-        raise HTTPException(status_code=500, detail=f"查询课程失败: {str(e)}")
-    return {
-        "success": True,
-        "data": courses,
-    }
-
-
-@app.put("/courses/{course_id}")
-async def update_course(
-    course_id: str,
-    req: CourseUpdateRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        updated = await QAserver.update_course(
-            current_user=current_user,
-            course_id=course_id,
-            course_name=req.course_name,
-            description=req.description,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except ValueError as e:
-        raise_course_value_error(e)
-    except Exception as e:
-        logger.exception("修改课程失败")
-        raise HTTPException(status_code=500, detail=f"修改课程失败: {str(e)}")
-    if not updated:
-        raise HTTPException(
-            status_code=404,
-            detail=course_error_detail("COURSE_NOT_FOUND", "课程不存在或无权修改"),
-        )
-    return {
-        "success": True,
-        "message": "课程修改成功",
-    }
-
-
-@app.delete("/courses/{course_id}")
-async def delete_course(course_id: str, current_user: dict = Depends(get_current_user)):
-    try:
-        deleted = await QAserver.delete_course(current_user, course_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except Exception as e:
-        logger.exception("删除课程失败")
-        raise HTTPException(status_code=500, detail=f"删除课程失败: {str(e)}")
-    if not deleted:
-        raise HTTPException(
-            status_code=404,
-            detail=course_error_detail("COURSE_NOT_FOUND", "课程不存在或无权删除"),
-        )
-    return {
-        "success": True,
-        "message": "课程删除成功",
-    }
-
-
-@app.post("/courses/{course_id}/exam_items")
-async def create_exam_item(
-    course_id: str,
-    req: ExamItemCreateRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        result = await QAserver.create_exam_item(
-            current_user=current_user,
-            course_id=course_id,
-            exam_item_name=req.exam_item_name,
-            dimension_scores=dimensions_to_scores(req.dimensions) or {},
-            description=req.description,
-            item_type=req.item_type,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except ValueError as e:
-        raise_course_value_error(e)
-    except Exception as e:
-        logger.exception("创建考试项失败")
-        raise HTTPException(status_code=500, detail=f"创建考试项失败: {str(e)}")
-    return {
-        "success": True,
-        "message": "考试项创建成功",
-        "data": result,
-    }
-
-
-@app.get("/courses/{course_id}/exam_items")
-async def list_exam_items(course_id: str, current_user: dict = Depends(get_current_user)):
-    try:
-        items = await QAserver.list_exam_items(current_user, course_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except Exception as e:
-        logger.exception("查询考试项失败")
-        raise HTTPException(status_code=500, detail=f"查询考试项失败: {str(e)}")
-    return {
-        "success": True,
-        "data": items,
-    }
-
-
-@app.put("/courses/{course_id}/exam_items/{exam_item_id}")
-async def update_exam_item(
-    course_id: str,
-    exam_item_id: str,
-    req: ExamItemUpdateRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        updated = await QAserver.update_exam_item(
-            current_user=current_user,
-            course_id=course_id,
-            exam_item_id=exam_item_id,
-            exam_item_name=req.exam_item_name,
-            dimension_scores=dimensions_to_scores(req.dimensions),
-            description=req.description,
-            item_type=req.item_type,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except ValueError as e:
-        raise_course_value_error(e)
-    except Exception as e:
-        logger.exception("修改考试项失败")
-        raise HTTPException(status_code=500, detail=f"修改考试项失败: {str(e)}")
-    if not updated:
-        raise HTTPException(
-            status_code=404,
-            detail=course_error_detail("EXAM_ITEM_NOT_FOUND", "考试项不存在或无权修改"),
-        )
-    return {
-        "success": True,
-        "message": "考试项修改成功",
-    }
-
-
-@app.delete("/courses/{course_id}/exam_items/{exam_item_id}")
-async def delete_exam_item(
-    course_id: str,
-    exam_item_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    try:
-        deleted = await QAserver.delete_exam_item(current_user, course_id, exam_item_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-    except Exception as e:
-        logger.exception("删除考试项失败")
-        raise HTTPException(status_code=500, detail=f"删除考试项失败: {str(e)}")
-    if not deleted:
-        raise HTTPException(
-            status_code=404,
-            detail=course_error_detail("EXAM_ITEM_NOT_FOUND", "考试项不存在或无权删除"),
-        )
-    return {
-        "success": True,
-        "message": "考试项删除成功",
-    }
-
 
 if __name__ == "__main__":
     asyncio.run(setup_monitor(app, args))

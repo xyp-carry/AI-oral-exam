@@ -20,17 +20,23 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 class GitRepositoryToolInput(BaseModel):
     repo_url: str = Field(description="Git repository URL.")
     user_uuid: str = Field(description="Current user uuid used to scope repository cache.")
+    course_id: Optional[str] = Field(default=None, description="Optional course id for exam-scoped repository cache.")
+    exam_id: Optional[str] = Field(default=None, description="Optional exam id for exam-scoped repository cache.")
+    git_branch: Optional[str] = Field(default=None, description="Optional branch folder name for exam-scoped repository cache.")
     code_path: Optional[str] = Field(default=None, description="Optional code directory or file path in the repository.")
     doc_path: Optional[str] = Field(default=None, description="Optional document directory or file path in the repository.")
     storage_dir: Optional[str] = Field(default=None, description="Optional storage root. Defaults to the project root directory.")
     branch: Optional[str] = Field(default=None, description="Optional branch, tag, or commit-ish to fetch.")
     accelerator_urls: Optional[list[str]] = Field(default=None, description="Optional git or zip accelerator URL prefixes.")
+    reload: bool = Field(default=False, description="Force refresh repository cache and fetch the repository again.")
 
 
 GitRepositoryDescription = (
     "Fetch a git repository for a user. If code_path or doc_path is provided, copy those repository paths into "
-    "Gitrepositorys/{user_uuid}/{repo}/code and/or doc, then return readable file contents. If neither path is "
-    "provided, return repository files with their directory hierarchy and do not store code/doc files."
+    "Gitrepositorys/{user_uuid}/{repo}/code and/or doc, or into "
+    "Gitrepositorys/{user_uuid}/{course_id}/{exam_id}/{git_branch}/code and/or doc when exam-scoped fields are "
+    "provided, then return readable file contents. If neither path is provided, return repository files with their "
+    "directory hierarchy and do not store code/doc files."
 )
 
 
@@ -50,6 +56,10 @@ class GitRepositoryTool(BaseTool):
         storage_dir: Optional[str] = None,
         branch: Optional[str] = None,
         accelerator_urls: Optional[list[str]] = None,
+        course_id: Optional[str] = None,
+        exam_id: Optional[str] = None,
+        git_branch: Optional[str] = None,
+        reload: bool = False,
     ) -> str:
         with ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
@@ -63,6 +73,10 @@ class GitRepositoryTool(BaseTool):
                 storage_dir,
                 branch,
                 accelerator_urls,
+                course_id,
+                exam_id,
+                git_branch,
+                reload,
             )
 
     def fetch_repository(
@@ -74,10 +88,17 @@ class GitRepositoryTool(BaseTool):
         storage_dir: Optional[str] = None,
         branch: Optional[str] = None,
         accelerator_urls: Optional[list[str]] = None,
+        course_id: Optional[str] = None,
+        exam_id: Optional[str] = None,
+        git_branch: Optional[str] = None,
+        reload: bool = False,
     ) -> str:
         logs = []
         repo_url = self._require_text(repo_url, "repo_url")
         user_uuid = self._require_text(user_uuid, "user_uuid")
+        course_id = self._normalize_optional_path(course_id)
+        exam_id = self._normalize_optional_path(exam_id)
+        git_branch = self._normalize_optional_path(git_branch)
         code_path = self._normalize_optional_path(code_path)
         doc_path = self._normalize_optional_path(doc_path)
         branch = branch.strip() if branch and branch.strip() else None
@@ -90,9 +111,13 @@ class GitRepositoryTool(BaseTool):
             "Start fetching repository.",
             repo_url=repo_url,
             user_uuid=user_uuid,
+            course_id=course_id,
+            exam_id=exam_id,
+            git_branch=git_branch,
             code_path=code_path,
             doc_path=doc_path,
             branch=branch,
+            reload=reload,
             accelerator_count=len(accelerator_urls),
         )
 
@@ -101,17 +126,20 @@ class GitRepositoryTool(BaseTool):
                 self._append_log(logs, "mode", "success", "No code_path/doc_path provided; listing files and tree only.")
                 return self._list_repository_directories(repo_url, branch, accelerator_urls, logs)
 
-            repo_root = self._repo_cache_root(storage_dir, user_uuid, repo_url)
+            repo_root = self._repo_cache_root(storage_dir, user_uuid, repo_url, course_id, exam_id, git_branch)
             manifest_path = repo_root / "manifest.json"
             self._append_log(logs, "cache_check", "success", "Checking local repository cache.", repository_root=str(repo_root))
 
-            cached = self._read_cached_result(repo_root, manifest_path, repo_url, code_path, doc_path, branch)
-            if cached is not None:
-                self._append_log(logs, "cache_hit", "success", "Matched local cache; reading stored files.")
-                cached["logs"] = logs
-                return json.dumps(cached, ensure_ascii=False)
+            if not reload:
+                cached = self._read_cached_result(repo_root, manifest_path, repo_url, code_path, doc_path, branch)
+                if cached is not None:
+                    self._append_log(logs, "cache_hit", "success", "Matched local cache; reading stored files.")
+                    cached["logs"] = logs
+                    return json.dumps(cached, ensure_ascii=False)
 
-            self._append_log(logs, "cache_miss", "success", "No matching cache found; preparing repository storage.")
+                self._append_log(logs, "cache_miss", "success", "No matching cache found; preparing repository storage.")
+            else:
+                self._append_log(logs, "cache_reload", "success", "Reload requested; rebuilding repository storage.")
             if repo_root.exists():
                 shutil.rmtree(repo_root)
                 self._append_log(logs, "storage_cleanup", "success", "Removed stale repository cache.")
@@ -157,6 +185,9 @@ class GitRepositoryTool(BaseTool):
                     "repo_url": repo_url,
                     "safe_repo_name": repo_root.name,
                     "user_uuid": user_uuid,
+                    "course_id": course_id,
+                    "exam_id": exam_id,
+                    "git_branch": git_branch,
                     "branch": branch,
                     "code_path": code_path,
                     "doc_path": doc_path,
@@ -664,8 +695,25 @@ class GitRepositoryTool(BaseTool):
             raise ValueError(f"Path escapes repository root: {requested_path}")
         return candidate
 
-    def _repo_cache_root(self, storage_dir: Optional[str], user_uuid: str, repo_url: str) -> Path:
+    def _repo_cache_root(
+        self,
+        storage_dir: Optional[str],
+        user_uuid: str,
+        repo_url: str,
+        course_id: Optional[str] = None,
+        exam_id: Optional[str] = None,
+        git_branch: Optional[str] = None,
+    ) -> Path:
         root = Path(storage_dir).expanduser() if storage_dir and storage_dir.strip() else self._default_storage_root()
+        if course_id and exam_id and git_branch:
+            return (
+                root
+                / "Gitrepositorys"
+                / self._safe_path_part(user_uuid)
+                / self._safe_path_part(course_id)
+                / self._safe_path_part(exam_id)
+                / self._safe_path_part(git_branch)
+            )
         return root / "Gitrepositorys" / self._safe_path_part(user_uuid) / self._safe_path_part(repo_url)
 
     def _default_storage_root(self) -> Path:
@@ -702,8 +750,6 @@ class GitRepositoryTool(BaseTool):
             ".bmp",
             ".class",
             ".dll",
-            ".doc",
-            ".docx",
             ".exe",
             ".gif",
             ".ico",
@@ -713,7 +759,6 @@ class GitRepositoryTool(BaseTool):
             ".lock",
             ".mp3",
             ".mp4",
-            ".pdf",
             ".png",
             ".pyc",
             ".rar",

@@ -8,6 +8,7 @@ import time
 import asyncio
 from urllib.parse import urlparse
 import glob
+from pathlib import Path
 
 class FileParserTool(BaseTool):
     """文件解析工具"""
@@ -20,7 +21,7 @@ class FileParserTool(BaseTool):
             "Authorization": f"Bearer {token}"
         }
 
-    async def _run(self, file_paths: list) -> str:
+    async def _run(self, file_paths: list, work_dir: str | None = None) -> str:
         """
         query: 用户查询的信息
         source: 用户的id，用于指定查询的文档来源
@@ -30,18 +31,28 @@ class FileParserTool(BaseTool):
             chunks = await loop.run_in_executor(
                 executor,
                 self.getfile,
-                file_paths
+                file_paths,
+                work_dir,
             )
         return chunks
     
-    def getfile(self, file_paths: list):
+    def getfile(self, file_paths: list, work_dir: str | None = None):
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+        work_root = self._resolve_work_root(work_dir)
+        zip_dir = work_root / "zips"
+        extract_dir = work_root / "extracted"
         res = self.batch_upload(file_paths)
+        if not res:
+            raise RuntimeError("MinerU batch upload failed; no batch result returned.")
         batch_id = res["batch_id"]
-        zip_paths = self.download_zip(batch_id, "./FILE/")
+        zip_paths = self.download_zip(batch_id, str(zip_dir))
 
         file_chunks = []
         for zip_path in zip_paths:
-            file_path = self.unzip_file(zip_path, "./newfile", os.path.basename(zip_path))
+            file_path = self.unzip_file(zip_path, str(extract_dir), os.path.basename(zip_path))
+            if not file_path:
+                continue
             md_files = glob.glob(os.path.join(file_path, "**", "full.md"), recursive=True)
             print(md_files)
             if not md_files:
@@ -53,6 +64,21 @@ class FileParserTool(BaseTool):
                 file_chunks.append(md_content)
         
         return file_chunks
+
+    def _resolve_work_root(self, work_dir: str | None) -> Path:
+        if work_dir and str(work_dir).strip():
+            root = Path(str(work_dir).strip()).expanduser()
+        else:
+            root = self._project_root() / "FILE"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _project_root(self) -> Path:
+        current_file = Path(__file__).resolve()
+        for parent in current_file.parents:
+            if parent.name == "AIOralExamSystem":
+                return parent.parent
+        return Path.cwd()
 
     def get_description(self) -> str:
         return self.description

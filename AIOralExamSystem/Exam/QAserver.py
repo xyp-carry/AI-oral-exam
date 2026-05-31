@@ -5,21 +5,30 @@ from typing import Dict, List, Optional
 
 from loguru import logger
 
+from Authentication.database import db as auth_db
 from AIOralExamSystem.Exam.Examdata import (
+    approve_course_join_request_by_user,
     create_course as create_course_record,
     create_exam_item as create_exam_item_record,
     delete_course as delete_course_record,
     delete_exam_item as delete_exam_item_record,
+    get_course_by_invite_code as get_course_by_invite_code_record,
     get_exam_history_by_user,
+    get_exam_item_by_id,
     get_exam_record_by_exam_id,
     get_teacher_course_ids,
     is_course_owner,
     is_student_in_course,
     is_teacher_of_course,
     list_all_courses,
+    list_course_join_requests,
+    list_exam_sessions_by_course_and_user,
     list_exam_items_by_course,
     list_student_courses,
     list_teacher_courses,
+    request_join_course,
+    reset_course_invite_code as reset_course_invite_code_record,
+    reset_exam_item_availability as reset_exam_item_availability_record,
     save_exam_data,
     update_course as update_course_record,
     update_exam_item as update_exam_item_record,
@@ -64,12 +73,20 @@ class QAserver:
 
         settings = get_settings()
         model_settings = settings.model_dump(mode="json")
+        course_id = current_user.get("course_id")
+        exam_id = current_user.get("exam_id")
+        file_local_address = f"{course_id}/{exam_id}" if course_id and exam_id else None
+        code_local_address = f"{course_id}/{exam_id}/main" if course_id and exam_id else None
         self.exam_setter = ExamSetterAgent(
             model_settings,
             current_user["uuid"],
             thinking=False,
             response_format=True,
             temperature=0,
+            course_id=course_id,
+            exam_id=exam_id,
+            file_local_address=file_local_address,
+            code_local_address=code_local_address,
         )
         self.stage_judger = StageJudgerAgent(
             model_settings,
@@ -133,137 +150,213 @@ class QAserver:
         }
 
     @classmethod
-    async def create_course(
+    async def manage_course(
         cls,
         current_user: dict,
-        course_name: str,
-        description: Optional[str] = None,
-    ) -> Dict[str, object]:
-        role = cls.get_user_role(current_user)
-        user_id = cls.get_user_id(current_user)
-        if role not in cls.TEACHER_ROLES and role not in cls.ADMIN_ROLES:
-            raise PermissionError("只有教师可以创建课程")
-        if not user_id:
-            raise PermissionError("当前用户缺少 user_id")
-        course_id = await create_course_record(
-            course_name=course_name,
-            owner_teacher_id=user_id,
-            description=description,
-        )
-        return {"course_id": course_id}
-
-    @classmethod
-    async def list_courses(cls, current_user: dict) -> List[Dict[str, object]]:
-        role = cls.get_user_role(current_user)
-        user_id = cls.get_user_id(current_user)
-        if role in cls.ADMIN_ROLES:
-            return await list_all_courses()
-        if not user_id:
-            raise PermissionError("当前用户缺少 user_id")
-        if role in cls.TEACHER_ROLES:
-            return await list_teacher_courses(user_id)
-        return await list_student_courses(user_id)
-
-    @classmethod
-    async def update_course(
-        cls,
-        current_user: dict,
-        course_id: str,
+        action: str,
+        course_id: Optional[str] = None,
         course_name: Optional[str] = None,
         description: Optional[str] = None,
-    ) -> bool:
+        invite_code_valid_times: Optional[int] = None,
+    ):
         role = cls.get_user_role(current_user)
         user_id = cls.get_user_id(current_user)
+        action = str(action).strip().lower()
+
+        if action == "list":
+            if role in cls.ADMIN_ROLES:
+                return await list_all_courses()
+            if not user_id:
+                raise PermissionError("当前用户缺少 user_id")
+            if role in cls.TEACHER_ROLES:
+                return await list_teacher_courses(user_id)
+            return await list_student_courses(user_id)
+
+        if action == "create":
+            if role not in cls.TEACHER_ROLES and role not in cls.ADMIN_ROLES:
+                raise PermissionError("只有教师可以创建课程")
+            if not user_id:
+                raise PermissionError("当前用户缺少 user_id")
+            return await create_course_record(
+                course_name=course_name,
+                owner_teacher_id=user_id,
+                description=description,
+                invite_code_valid_times=(
+                    2592000 if invite_code_valid_times is None else invite_code_valid_times
+                ),
+            )
+
+        if action not in {"update", "delete", "reset_invite_code"}:
+            raise ValueError(f"Unsupported course action: {action}")
         if role not in cls.TEACHER_ROLES:
-            raise PermissionError("只有课程主负责老师可以修改课程")
+            raise PermissionError("只有课程主负责老师可以修改或删除课程")
         if not user_id:
             raise PermissionError("当前教师用户缺少 user_id")
-        return await update_course_record(
-            course_id=course_id,
-            owner_teacher_id=user_id,
-            course_name=course_name,
-            description=description,
-        )
+        if not course_id:
+            raise ValueError("course_id is required")
+
+        if action == "reset_invite_code":
+            if not await is_course_owner(user_id, course_id):
+                raise PermissionError("只有课程主负责老师可以重置课程邀请码")
+            return await reset_course_invite_code_record(
+                course_id=course_id,
+                invite_code_valid_times=invite_code_valid_times,
+            )
+
+        if action == "update":
+            return await update_course_record(
+                course_id=course_id,
+                owner_teacher_id=user_id,
+                course_name=course_name,
+                description=description,
+            )
+        return await delete_course_record(course_id=course_id, owner_teacher_id=user_id)
 
     @classmethod
-    async def delete_course(cls, current_user: dict, course_id: str) -> bool:
-        role = cls.get_user_role(current_user)
-        user_id = cls.get_user_id(current_user)
-        if role not in cls.TEACHER_ROLES:
-            raise PermissionError("只有课程主负责老师可以删除课程")
-        if not user_id:
-            raise PermissionError("当前教师用户缺少 user_id")
-        return await delete_course_record(
-            course_id=course_id,
-            owner_teacher_id=user_id,
-        )
-
-    @classmethod
-    async def create_exam_item(
+    async def manage_course_join_request(
         cls,
         current_user: dict,
+        action: str,
         course_id: str,
-        exam_item_name: str,
-        dimension_scores: Dict[str, float],
-        description: Optional[str] = None,
-        item_type: Optional[str] = None,
-    ) -> Dict[str, object]:
-        user_id = cls.get_user_id(current_user)
+        target_user_id: Optional[str] = None,
+    ):
         role = cls.get_user_role(current_user)
-        if role not in cls.TEACHER_ROLES and role not in cls.ADMIN_ROLES:
-            raise PermissionError("只有课程主负责老师可以创建考试项")
+        user_id = cls.get_user_id(current_user)
+        action = str(action).strip().lower()
         if not user_id:
             raise PermissionError("当前用户缺少 user_id")
-        if not await is_course_owner(user_id, course_id):
-            raise PermissionError("只有课程主负责老师可以创建考试项")
-        exam_item_id = await create_exam_item_record(
-            course_id=course_id,
-            exam_item_name=exam_item_name,
-            created_by=user_id,
-            dimension_scores=dimension_scores,
-            description=description,
-            item_type=item_type,
-        )
-        return {"exam_item_id": exam_item_id}
+        if not course_id:
+            raise ValueError("course_id is required")
+
+        if action == "create":
+            request_id = await request_join_course(course_id=course_id, user_id=user_id)
+            return {"request_id": request_id}
+
+        if action == "list":
+            if role not in cls.TEACHER_ROLES:
+                raise PermissionError("只有课程教师可以查看课程申请")
+            if not await is_teacher_of_course(user_id, course_id):
+                raise PermissionError("无权查看该课程的申请")
+            return await list_course_join_requests(teacher_id=user_id, course_id=course_id)
+
+        if action == "approve":
+            if not target_user_id:
+                raise ValueError("user_id is required")
+            if not await is_teacher_of_course(user_id, course_id):
+                raise PermissionError("审批教师不是该课程的有效教师")
+            target_user = await asyncio.to_thread(auth_db.get_user_by_uuid, target_user_id)
+            if target_user is None:
+                raise ValueError("USER_NOT_FOUND")
+            target_role = cls.get_user_role(target_user)
+            if target_role in cls.TEACHER_ROLES:
+                member_role = "teacher"
+            elif target_role in cls.STUDENT_ROLES:
+                member_role = "student"
+            else:
+                raise ValueError("USER_ROLE_UNSUPPORTED")
+            return await approve_course_join_request_by_user(
+                course_id=course_id,
+                user_id=target_user_id,
+                user_role=member_role,
+                reviewer_id=user_id,
+            )
+
+        raise ValueError(f"Unsupported course join request action: {action}")
 
     @classmethod
-    async def list_exam_items(cls, current_user: dict, course_id: str) -> List[Dict[str, object]]:
+    async def get_course_by_invite_code(cls, invite_code: str) -> Optional[Dict[str, object]]:
+        return await get_course_by_invite_code_record(invite_code)
+
+    @classmethod
+    async def list_exam_sessions_by_course(cls, current_user: dict, course_id: str) -> List[Dict[str, object]]:
+        user_id = cls.get_user_id(current_user)
+        if not user_id:
+            raise PermissionError("当前用户缺少 user_id")
         if not await cls.can_view_course(current_user, course_id):
-            raise PermissionError("无权查看该课程的考试项")
-        return await list_exam_items_by_course(course_id)
+            raise PermissionError("无权查看该课程的考试记录")
+        return await list_exam_sessions_by_course_and_user(course_id=course_id, user_id=user_id)
 
     @classmethod
-    async def update_exam_item(
+    async def manage_exam_item(
         cls,
         current_user: dict,
-        course_id: str,
-        exam_item_id: str,
+        action: str,
+        course_id: Optional[str] = None,
+        exam_item_id: Optional[str] = None,
         exam_item_name: Optional[str] = None,
         dimension_scores: Optional[Dict[str, float]] = None,
+        exam_available_valid_times: Optional[int] = None,
         description: Optional[str] = None,
         item_type: Optional[str] = None,
-    ) -> bool:
+        need_code_repository: Optional[bool] = None,
+    ):
+        action = str(action).strip().lower()
         user_id = cls.get_user_id(current_user)
-        if not user_id or not await is_course_owner(user_id, course_id):
-            raise PermissionError("只有课程主负责老师可以修改考试项")
-        return await update_exam_item_record(
-            course_id=course_id,
-            exam_item_id=exam_item_id,
-            exam_item_name=exam_item_name,
-            dimension_scores=dimension_scores,
-            description=description,
-            item_type=item_type,
-        )
 
-    @classmethod
-    async def delete_exam_item(cls, current_user: dict, course_id: str, exam_item_id: str) -> bool:
-        user_id = cls.get_user_id(current_user)
+        if action == "reset_availability":
+            if not exam_item_id:
+                raise ValueError("exam_item_id is required")
+            exam_item = await get_exam_item_by_id(exam_item_id)
+            if not exam_item:
+                return None
+            course_id = str(exam_item["course_id"])
+            if not user_id or not await is_course_owner(user_id, course_id):
+                raise PermissionError("只有课程主负责老师可以重置考试可开启有效期")
+            return await reset_exam_item_availability_record(
+                exam_item_id=exam_item_id,
+                exam_available_valid_times=exam_available_valid_times,
+            )
+
+        if not course_id:
+            raise ValueError("course_id is required")
+
+        if action == "list":
+            if not await cls.can_view_course(current_user, course_id):
+                raise PermissionError("无权查看该课程的考试项")
+            return await list_exam_items_by_course(course_id)
+
+        if action == "create":
+            role = cls.get_user_role(current_user)
+            if role not in cls.TEACHER_ROLES and role not in cls.ADMIN_ROLES:
+                raise PermissionError("只有课程主负责老师可以创建考试项")
+            if not user_id:
+                raise PermissionError("当前用户缺少 user_id")
+            if not await is_course_owner(user_id, course_id):
+                raise PermissionError("只有课程主负责老师可以创建考试项")
+            created_item = await create_exam_item_record(
+                course_id=course_id,
+                exam_item_name=exam_item_name,
+                created_by=user_id,
+                dimension_scores=dimension_scores,
+                exam_available_valid_times=exam_available_valid_times,
+                description=description,
+                item_type=item_type,
+                need_code_repository=bool(need_code_repository),
+            )
+            return created_item
+
+        if action not in {"update", "delete"}:
+            raise ValueError(f"Unsupported exam item action: {action}")
         if not user_id or not await is_course_owner(user_id, course_id):
-            raise PermissionError("只有课程主负责老师可以删除考试项")
+            raise PermissionError("只有课程主负责老师可以修改或删除考试项")
+        if not exam_item_id:
+            raise ValueError("exam_item_id is required")
+
+        if action == "update":
+            return await update_exam_item_record(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                exam_item_name=exam_item_name,
+                dimension_scores=dimension_scores,
+                description=description,
+                item_type=item_type,
+                need_code_repository=need_code_repository,
+            )
         return await delete_exam_item_record(course_id=course_id, exam_item_id=exam_item_id)
 
     @classmethod
     async def can_view_course(cls, current_user: dict, course_id: str) -> bool:
+        """检查用户是否有查看查看课程的权限"""
         role = cls.get_user_role(current_user)
         user_id = cls.get_user_id(current_user)
         if role in cls.ADMIN_ROLES:
@@ -338,7 +431,7 @@ class QAserver:
             ]
         return [str(raw_value)]
 
-    async def put_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    async def put_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, object]]:
         if self.exam_state is None:
             return [self._text_event(self.MISSING_EXAM_STATE_ERROR)]
         if self.exam_finished:
@@ -368,23 +461,46 @@ class QAserver:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.requst_loop())
 
+    async def stop_request_loop(self) -> None:
+        task = self._task
+        if task is None or task.done():
+            self._task = None
+            self._prepare_generation_pending = False
+            return
+
+        await self.task_queue.put({"type": "stop"})
+        if asyncio.current_task() is not task:
+            await task
+            self._task = None
+            self._prepare_generation_pending = False
+
     async def requst_loop(self):
-        while True:
-            task = await self.task_queue.get()
-            try:
-                if self.exam_state is None or self.exam_finished:
-                    continue
-                task_type = task.get("type")
-                if task_type == "judge_and_generate":
-                    await self.handle_judge_and_generate_task(task)
-                elif task_type == "prepare_generation":
-                    try:
-                        await self.ensure_ready_question_exists()
-                    finally:
-                        self._prepare_generation_pending = False
-            finally:
-                print(f"当前分数: {self.exam_state.get_score()}")
-                self.task_queue.task_done()
+        try:
+            while True:
+                task = await self.task_queue.get()
+                try:
+                    task_type = task.get("type")
+                    if task_type == "stop":
+                        return
+                    if self.exam_state is None or self.exam_finished:
+                        continue
+                    if task_type == "judge_and_generate":
+                        await self.handle_judge_and_generate_task(task)
+                    elif task_type == "prepare_generation":
+                        try:
+                            await self.ensure_ready_question_exists()
+                        finally:
+                            self._prepare_generation_pending = False
+                finally:
+                    if self.exam_state is not None:
+                        print(f"当前分数: {self.exam_state.get_score()}")
+                    self.task_queue.task_done()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._prepare_generation_pending = False
+            if asyncio.current_task() is self._task:
+                self._task = None
 
     async def handle_judge_and_generate_task(self, task: Dict[str, object]) -> None:
         answered_question = task.get("question")
@@ -415,7 +531,7 @@ class QAserver:
     async def wait_and_dispatch_question(
         self,
         can_request_prepare_generation: bool = True,
-    ) -> List[Dict[str, str]]:
+    ) -> List[Dict[str, object]]:
         while True:
             if self.exam_state is None:
                 return [self._text_event(self.MISSING_EXAM_STATE_ERROR)]
@@ -456,6 +572,8 @@ class QAserver:
             "question": {
                 "question_id": judged_question.question_id,
                 "content": judged_question.content,
+                "question_blocks": judged_question.question_blocks,
+                "code_fragments": judged_question.code_fragments,
                 "dimension": judged_question.dimension,
                 "score": judged_question.score,
                 "difficulty_level": self.get_current_difficulty_level(judged_question.dimension),
@@ -557,6 +675,8 @@ class QAserver:
             "previous_question": {
                 "question_id": source_question.question_id,
                 "content": source_question.content,
+                "question_blocks": source_question.question_blocks,
+                "code_fragments": source_question.code_fragments,
                 "dimension": source_question.dimension,
             } if source_question else None,
             "latest_judge": judge_res,
@@ -570,6 +690,7 @@ class QAserver:
             difficulty_level=active_difficulty_level,
             question_count=question_count,
             question_dimensions=[dimension],
+            is_initial_generation=False,
         )
         question_doc = self.parse_outer_json_block(self.get_agent_response_content(response))
         questions = []
@@ -583,6 +704,8 @@ class QAserver:
                 question_id=str(existing_question_count + index),
                 content=content,
                 dimension=dimension,
+                question_blocks=item.get("question_blocks", []),
+                code_fragments=item.get("code_fragments", []),
                 score=float(item.get("score", 1.0)),
                 standard_answer=item.get("standard_answer"),
                 based_on_record_index=len(self.exam_state.exam_records) - 1 if self.exam_state else -1,
@@ -612,6 +735,7 @@ class QAserver:
             )
         except Exception:
             logger.exception("保存考试数据到 MySQL 失败")
+        await self.stop_request_loop()
         return [
             self._text_event("AI评审开始评估"),
             self._text_event(build_final_review_output(final_review, output_type="html")),
@@ -638,6 +762,8 @@ class QAserver:
                 "question": {
                     "question_id": question.question_id,
                     "content": question.content,
+                    "question_blocks": question.question_blocks,
+                    "code_fragments": question.code_fragments,
                     "dimension": question.dimension,
                     "score": question.score,
                     "standard_answer": question.standard_answer,
@@ -661,7 +787,7 @@ class QAserver:
             "total": sum(dimension_scores.values()),
         }
 
-    def ask_question(self, question: Question) -> List[Dict[str, str]]:
+    def ask_question(self, question: Question) -> List[Dict[str, object]]:
         if self.exam_state:
             self.exam_state.set_current_question(question)
         self.history.append({
@@ -670,16 +796,18 @@ class QAserver:
         })
         return [
             self._text_event("AI口试开始回答"),
-            self._text_event(question.content),
-            self._speak_event(question.content),
+            self._question_event(question),
             self._text_event("AI口试结束回答"),
         ]
 
-    def _text_event(self, content: str) -> Dict[str, str]:
+    def _text_event(self, content: str) -> Dict[str, object]:
         return {"type": "text", "content": content}
 
-    def _speak_event(self, content: str) -> Dict[str, str]:
+    def _speak_event(self, content: str) -> Dict[str, object]:
         return {"type": "speak", "content": content}
+
+    def _question_event(self, question: Question) -> Dict[str, object]:
+        return {"type": "question", "question": question}
 
     def get_agent_response_content(self, response) -> str:
         """获取 langchain 的 Agent 结果的最后一个消息内容，作为 Agent 输出。"""

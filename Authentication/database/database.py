@@ -52,7 +52,7 @@ class UserDatabase:
 
     def _connect(self):
         try:
-            self._conn = pymysql.connect(**MYSQL_CONFIG)
+            self._conn = pymysql.connect(**MYSQL_CONFIG, autocommit=True)
             print(f"[DB] 已连接 MySQL: {MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}")
         except pymysql.err.OperationalError as e:
             if e.args[0] == 1049:

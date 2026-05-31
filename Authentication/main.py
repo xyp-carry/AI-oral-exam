@@ -18,7 +18,7 @@ from Authentication.models import (
 from Authentication.auth import (
     hash_password, verify_password,
     generate_session_token, set_auth_cookie, clear_auth_cookie,
-    get_current_user, get_optional_user,
+    extract_token_from_cookie, get_current_user, get_optional_user,
 )
 from Authentication.database import db
 
@@ -228,9 +228,8 @@ def auth(app, args):
     async def logout(
         request: Request,
         response: Response,
-        current_user: dict = Depends(get_current_user),
     ):
-        token = request.cookies.get("session_token")
+        token = extract_token_from_cookie(request)
         if token:
             db.delete_session(token)
 

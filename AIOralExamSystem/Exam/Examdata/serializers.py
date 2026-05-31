@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from typing import Dict, Optional
 
 
@@ -41,6 +42,15 @@ def get_exam_item_id(current_user: dict) -> Optional[str]:
         or current_user.get("examItem")
     )
     return str(exam_item_id) if exam_item_id is not None else None
+
+
+def get_exam_id(current_user: dict) -> Optional[str]:
+    exam_id = (
+        current_user.get("exam_id")
+        or current_user.get("examId")
+        or current_user.get("exam")
+    )
+    return str(exam_id) if exam_id is not None else None
 
 
 def first_course_id(raw_value) -> Optional[str]:
@@ -111,12 +121,17 @@ def course_row_to_dict(row) -> Dict[str, object]:
         "course_name",
         "description",
         "owner_teacher_id",
+        "invite_code",
+        "invite_code_expires_at",
+        "invite_code_created_at",
         "status",
         "created_at",
         "updated_at",
     )
     result = dict(zip(fields, row))
-    for key in ("created_at", "updated_at"):
+    expires_at = result.get("invite_code_expires_at")
+    result["invite_code_valid"] = bool(expires_at and expires_at > datetime.now())
+    for key in ("invite_code_expires_at", "invite_code_created_at", "created_at", "updated_at"):
         value = result.get(key)
         if value is not None:
             result[key] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -136,6 +151,9 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
         "total_score",
         "participant_count",
         "attempt_count",
+        "need_code_repository",
+        "exam_available_from",
+        "exam_available_until",
         "status",
         "created_by",
         "created_at",
@@ -144,8 +162,14 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
     result = dict(zip(fields, row))
     result["dimension_names"] = _json_loads(result.pop("dimension_names_json"), [])
     result["dimension_scores"] = _json_loads(result.pop("dimension_scores_json"), {})
+    result["need_code_repository"] = bool(result.get("need_code_repository"))
     result.pop("created_by", None)
-    for key in ("created_at", "updated_at"):
+    available_from = result.get("exam_available_from")
+    available_until = result.get("exam_available_until")
+    result["available"] = bool(
+        available_from and available_until and available_from <= datetime.now() < available_until
+    )
+    for key in ("exam_available_from", "exam_available_until", "created_at", "updated_at"):
         value = result.get(key)
         if value is not None:
             result[key] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -168,7 +192,7 @@ def join_request_row_to_dict(row) -> Dict[str, object]:
         "request_id",
         "course_id",
         "course_name",
-        "student_id",
+        "user_id",
         "status",
         "requested_at",
         "reviewed_at",

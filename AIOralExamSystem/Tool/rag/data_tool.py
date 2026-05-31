@@ -8,7 +8,7 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 from AIOralExamSystem.Tool.rag.file_tool import FileParserTool
 from meilisearch import Client
 from pydantic import BaseModel, Field
-
+from config import get_settings
 
 class SearchToolInput(BaseModel):
     query: str = Field(description="用于查询信息的一段话；如果传入空字符串，则读取该 source 下的全部文本块")
@@ -32,6 +32,8 @@ class SearchTool(BaseTool):
         self,
         query: str,
         source: str,
+        course_id: str,
+        exam_id: str | None = None,
         batch_index: int = 0,
         target_tokens: int = 6000,
     ) -> str:
@@ -42,6 +44,8 @@ class SearchTool(BaseTool):
                 self.search,
                 query,
                 source,
+                course_id,
+                exam_id,
                 batch_index,
                 target_tokens,
             )
@@ -50,6 +54,8 @@ class SearchTool(BaseTool):
         self,
         query: str,
         source: str,
+        course_id: str,
+        exam_id: str | None = None,
         batch_index: int = 0,
         target_tokens: int = 6000,
     ) -> str:
@@ -58,7 +64,7 @@ class SearchTool(BaseTool):
         target_tokens = min(12000, max(2000, int(target_tokens or 6000)))
         max_block_tokens = max(1000, target_tokens)
 
-        results = self._search_documents(query, source)
+        results = self._search_documents(query, source, course_id, exam_id)
         blocks = self._build_text_blocks(results.get("hits", []), max_block_tokens)
         batches = self._build_batches(blocks, target_tokens)
 
@@ -105,9 +111,9 @@ class SearchTool(BaseTool):
             ensure_ascii=False,
         )
 
-    def _search_documents(self, query: str, source: str) -> dict:
-        index = self.client.index("test")
-        filter_expr = f'source = "{self._escape_filter_value(source)}"'
+    def _search_documents(self, query: str, source: str, course_id: str, exam_id: str | None = None) -> dict:
+        index = self.client.index(self._course_index_name(course_id))
+        filter_expr = self._build_filter(source, exam_id)
 
         if not query.strip():
             hits = []
@@ -150,6 +156,19 @@ class SearchTool(BaseTool):
 
     def _escape_filter_value(self, value: str) -> str:
         return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    def _course_index_name(self, course_id: str) -> str:
+        course_id = str(course_id or "").strip()
+        if not course_id:
+            raise ValueError("course_id is required")
+        safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
+        return f"course_{safe_course_id}"
+
+    def _build_filter(self, source: str, exam_id: str | None = None) -> str:
+        filters = [f'source = "{self._escape_filter_value(source)}"']
+        if exam_id and str(exam_id).strip():
+            filters.append(f'exam_id = "{self._escape_filter_value(str(exam_id).strip())}"')
+        return " AND ".join(filters)
 
     def _count_tokens(self, text: str) -> int:
         if not text:
@@ -262,16 +281,25 @@ class InsertTool(BaseTool):
         self.client = Client("http://localhost:7700")
         self.fileParser = FileParserTool(token, "file_parser")
 
-    async def _run(self, data: list | str, source: str, type: str = "file") -> str:
+    async def _run(
+        self,
+        data: list | str,
+        source: str,
+        type: str = "file",
+        course_id: str | None = None,
+        exam_id: str | None = None,
+        work_dir: str | None = None,
+        reload: bool = False,
+    ) -> str:
         if type == "file":
-            chunksList = await self.fileParser.execute(file_paths=data)
+            chunksList = await self.fileParser.execute(file_paths=data, work_dir=work_dir)
         else:
             chunksList = data
 
         if not chunksList:
             return "没有可插入的文档。"
 
-        index = self.client.index("test")
+        index = self.client.index(self._course_index_name(course_id))
 
         settings = {
             "embedders": {
@@ -292,22 +320,28 @@ class InsertTool(BaseTool):
                         ]
                     },
                     "headers": {
-                        "Authorization": "Bearer f3243c87fe4547698d5beee226f71452.3UGVyBevympxI2TA",
+                        "Authorization": f"Bearer {get_settings().model_api_key}",
                     },
                 }
             },
-            "filterableAttributes": ["source"],
+            "filterableAttributes": ["source", "course_id", "exam_id"],
         }
 
         task = index.update_settings(settings)
         self.client.wait_for_task(task.task_uid)
-
+        if reload:
+            self._delete_existing_documents(index, source, exam_id)
+        print(chunksList)
+        print(len(chunksList))
+        print(len(chunksList[0]))
         inserted_count = 0
         for chunks in chunksList:
             documents = [
                 {
                     "id": str(uuid.uuid4()),
                     "source": source,
+                    "course_id": course_id,
+                    "exam_id": exam_id,
                     "content": chunk,
                 }
                 for chunk in chunks
@@ -316,14 +350,63 @@ class InsertTool(BaseTool):
             if not documents:
                 continue
 
-            task = index.add_documents(documents)
+            task = index.add_documents(documents, primary_key="id")
             self.client.wait_for_task(task.task_uid)
             inserted_count += len(documents)
-
+            
+        print(f"成功插入 {inserted_count} 条文档")
         return f"成功插入 {inserted_count} 条文档"
 
     def get_description(self) -> str:
         return self.description
+
+    def _course_index_name(self, course_id: str | None) -> str:
+        course_id = str(course_id or "").strip()
+        if not course_id:
+            raise ValueError("course_id is required")
+        safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
+        return f"course_{safe_course_id}"
+
+    def _delete_existing_documents(self, index, source: str, exam_id: str | None) -> None:
+        if not source or not str(source).strip():
+            raise ValueError("source is required when reload is true")
+        if not exam_id or not str(exam_id).strip():
+            raise ValueError("exam_id is required when reload is true")
+        filter_expr = (
+            f'source = "{self._escape_filter_value(source)}" '
+            f'AND exam_id = "{self._escape_filter_value(str(exam_id).strip())}"'
+        )
+        document_ids = []
+        offset = 0
+        limit = 1000
+
+        while True:
+            results = index.search(
+                "",
+                {
+                    "filter": filter_expr,
+                    "limit": limit,
+                    "offset": offset,
+                    "attributesToRetrieve": ["id"],
+                },
+            )
+            hits = results.get("hits", [])
+            document_ids.extend(hit["id"] for hit in hits if hit.get("id"))
+
+            if not hits or len(hits) < limit:
+                break
+
+            offset += limit
+            total_hits = results.get("estimatedTotalHits")
+            if total_hits is not None and offset >= total_hits:
+                break
+
+        for start in range(0, len(document_ids), limit):
+            task = index.delete_documents(document_ids[start:start + limit])
+            self.client.wait_for_task(task.task_uid)
+
+    def _escape_filter_value(self, value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
     def is_meaningful_text(self, text: str) -> bool:
         if not text or not text.strip():

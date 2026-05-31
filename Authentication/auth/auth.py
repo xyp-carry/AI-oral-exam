@@ -56,6 +56,9 @@ def generate_session_token() -> str:
 # ──────────────── Cookie 管理 ────────────────
 
 COOKIE_NAME = "session_token"
+COOKIE_PATH = "/"
+COOKIE_SECURE = True
+COOKIE_SAMESITE = "none"
 
 def set_auth_cookie(response: Response, token: str, remember_me: bool = False) -> None:
     """
@@ -69,18 +72,19 @@ def set_auth_cookie(response: Response, token: str, remember_me: bool = False) -
         value=signed_token,
         max_age=max_age,
         httponly=True,       # 禁止 JS 访问，防止 XSS
-        secure=True,         # 生产环境设为 True（HTTPS）
-        samesite="None",       # 防止 CSRF
-        path="/",
+        secure=COOKIE_SECURE,  # 生产环境设为 True（HTTPS）
+        samesite=COOKIE_SAMESITE,  # 防止 CSRF
+        path=COOKIE_PATH,
     )
 
 def clear_auth_cookie(response: Response) -> None:
     """清除认证 Cookie"""
     response.delete_cookie(
         key=COOKIE_NAME,
-        path="/",
+        path=COOKIE_PATH,
+        secure=COOKIE_SECURE,
         httponly=True,
-        samesite="None",
+        samesite=COOKIE_SAMESITE,
     )
 
 def extract_token_from_cookie(request: Request) -> str | None:

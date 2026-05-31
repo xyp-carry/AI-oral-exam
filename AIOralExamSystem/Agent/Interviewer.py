@@ -5,9 +5,11 @@ from pydantic import BaseModel
 
 
 class InterviewerAgent(BaseAgent):
-    def __init__(self, model_settings: dict, source: str):
+    def __init__(self, model_settings: dict, source: str, course_id: str | None = None, exam_id: str | None = None):
         super().__init__("InterviewerAgent", model_settings)
         self.source = source
+        self.course_id = course_id
+        self.exam_id = exam_id
         self.system_prompt = """
         ## Role（角色设定）
          你现在是一位严谨、专业且富有启发性的“计算机操作系统”资深面试官，名字叫张三。你拥有丰富的高校计算机系口试经验，擅长通过追问挖掘学生对底层原理的真实理解程度，而不是死记硬背。
@@ -60,7 +62,12 @@ class InterviewerAgent(BaseAgent):
         @tool(args_schema=SearchToolInput, description=SearchDescription)
         async def search(query: str) -> str:
             tool = SearchTool("search_tool")
-            response = await tool.execute(query, self.source)
+            response = await tool.execute(
+                query=query,
+                source=self.source,
+                course_id=self.course_id,
+                exam_id=self.exam_id,
+            )
             return response
         return [search]
     

@@ -15,6 +15,8 @@ class Question:
     question_id: str
     content: str
     dimension: str
+    question_blocks: List[Dict[str, object]] = field(default_factory=list)
+    code_fragments: List[Dict[str, object]] = field(default_factory=list)
     # 当前默认每题 1 分，保留字段是为了后续支持不同题目分值。
     score: float = 1.0
     standard_answer: Optional[str] = None
@@ -23,6 +25,57 @@ class Question:
 
     # 生成题目时的补充来源信息，便于日志排查。
     source_detail: Optional[str] = None
+
+    def __post_init__(self):
+        question_blocks = self._normalize_question_blocks(self.question_blocks)
+        if not question_blocks and self.content:
+            question_blocks = [{"type": "text", "content": self.content}]
+        object.__setattr__(self, "question_blocks", question_blocks)
+        object.__setattr__(
+            self,
+            "code_fragments",
+            self._normalize_code_fragments(self.code_fragments),
+        )
+
+    @staticmethod
+    def _normalize_question_blocks(blocks) -> List[Dict[str, object]]:
+        if not isinstance(blocks, list):
+            return []
+        normalized: List[Dict[str, object]] = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).strip()
+            if block_type == "text":
+                content = str(block.get("content", "")).strip()
+                if content:
+                    normalized.append({"type": "text", "content": content})
+            elif block_type == "code":
+                fragment_id = str(block.get("fragment_id", "")).strip()
+                if fragment_id:
+                    normalized.append({"type": "code", "fragment_id": fragment_id})
+        return normalized
+
+    @staticmethod
+    def _normalize_code_fragments(fragments) -> List[Dict[str, object]]:
+        if not isinstance(fragments, list):
+            return []
+        normalized: List[Dict[str, object]] = []
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+            item = dict(fragment)
+            if "id" in item:
+                item["id"] = str(item["id"])
+            lines = item.get("lines", [])
+            if isinstance(lines, str):
+                item["lines"] = lines.splitlines()
+            elif isinstance(lines, list):
+                item["lines"] = [str(line) for line in lines]
+            else:
+                item["lines"] = []
+            normalized.append(item)
+        return normalized
 
 @dataclass
 class QARecord:
@@ -90,6 +143,7 @@ class CandidateExamState:
         self,
         initial_score: float = 5.0,
         initial_difficulty_level: int = 3,
+        dimensions: Optional[List[str]] = None,
     ):
         self.default_score = self._clamp_score(initial_score)
         self.default_difficulty_level = self._clamp_difficulty_level(initial_difficulty_level)
@@ -113,6 +167,9 @@ class CandidateExamState:
         self.current_question: Optional[Question] = None
         self.exam_records: List[QARecord] = []
         self._sequence = count()
+
+        self.configured_dimensions: List[str] = []
+        self.initialize_dimensions(dimensions or [])
 
     @property
     def prepared_question_queue(self) -> Deque[Question]:
@@ -144,6 +201,25 @@ class CandidateExamState:
         self.prepared_question_queues.setdefault(dimension, deque())
         self.priority_question_queues.setdefault(dimension, [])
         return dimension
+
+    def initialize_dimensions(self, dimensions: List[str]) -> None:
+        """初始化考试项配置的维度，并为每个维度建立独立状态。"""
+
+        normalized_dimensions = []
+        for dimension in dimensions:
+            dimension = str(dimension).strip()
+            if dimension and dimension not in normalized_dimensions:
+                normalized_dimensions.append(dimension)
+        self.configured_dimensions = normalized_dimensions
+        for dimension in self.configured_dimensions:
+            self._ensure_dimension_state(dimension)
+        if self.configured_dimensions:
+            self.set_current_dimension(self.configured_dimensions[0])
+
+    def get_configured_dimensions(self) -> List[str]:
+        """返回本次考试配置的维度列表。"""
+
+        return list(self.configured_dimensions)
 
     def set_current_dimension(self, dimension: str) -> str:
         """切换当前维度，并同步当前状态视图。"""

@@ -1,7 +1,9 @@
 from .course_repository import (
+    approve_course_join_request_by_user,
     approve_join_request,
     create_course,
     delete_course,
+    get_course_by_invite_code,
     list_available_courses,
     list_all_courses,
     list_course_join_requests,
@@ -9,17 +11,24 @@ from .course_repository import (
     list_teacher_courses,
     reject_join_request,
     request_join_course,
+    reset_course_invite_code,
     update_course,
 )
 from .exam_repository import (
     get_exam_history_by_user,
     get_exam_record_by_exam_id,
+    get_exam_session_by_exam_id,
+    list_exam_sessions_by_course_and_user,
     save_exam_data,
 )
 from .exam_item_repository import (
     create_exam_item,
     delete_exam_item,
+    get_available_exam_item_by_exam_id,
+    get_available_exam_item_by_id,
+    get_exam_item_by_id,
     list_exam_items_by_course,
+    reset_exam_item_availability,
     update_exam_item,
 )
 from .permissions import (
@@ -31,19 +40,27 @@ from .permissions import (
 )
 
 __all__ = [
+    "approve_course_join_request_by_user",
     "approve_join_request",
     "create_course",
     "create_exam_item",
     "delete_course",
     "delete_exam_item",
+    "get_course_by_invite_code",
+    "get_available_exam_item_by_exam_id",
+    "get_available_exam_item_by_id",
     "get_exam_history_by_user",
+    "get_exam_item_by_id",
     "get_exam_record_by_exam_id",
+    "get_exam_session_by_exam_id",
+    "list_exam_sessions_by_course_and_user",
     "get_student_course_ids",
     "get_teacher_course_ids",
     "is_course_owner",
     "is_student_in_course",
     "is_teacher_of_course",
     "list_exam_items_by_course",
+    "reset_exam_item_availability",
     "list_available_courses",
     "list_all_courses",
     "list_course_join_requests",
@@ -51,6 +68,7 @@ __all__ = [
     "list_teacher_courses",
     "reject_join_request",
     "request_join_course",
+    "reset_course_invite_code",
     "save_exam_data",
     "update_course",
     "update_exam_item",
