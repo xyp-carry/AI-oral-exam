@@ -12,14 +12,6 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 
 
 class CodeAstToolInput(BaseModel):
-    git_local_address: Optional[str] = Field(
-        default=None,
-        description=(
-            "Git repository address or local repository cache identifier. It is normalized before "
-            "locating Gitrepositorys/{user_uuid}/{normalized_git_local_address}/code. "
-            "May be omitted only when the tool was registered with a bound git_local_address."
-        ),
-    )
     file_path: str = Field(
         description="Python file path relative to the selected repository code root.",
     )
@@ -31,9 +23,9 @@ class CodeAstToolInput(BaseModel):
 
 CodeAstDescription = (
     "Parse one Python file from a specific current-user repository cache into compact AST layers. "
-    "`file_path` must be relative to Gitrepositorys/{user_uuid}/{normalized_git_local_address}/code. "
-    "`git_local_address` is normalized the same way as GitRepositoryTool cache names and may be omitted "
-    "only when the tool was registered with a bound git_local_address. Use this tool to understand a "
+    "`file_path` must be relative to the system-bound repository code root. "
+    "The repository address is bound by the system when this tool is initialized and cannot be overridden "
+    "by tool input. Use this tool to understand a "
     "file's classes, functions, module organization, and call skeleton; use codeReader for exact source snippets."
 )
 
@@ -50,7 +42,6 @@ class CodeAstTool(BaseTool):
     async def _run(
         self,
         file_path: str,
-        git_local_address: Optional[str] = None,
         language: Optional[str] = None,
     ) -> str:
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -59,20 +50,22 @@ class CodeAstTool(BaseTool):
                 executor,
                 self.analyze_ast,
                 file_path,
-                git_local_address,
                 language,
             )
 
     def analyze_ast(
         self,
         file_path: str,
-        git_local_address: Optional[str] = None,
         language: Optional[str] = None,
     ) -> str:
         logs = []
-        active_git_address = self._normalize_optional_text(git_local_address) or self.git_local_address
+        active_git_address = None
         try:
-            target_path = self.resolve_code_path(active_git_address, file_path)
+            active_git_address = self._require_text(self.git_local_address, "git_local_address")
+            code_root = self.code_root(active_git_address)
+            if not code_root.is_dir():
+                raise ValueError(f"Code root does not exist: {code_root}")
+            target_path = self._resolve_relative_path(code_root, file_path)
             language = language or self.detect_language(target_path)
             logs.append(
                 {
@@ -84,7 +77,7 @@ class CodeAstTool(BaseTool):
                     "user_uuid": self.user_uuid,
                     "git_local_address": active_git_address,
                     "safe_git_local_address": self._safe_path_part(active_git_address),
-                    "code_root": str(self.code_root(active_git_address)),
+                    "code_root": str(code_root),
                     "language": language,
                 }
             )
@@ -211,8 +204,8 @@ class CodeAstTool(BaseTool):
         suffix = target_path.suffix.lower()
         return mapping.get(suffix, suffix.lstrip(".") or "unknown")
 
-    def resolve_code_path(self, git_local_address: Optional[str], file_path: Optional[str]) -> Path:
-        active_git_address = self._require_text(git_local_address, "git_local_address")
+    def resolve_code_path(self, file_path: Optional[str]) -> Path:
+        active_git_address = self._require_text(self.git_local_address, "git_local_address")
         relative_path = self._require_text(file_path, "file_path")
         code_root = self.code_root(active_git_address)
         if not code_root.is_dir():
@@ -225,7 +218,6 @@ class CodeAstTool(BaseTool):
             / "Gitrepositorys"
             / self._safe_path_part(self.user_uuid)
             / self._safe_repository_path(git_local_address)
-            / "code"
         )
 
     def _resolve_relative_path(self, code_root: Path, relative_path: str) -> Path:

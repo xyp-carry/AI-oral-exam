@@ -48,6 +48,21 @@ async def get_exam_history_by_user(
     )
 
 
+async def get_exam_history_by_course(
+    course_id: str,
+    user_id: Optional[str] = None,
+    include_all_users: bool = False,
+    exam_item_id: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    return await asyncio.to_thread(
+        _get_exam_history_by_course_sync,
+        course_id,
+        user_id,
+        include_all_users,
+        exam_item_id,
+    )
+
+
 async def get_exam_record_by_exam_id(
     exam_id: str,
     user_id: Optional[str],
@@ -63,6 +78,21 @@ async def get_exam_record_by_exam_id(
         course_ids,
         allow_course_scope,
         allow_all,
+    )
+
+
+async def get_exam_questions_by_exam_item(
+    course_id: str,
+    exam_item_id: str,
+    user_id: Optional[str] = None,
+    include_all_users: bool = False,
+) -> List[Dict[str, object]]:
+    return await asyncio.to_thread(
+        _get_exam_questions_by_exam_item_sync,
+        course_id,
+        exam_item_id,
+        user_id,
+        include_all_users,
     )
 
 
@@ -107,6 +137,49 @@ async def update_exam_session_repository_url(
         exam_id,
         repository_url,
     )
+
+
+async def update_exam_session_use_preset_questions(
+    course_id: str,
+    exam_id: str,
+    use_preset_questions: bool,
+) -> bool:
+    return await asyncio.to_thread(
+        _update_exam_session_use_preset_questions_sync,
+        course_id,
+        exam_id,
+        use_preset_questions,
+    )
+
+
+def _update_exam_session_use_preset_questions_sync(
+    course_id: str,
+    exam_id: str,
+    use_preset_questions: bool,
+) -> bool:
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE exam_sessions
+                SET use_preset_questions = %s
+                WHERE course_id = %s
+                  AND exam_id = %s
+                  AND exam_completed = 0
+                """,
+                (1 if use_preset_questions else 0, course_id, exam_id),
+            )
+            updated = cursor.rowcount > 0
+        connection.commit()
+        return updated
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _update_exam_session_repository_url_sync(
@@ -172,7 +245,9 @@ def create_pending_exam_sessions_for_exam_item(
     connection,
     course_id: Optional[str],
     exam_item_id: Optional[str],
+    exam_item_name: Optional[str] = None,
     need_code_repository: bool = False,
+    use_preset_questions: bool = False,
     dimension_scores: Optional[Dict[str, float]] = None,
     total_score: float = 0,
 ) -> int:
@@ -208,7 +283,9 @@ def create_pending_exam_sessions_for_exam_item(
                 user_id=user_id,
                 course_id=course_id,
                 exam_item_id=exam_item_id,
+                exam_item_name=exam_item_name,
                 need_code_repository=need_code_repository,
+                use_preset_questions=use_preset_questions,
                 dimension_scores=dimension_scores,
                 total_score=total_score,
             )
@@ -225,7 +302,7 @@ def create_pending_exam_sessions_for_user(
     with connection.cursor() as cursor:
         cursor.execute(
             """
-            SELECT exam_item_id, need_code_repository, dimension_scores_json, total_score
+            SELECT exam_item_id, exam_item_name, need_code_repository, use_preset_questions, dimension_scores_json, total_score
             FROM course_exam_items
             WHERE course_id = %s
               AND status = 'active'
@@ -233,20 +310,29 @@ def create_pending_exam_sessions_for_user(
             (course_id,),
         )
         exam_items = [
-            (str(row[0]), bool(row[1]), _normalize_dimension_scores_json(row[2]), float(row[3] or 0))
+            (
+                str(row[0]),
+                str(row[1]) if row[1] is not None else None,
+                bool(row[2]),
+                bool(row[3]),
+                _normalize_dimension_scores_json(row[4]),
+                float(row[5] or 0),
+            )
             for row in cursor.fetchall()
             if row and row[0]
         ]
 
     created_count = 0
     with connection.cursor() as cursor:
-        for exam_item_id, need_code_repository, dimension_scores, total_score in exam_items:
+        for exam_item_id, exam_item_name, need_code_repository, use_preset_questions, dimension_scores, total_score in exam_items:
             created_count += _insert_pending_exam_session_if_missing(
                 cursor,
                 user_id=user_id,
                 course_id=course_id,
                 exam_item_id=exam_item_id,
+                exam_item_name=exam_item_name,
                 need_code_repository=need_code_repository,
+                use_preset_questions=use_preset_questions,
                 dimension_scores=dimension_scores,
                 total_score=total_score,
             )
@@ -278,6 +364,47 @@ def update_exam_sessions_need_code_repository(
               AND exam_item_id = %s
             """,
             (1 if need_code_repository else 0, course_id, exam_item_id),
+        )
+
+
+def update_pending_exam_sessions_use_preset_questions(
+    connection,
+    course_id: Optional[str],
+    exam_item_id: Optional[str],
+    use_preset_questions: bool,
+) -> None:
+    if not course_id or not exam_item_id:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE exam_sessions
+            SET use_preset_questions = %s
+            WHERE course_id = %s
+              AND exam_item_id = %s
+              AND exam_completed = 0
+            """,
+            (1 if use_preset_questions else 0, course_id, exam_item_id),
+        )
+
+
+def update_exam_sessions_exam_item_name(
+    connection,
+    course_id: Optional[str],
+    exam_item_id: Optional[str],
+    exam_item_name: Optional[str],
+) -> None:
+    if not course_id or not exam_item_id:
+        return
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE exam_sessions
+            SET exam_item_name = %s
+            WHERE course_id = %s
+              AND exam_item_id = %s
+            """,
+            (exam_item_name, course_id, exam_item_id),
         )
 
 
@@ -317,7 +444,9 @@ def _insert_pending_exam_session_if_missing(
     user_id: str,
     course_id: str,
     exam_item_id: str,
+    exam_item_name: Optional[str] = None,
     need_code_repository: bool = False,
+    use_preset_questions: bool = False,
     dimension_scores: Optional[Dict[str, float]] = None,
     total_score: float = 0,
 ) -> int:
@@ -329,15 +458,17 @@ def _insert_pending_exam_session_if_missing(
             user_id,
             course_id,
             exam_item_id,
+            exam_item_name,
             total_score,
             dimension_count,
             question_count,
             dimension_scores_json,
             need_code_repository,
+            use_preset_questions,
             exam_completed,
             ended_at
         )
-        SELECT %s, %s, %s, %s, %s, %s, 0, %s, %s, 0, NULL
+        SELECT %s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, 0, NULL
         WHERE NOT EXISTS (
             SELECT 1
             FROM exam_sessions
@@ -351,10 +482,12 @@ def _insert_pending_exam_session_if_missing(
             user_id,
             course_id,
             exam_item_id,
+            exam_item_name,
             float(total_score or 0),
             len(dimension_scores),
             to_json(dimension_scores),
             1 if need_code_repository else 0,
+            1 if use_preset_questions else 0,
             user_id,
             course_id,
             exam_item_id,
@@ -391,19 +524,30 @@ def _exam_session_row_to_dict(row) -> Dict[str, object]:
         "user_id",
         "course_id",
         "exam_item_id",
+        "exam_item_name",
         "total_score",
+        "exam_score",
         "dimension_count",
         "question_count",
         "dimension_scores_json",
+        "exam_dimension_scores_json",
         "repository_url",
         "need_code_repository",
+        "use_preset_questions",
         "exam_completed",
         "ended_at",
         "created_at",
     )
     result = dict(zip(fields, row))
     result["dimension_scores"] = _normalize_dimension_scores_json(result.pop("dimension_scores_json", None))
+    exam_dimension_scores_json = result.pop("exam_dimension_scores_json", None)
+    result["exam_dimension_scores"] = (
+        _normalize_dimension_scores_json(exam_dimension_scores_json)
+        if exam_dimension_scores_json is not None
+        else None
+    )
     result["need_code_repository"] = bool(result.get("need_code_repository"))
+    result["use_preset_questions"] = bool(result.get("use_preset_questions"))
     result["exam_completed"] = bool(result.get("exam_completed"))
     for key in ("ended_at", "created_at"):
         value = result.get(key)
@@ -429,12 +573,16 @@ def _list_exam_sessions_by_course_and_user_sync(
                     user_id,
                     course_id,
                     exam_item_id,
+                    exam_item_name,
                     total_score,
+                    exam_score,
                     dimension_count,
                     question_count,
                     dimension_scores_json,
+                    exam_dimension_scores_json,
                     repository_url,
                     need_code_repository,
+                    use_preset_questions,
                     exam_completed,
                     ended_at,
                     created_at
@@ -464,12 +612,16 @@ def _get_exam_session_by_exam_id_sync(exam_id: str) -> Optional[Dict[str, object
                     user_id,
                     course_id,
                     exam_item_id,
+                    exam_item_name,
                     total_score,
+                    exam_score,
                     dimension_count,
                     question_count,
                     dimension_scores_json,
+                    exam_dimension_scores_json,
                     repository_url,
                     need_code_repository,
+                    use_preset_questions,
                     exam_completed,
                     ended_at,
                     created_at
@@ -577,6 +729,167 @@ def _find_existing_exam_id(
     return str(row[0]) if row else None
 
 
+def _get_exam_session_total_score(connection, exam_id: Optional[str]) -> Optional[float]:
+    if not exam_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT total_score
+            FROM exam_sessions
+            WHERE exam_id = %s
+            LIMIT 1
+            """,
+            (exam_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _get_exam_item_total_score(connection, exam_item_id: Optional[str]) -> Optional[float]:
+    if not exam_item_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT total_score
+            FROM course_exam_items
+            WHERE exam_item_id = %s
+            LIMIT 1
+            """,
+            (exam_item_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return float(row[0])
+
+
+def _get_exam_session_dimension_scores(
+    connection,
+    exam_id: Optional[str],
+) -> Optional[Dict[str, float]]:
+    if not exam_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT dimension_scores_json
+            FROM exam_sessions
+            WHERE exam_id = %s
+            LIMIT 1
+            """,
+            (exam_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return _normalize_dimension_scores_json(row[0])
+
+
+def _get_exam_item_dimension_scores(
+    connection,
+    exam_item_id: Optional[str],
+) -> Optional[Dict[str, float]]:
+    if not exam_item_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT dimension_scores_json
+            FROM course_exam_items
+            WHERE exam_item_id = %s
+            LIMIT 1
+            """,
+            (exam_item_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return _normalize_dimension_scores_json(row[0])
+
+
+def _resolve_configured_dimension_scores(
+    connection,
+    exam_id: Optional[str],
+    exam_item_id: Optional[str],
+    fallback: Dict[str, float],
+) -> Dict[str, float]:
+    session_dimension_scores = _get_exam_session_dimension_scores(connection, exam_id)
+    if session_dimension_scores is not None:
+        return session_dimension_scores
+    item_dimension_scores = _get_exam_item_dimension_scores(connection, exam_item_id)
+    if item_dimension_scores is not None:
+        return item_dimension_scores
+    return dict(fallback or {})
+
+
+def _get_exam_session_exam_item_name(connection, exam_id: Optional[str]) -> Optional[str]:
+    if not exam_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT exam_item_name
+            FROM exam_sessions
+            WHERE exam_id = %s
+            LIMIT 1
+            """,
+            (exam_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def _get_exam_item_name(connection, exam_item_id: Optional[str]) -> Optional[str]:
+    if not exam_item_id:
+        return None
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT exam_item_name
+            FROM course_exam_items
+            WHERE exam_item_id = %s
+            LIMIT 1
+            """,
+            (exam_item_id,),
+        )
+        row = cursor.fetchone()
+    if not row or row[0] is None:
+        return None
+    return str(row[0])
+
+
+def _resolve_exam_item_name(
+    connection,
+    exam_id: Optional[str],
+    exam_item_id: Optional[str],
+) -> Optional[str]:
+    return (
+        _get_exam_session_exam_item_name(connection, exam_id)
+        or _get_exam_item_name(connection, exam_item_id)
+    )
+
+
+def _resolve_configured_total_score(
+    connection,
+    exam_id: Optional[str],
+    exam_item_id: Optional[str],
+    fallback: float,
+) -> float:
+    session_total_score = _get_exam_session_total_score(connection, exam_id)
+    if session_total_score is not None:
+        return session_total_score
+    item_total_score = _get_exam_item_total_score(connection, exam_item_id)
+    if item_total_score is not None:
+        return item_total_score
+    return float(fallback or 0)
+
+
 def _upsert_exam_session(
     connection,
     exam_id: str,
@@ -588,14 +901,31 @@ def _upsert_exam_session(
     exam_item_id: Optional[str],
 ) -> None:
     records = list(getattr(exam_state, "exam_records", []) or [])
-    dimension_scores = dict(getattr(exam_state, "dimension_scores", {}) or {})
+    exam_dimension_scores = dict(getattr(exam_state, "dimension_scores", {}) or {})
     record_dimensions = {
         record.question.dimension
         for record in records
         if getattr(record, "question", None) is not None
     }
-    dimension_names = set(dimension_scores.keys()) | record_dimensions
-    total_score = float(sum(dimension_scores.values()))
+    dimension_scores = _resolve_configured_dimension_scores(
+        connection,
+        exam_id=exam_id,
+        exam_item_id=exam_item_id,
+        fallback=exam_dimension_scores,
+    )
+    dimension_names = set(dimension_scores.keys()) | set(exam_dimension_scores.keys()) | record_dimensions
+    exam_score = float(sum(exam_dimension_scores.values()))
+    total_score = _resolve_configured_total_score(
+        connection,
+        exam_id=exam_id,
+        exam_item_id=exam_item_id,
+        fallback=exam_score,
+    )
+    exam_item_name = _resolve_exam_item_name(
+        connection,
+        exam_id=exam_id,
+        exam_item_id=exam_item_id,
+    )
     ended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with connection.cursor() as cursor:
@@ -616,11 +946,14 @@ def _upsert_exam_session(
                 SET user_id = %s,
                     course_id = %s,
                     exam_item_id = %s,
+                    exam_item_name = %s,
                     candidate_info_json = %s,
                     total_score = %s,
+                    exam_score = %s,
                     dimension_count = %s,
                     question_count = %s,
                     dimension_scores_json = %s,
+                    exam_dimension_scores_json = %s,
                     final_review_json = %s,
                     exam_completed = %s,
                     ended_at = %s
@@ -630,11 +963,14 @@ def _upsert_exam_session(
                     user_id,
                     course_id,
                     exam_item_id,
+                    exam_item_name,
                     to_json(current_user),
                     total_score,
+                    exam_score,
                     len(dimension_names),
                     len(records),
                     to_json(dimension_scores),
+                    to_json(exam_dimension_scores),
                     to_json(final_review),
                     1,
                     ended_at,
@@ -650,26 +986,32 @@ def _upsert_exam_session(
                 user_id,
                 course_id,
                 exam_item_id,
+                exam_item_name,
                 candidate_info_json,
                 total_score,
+                exam_score,
                 dimension_count,
                 question_count,
                 dimension_scores_json,
+                exam_dimension_scores_json,
                 final_review_json,
                 exam_completed,
                 ended_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 exam_id,
                 user_id,
                 course_id,
                 exam_item_id,
+                exam_item_name,
                 to_json(current_user),
                 total_score,
+                exam_score,
                 len(dimension_names),
                 len(records),
                 to_json(dimension_scores),
+                to_json(exam_dimension_scores),
                 to_json(final_review),
                 1,
                 ended_at,
@@ -723,6 +1065,7 @@ def _insert_exam_questions(connection, exam_id: str, exam_state) -> None:
             record.correctness_level,
             record.evaluation,
             question.standard_answer,
+            1 if getattr(question, "is_preset_question", False) else 0,
         ))
 
     if not rows:
@@ -743,8 +1086,9 @@ def _insert_exam_questions(connection, exam_id: str, exam_state) -> None:
                 student_answer,
                 correctness_level,
                 evaluation,
-                standard_answer
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                standard_answer,
+                is_preset_question
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             rows,
         )
@@ -783,7 +1127,11 @@ def _get_exam_history_by_user_sync(
                     exam_id,
                     course_id,
                     exam_item_id,
+                    exam_item_name,
                     total_score,
+                    exam_score,
+                    dimension_scores_json,
+                    exam_dimension_scores_json,
                     dimension_count,
                     question_count,
                     ended_at,
@@ -793,6 +1141,54 @@ def _get_exam_history_by_user_sync(
                 ORDER BY ended_at DESC, created_at DESC
                 """,
                 params,
+            )
+            rows = cursor.fetchall()
+        return [history_row_to_dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def _get_exam_history_by_course_sync(
+    course_id: str,
+    user_id: Optional[str],
+    include_all_users: bool,
+    exam_item_id: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        where_sql = "WHERE course_id = %s AND exam_completed = 1"
+        params: List[object] = [course_id]
+        if not include_all_users:
+            if not user_id:
+                raise ValueError("user_id is required for user scoped query")
+            where_sql += " AND user_id = %s"
+            params.append(user_id)
+        if exam_item_id:
+            where_sql += " AND exam_item_id = %s"
+            params.append(exam_item_id)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    exam_id,
+                    course_id,
+                    exam_item_id,
+                    exam_item_name,
+                    total_score,
+                    exam_score,
+                    dimension_scores_json,
+                    exam_dimension_scores_json,
+                    dimension_count,
+                    question_count,
+                    ended_at,
+                    created_at
+                FROM exam_sessions
+                {where_sql}
+                ORDER BY ended_at DESC, created_at DESC
+                """,
+                tuple(params),
             )
             rows = cursor.fetchall()
         return [history_row_to_dict(row) for row in rows]
@@ -835,6 +1231,7 @@ def _get_exam_record_by_exam_id_sync(
                     q.correctness_level,
                     q.evaluation,
                     q.standard_answer,
+                    q.is_preset_question,
                     q.created_at
                 FROM exam_questions q
                 JOIN exam_sessions s ON q.exam_id = s.exam_id
@@ -846,5 +1243,86 @@ def _get_exam_record_by_exam_id_sync(
             )
             rows = cursor.fetchall()
         return [record_row_to_dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def _get_exam_questions_by_exam_item_sync(
+    course_id: str,
+    exam_item_id: str,
+    user_id: Optional[str],
+    include_all_users: bool,
+) -> List[Dict[str, object]]:
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        where_sql = """
+            WHERE s.course_id = %s
+              AND s.exam_item_id = %s
+        """
+        params: List[object] = [course_id, exam_item_id]
+        if not include_all_users:
+            if not user_id:
+                raise ValueError("user_id is required for user scoped query")
+            where_sql += " AND s.user_id = %s"
+            params.append(user_id)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    s.exam_id,
+                    s.user_id,
+                    s.course_id,
+                    s.exam_item_id,
+                    s.exam_item_name,
+                    s.total_score,
+                    s.exam_score,
+                    s.exam_completed,
+                    s.ended_at,
+                    s.created_at,
+                    q.record_index,
+                    q.question_id,
+                    q.question_content,
+                    q.question_dimension,
+                    q.question_score,
+                    q.based_on_record_index,
+                    q.source_detail,
+                    q.student_answer,
+                    q.correctness_level,
+                    q.evaluation,
+                    q.standard_answer,
+                    q.is_preset_question,
+                    q.created_at
+                FROM exam_sessions s
+                JOIN exam_questions q ON q.exam_id = s.exam_id
+                {where_sql}
+                ORDER BY s.created_at DESC, q.record_index ASC, q.id ASC
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+
+        sessions: Dict[str, Dict[str, object]] = {}
+        for row in rows:
+            exam_id = str(row[0])
+            session = sessions.setdefault(
+                exam_id,
+                {
+                    "exam_id": exam_id,
+                    "user_id": row[1],
+                    "course_id": row[2],
+                    "exam_item_id": row[3],
+                    "exam_item_name": row[4],
+                    "total_score": row[5],
+                    "exam_score": row[6],
+                    "exam_completed": bool(row[7]),
+                    "ended_at": row[8].strftime("%Y-%m-%d %H:%M:%S") if row[8] is not None else None,
+                    "created_at": row[9].strftime("%Y-%m-%d %H:%M:%S") if row[9] is not None else None,
+                    "questions": [],
+                },
+            )
+            session["questions"].append(record_row_to_dict(row[10:]))
+        return list(sessions.values())
     finally:
         connection.close()

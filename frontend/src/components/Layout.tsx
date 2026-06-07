@@ -6,20 +6,22 @@ import { useExamSession } from '../hooks/useExamSession'
 const baseNavItems = [
   { to: '/dashboard', icon: 'fa-chart-pie', label: '仪表盘' },
   { to: '/exam', icon: 'fa-microphone', label: 'AI 口语考试' },
-  { to: '/upload', icon: 'fa-cloud-upload-alt', label: '数据上传' },
+  { to: '/join', icon: 'fa-user-plus', label: '课程申请' },
   { to: '/history', icon: 'fa-history', label: '考试历史管理' },
 ]
 
 const teacherOnlyItems = [
   { to: '/courses', icon: 'fa-book', label: '课程管理' },
+  { to: '/join-mgmt', icon: 'fa-clipboard-check', label: '申请管理' },
 ]
 
 const pageTitles: Record<string, string> = {
   '/dashboard': '仪表盘',
   '/exam': 'AI 口语考试',
-  '/upload': '数据上传',
+  '/join': '课程申请',
   '/history': '考试历史管理',
   '/courses': '课程管理',
+  '/join-mgmt': '申请管理',
 }
 
 export default function Layout() {
@@ -49,7 +51,7 @@ export default function Layout() {
   const pageTitle = pageTitles[location.pathname] || 'AI Oral Exam'
 
   const navItems = user?.role === 'teacher'
-    ? [...baseNavItems.slice(0, 2), ...teacherOnlyItems, ...baseNavItems.slice(2)]
+    ? [...baseNavItems.slice(0, 3), ...teacherOnlyItems, ...baseNavItems.slice(3)]
     : baseNavItems
 
   const handleLogout = async () => {

@@ -290,6 +290,7 @@ class InsertTool(BaseTool):
         exam_id: str | None = None,
         work_dir: str | None = None,
         reload: bool = False,
+        upload_batch_id: str | None = None,
     ) -> str:
         if type == "file":
             chunksList = await self.fileParser.execute(file_paths=data, work_dir=work_dir)
@@ -324,7 +325,7 @@ class InsertTool(BaseTool):
                     },
                 }
             },
-            "filterableAttributes": ["source", "course_id", "exam_id"],
+            "filterableAttributes": ["source", "course_id", "exam_id", "upload_batch_id"],
         }
 
         task = index.update_settings(settings)
@@ -342,6 +343,7 @@ class InsertTool(BaseTool):
                     "source": source,
                     "course_id": course_id,
                     "exam_id": exam_id,
+                    "upload_batch_id": upload_batch_id,
                     "content": chunk,
                 }
                 for chunk in chunks
@@ -367,15 +369,54 @@ class InsertTool(BaseTool):
         safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
         return f"course_{safe_course_id}"
 
+    def delete_documents_by_batch(
+        self,
+        course_id: str | None,
+        upload_batch_id: str | None,
+    ) -> None:
+        if not upload_batch_id or not str(upload_batch_id).strip():
+            return
+        index = self.client.index(self._course_index_name(course_id))
+        self._delete_documents_by_filter(
+            index,
+            f'upload_batch_id = "{self._escape_filter_value(str(upload_batch_id).strip())}"',
+        )
+
+    def delete_existing_documents_except_batch(
+        self,
+        course_id: str | None,
+        source: str,
+        exam_id: str | None,
+        upload_batch_id: str | None,
+    ) -> None:
+        filter_expr = self._existing_documents_filter(source, exam_id)
+        index = self.client.index(self._course_index_name(course_id))
+        excluded_batch_id = str(upload_batch_id or "").strip()
+        self._delete_documents_by_filter(
+            index,
+            filter_expr,
+            exclude_upload_batch_id=excluded_batch_id or None,
+        )
+
     def _delete_existing_documents(self, index, source: str, exam_id: str | None) -> None:
+        self._delete_documents_by_filter(index, self._existing_documents_filter(source, exam_id))
+
+    def _existing_documents_filter(self, source: str, exam_id: str | None) -> str:
         if not source or not str(source).strip():
             raise ValueError("source is required when reload is true")
         if not exam_id or not str(exam_id).strip():
             raise ValueError("exam_id is required when reload is true")
-        filter_expr = (
+        return (
             f'source = "{self._escape_filter_value(source)}" '
             f'AND exam_id = "{self._escape_filter_value(str(exam_id).strip())}"'
         )
+
+    def _delete_documents_by_filter(
+        self,
+        index,
+        filter_expr: str,
+        exclude_upload_batch_id: str | None = None,
+    ) -> None:
         document_ids = []
         offset = 0
         limit = 1000
@@ -387,11 +428,19 @@ class InsertTool(BaseTool):
                     "filter": filter_expr,
                     "limit": limit,
                     "offset": offset,
-                    "attributesToRetrieve": ["id"],
+                    "attributesToRetrieve": ["id", "upload_batch_id"],
                 },
             )
             hits = results.get("hits", [])
-            document_ids.extend(hit["id"] for hit in hits if hit.get("id"))
+            document_ids.extend(
+                hit["id"]
+                for hit in hits
+                if hit.get("id")
+                and (
+                    exclude_upload_batch_id is None
+                    or str(hit.get("upload_batch_id") or "") != exclude_upload_batch_id
+                )
+            )
 
             if not hits or len(hits) < limit:
                 break

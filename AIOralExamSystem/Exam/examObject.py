@@ -20,11 +20,14 @@ class Question:
     # 当前默认每题 1 分，保留字段是为了后续支持不同题目分值。
     score: float = 1.0
     standard_answer: Optional[str] = None
-    # -1 表示基础题；其他值表示该题依赖的历史答题记录下标。
-    based_on_record_index: int = -1
+    record_index: Optional[int] = None
+    based_on_record_index: str = "-1"
+    # "-1" 表示基础题；其他值表示该题依赖的父题 question_id。
+    based_on_record_index: str = "-1"
 
     # 生成题目时的补充来源信息，便于日志排查。
     source_detail: Optional[str] = None
+    is_preset_question: bool = False
 
     def __post_init__(self):
         question_blocks = self._normalize_question_blocks(self.question_blocks)
@@ -162,6 +165,7 @@ class CandidateExamState:
         # 预备队列按 FIFO 出题，优先队列按 priority/sequence 出题。
         self.prepared_question_queues: Dict[str, Deque[Question]] = {}
         self.priority_question_queues: Dict[str, List[PriorityQuestion]] = {}
+        self.preset_question_queues: Dict[str, Deque[Question]] = {}
 
         # 当前正在等待用户回答的题目，在 AI 真正发出题目时更新。
         self.current_question: Optional[Question] = None
@@ -189,6 +193,13 @@ class CandidateExamState:
             questions.extend(queue)
         return questions
 
+    @property
+    def preset_question_queue(self) -> Deque[Question]:
+        questions: Deque[Question] = deque()
+        for queue in self.preset_question_queues.values():
+            questions.extend(queue)
+        return questions
+
     def _ensure_dimension_state(self, dimension: str) -> str:
         dimension = str(dimension or "default").strip() or "default"
         self.dimension_scores.setdefault(dimension, self.default_score)
@@ -200,6 +211,7 @@ class CandidateExamState:
         self.dimension_finished.setdefault(dimension, False)
         self.prepared_question_queues.setdefault(dimension, deque())
         self.priority_question_queues.setdefault(dimension, [])
+        self.preset_question_queues.setdefault(dimension, deque())
         return dimension
 
     def initialize_dimensions(self, dimensions: List[str]) -> None:
@@ -414,6 +426,11 @@ class CandidateExamState:
         )
         self._log_question_event("priority_question_added", question, priority=priority)
 
+    def add_preset_question(self, question: Question) -> None:
+        dimension = self._ensure_dimension_state(question.dimension)
+        self.preset_question_queues[dimension].append(question)
+        self._log_question_event("preset_question_added", question)
+
     def has_next_question(self, dimension: Optional[str] = None) -> bool:
         """判断指定维度或全局是否还有可用题目。"""
 
@@ -422,10 +439,11 @@ class CandidateExamState:
             return bool(
                 self.priority_question_queues[dimension]
                 or self.prepared_question_queues[dimension]
+                or self.preset_question_queues[dimension]
             )
         return any(self.priority_question_queues.values()) or any(
             self.prepared_question_queues.values()
-        )
+        ) or any(self.preset_question_queues.values())
 
     def pop_next_question(self, dimension: Optional[str] = None) -> Optional[Question]:
         """按旧规则弹出下一题：先优先队列，再预备队列。"""
@@ -444,6 +462,11 @@ class CandidateExamState:
             if question:
                 return question
 
+        for active_dimension in list(self.preset_question_queues):
+            question = self._pop_next_preset_question(active_dimension)
+            if question:
+                return question
+
         return None
 
     def pop_ready_question(
@@ -456,8 +479,8 @@ class CandidateExamState:
 
         last_record_index = self._record_index_for_question(last_answered_question)
         if last_answered_question is None and self.exam_records:
-            last_record_index = len(self.exam_records) - 1
-            last_answered_question = self.exam_records[last_record_index].question
+            last_answered_question = self.exam_records[-1].question
+            last_record_index = self._record_index_for_question(last_answered_question)
 
         if last_answered_question is None:
             return self._pop_any_ready_question()
@@ -486,8 +509,8 @@ class CandidateExamState:
 
         last_record_index = self._record_index_for_question(last_answered_question)
         if last_answered_question is None and self.exam_records:
-            last_record_index = len(self.exam_records) - 1
-            last_answered_question = self.exam_records[last_record_index].question
+            last_answered_question = self.exam_records[-1].question
+            last_record_index = self._record_index_for_question(last_answered_question)
 
         if last_answered_question is None:
             return self._has_any_ready_question()
@@ -505,24 +528,23 @@ class CandidateExamState:
 
         return self._has_any_ready_question()
 
-    def _record_index_for_question(self, question: Optional[Question]) -> Optional[int]:
+    def _record_index_for_question(self, question: Optional[Question]) -> Optional[str]:
         if question is None:
             return None
-        for index in range(len(self.exam_records) - 1, -1, -1):
-            recorded_question = self.exam_records[index].question
-            if recorded_question is question:
-                return index
-            if recorded_question.question_id == question.question_id:
-                return index
-        return None
+        return question.question_id
+
+    def record_index_for_question(self, question: Optional[Question]) -> Optional[str]:
+        return self._record_index_for_question(question)
 
     def _question_has_ready_parent(self, question: Question) -> bool:
-        parent_index = question.based_on_record_index
-        if parent_index == -1:
+        parent_question_id = str(question.based_on_record_index or "").strip()
+        if not parent_question_id or parent_question_id == "-1":
             return True
-        if not 0 <= parent_index < len(self.exam_records):
-            return False
-        return bool(self.exam_records[parent_index].question.question_id)
+        return any(
+            record.question.question_id == parent_question_id
+            for record in self.exam_records
+            if record.question is not None
+        )
 
     def _pop_any_ready_question(self, excluded_dimension: Optional[str] = None) -> Optional[Question]:
         question = self._pop_best_ready_priority_question(excluded_dimension)
@@ -539,6 +561,16 @@ class CandidateExamState:
             if question:
                 return question
 
+        for active_dimension in list(self.preset_question_queues):
+            if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
+                continue
+            question = self._pop_preset_question_matching(
+                active_dimension,
+                self._question_has_ready_parent,
+            )
+            if question:
+                return question
+
         return None
 
     def _has_any_ready_question(self, excluded_dimension: Optional[str] = None) -> bool:
@@ -549,6 +581,12 @@ class CandidateExamState:
                 return True
 
         for active_dimension, queue in self.prepared_question_queues.items():
+            if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
+                continue
+            if any(self._question_has_ready_parent(question) for question in queue):
+                return True
+
+        for active_dimension, queue in self.preset_question_queues.items():
             if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
                 continue
             if any(self._question_has_ready_parent(question) for question in queue):
@@ -617,6 +655,19 @@ class CandidateExamState:
 
         return None
 
+    def _pop_preset_question_matching(self, dimension: str, predicate) -> Optional[Question]:
+        queue = self.preset_question_queues.get(dimension)
+        if not queue:
+            return None
+
+        for _ in range(len(queue)):
+            question = queue.popleft()
+            if predicate(question):
+                return self._activate_popped_question(question)
+            queue.append(question)
+
+        return None
+
     def _activate_popped_question(self, question: Question) -> Question:
         self.set_current_dimension(question.dimension)
         return question
@@ -625,7 +676,10 @@ class CandidateExamState:
         question = self._pop_next_priority_question(dimension)
         if question:
             return question
-        return self._pop_next_prepared_question(dimension)
+        question = self._pop_next_prepared_question(dimension)
+        if question:
+            return question
+        return self._pop_next_preset_question(dimension)
 
     def _pop_next_priority_question(self, dimension: Optional[str] = None) -> Optional[Question]:
         if dimension is not None:
@@ -653,6 +707,13 @@ class CandidateExamState:
         question = queue.popleft()
         return self._activate_popped_question(question)
 
+    def _pop_next_preset_question(self, dimension: str) -> Optional[Question]:
+        queue = self.preset_question_queues.get(dimension)
+        if not queue:
+            return None
+        question = queue.popleft()
+        return self._activate_popped_question(question)
+
     def record_answer(
         self,
         question: Question,
@@ -663,6 +724,7 @@ class CandidateExamState:
         """记录一次已完成答题。"""
 
         self.set_current_dimension(question.dimension)
+        object.__setattr__(question, "record_index", len(self.exam_records))
         record = QARecord(
             question=question,
             correctness_level=correctness_level,
@@ -759,12 +821,20 @@ class CandidateExamState:
             lines.append(f"{dimension}: {contents}")
         return "\n".join(lines) if lines else "(empty)"
 
+    def _format_preset_queue_contents(self) -> str:
+        lines: List[str] = []
+        for dimension, queue in self.preset_question_queues.items():
+            contents = [question.content for question in queue]
+            lines.append(f"{dimension}: {contents}")
+        return "\n".join(lines) if lines else "(empty)"
+
     def _log_question_event(self, event: str, question: Question, priority: Optional[int] = None) -> None:
-        if event in {"prepared_question_added", "priority_question_added"}:
+        if event in {"prepared_question_added", "priority_question_added", "preset_question_added"}:
             logger.info(
                 "\n[CandidateExamState] Question queue snapshot\n"
                 f"priority_question_queue:\n{self._format_priority_queue_contents()}\n"
-                f"prepared_question_queue:\n{self._format_prepared_queue_contents()}"
+                f"prepared_question_queue:\n{self._format_prepared_queue_contents()}\n"
+                f"preset_question_queue:\n{self._format_preset_queue_contents()}"
             )
             return
 

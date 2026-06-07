@@ -100,7 +100,7 @@ export default function Exam() {
 
   const handleStart = useCallback(() => {
     console.log('[Exam] 点击 Start, micStream:', micStream ? '已就绪' : '未就绪')
-    startSession(micStream, examId ? { exam_item_id: examId } : undefined)
+    startSession(micStream, examId ? { exam_id: examId } : undefined)
   }, [startSession, micStream, examId])
 
   const handleSendText = useCallback((text: string) => {
