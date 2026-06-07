@@ -60,7 +60,6 @@ class GitRepositoryTool(BaseTool):
         exam_id: Optional[str] = None,
         git_branch: Optional[str] = None,
         reload: bool = False,
-        target_root: Optional[str] = None,
     ) -> str:
         with ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
@@ -78,7 +77,6 @@ class GitRepositoryTool(BaseTool):
                 exam_id,
                 git_branch,
                 reload,
-                target_root,
             )
 
     def fetch_repository(
@@ -94,7 +92,6 @@ class GitRepositoryTool(BaseTool):
         exam_id: Optional[str] = None,
         git_branch: Optional[str] = None,
         reload: bool = False,
-        target_root: Optional[str] = None,
     ) -> str:
         logs = []
         repo_url = self._require_text(repo_url, "repo_url")
@@ -129,11 +126,7 @@ class GitRepositoryTool(BaseTool):
                 self._append_log(logs, "mode", "success", "No code_path/doc_path provided; listing files and tree only.")
                 return self._list_repository_directories(repo_url, branch, accelerator_urls, logs)
 
-            repo_root = (
-                Path(target_root).expanduser().resolve()
-                if target_root and str(target_root).strip()
-                else self._repo_cache_root(storage_dir, user_uuid, repo_url, course_id, exam_id, git_branch)
-            )
+            repo_root = self._repo_cache_root(storage_dir, user_uuid, repo_url, course_id, exam_id, git_branch)
             manifest_path = repo_root / "manifest.json"
             self._append_log(logs, "cache_check", "success", "Checking local repository cache.", repository_root=str(repo_root))
 

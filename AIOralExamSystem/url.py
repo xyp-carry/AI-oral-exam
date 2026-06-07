@@ -1,6 +1,4 @@
 import json
-import shutil
-import uuid
 from pathlib import Path
 from typing import Dict, List
 
@@ -9,7 +7,6 @@ from loguru import logger
 from pydantic import BaseModel
 
 from AIOralExamSystem.Exam.Examdata.exam_repository import (
-    get_exam_session_by_exam_id,
     has_repository_url_by_exam_session,
     update_exam_session_repository_url,
 )
@@ -53,17 +50,14 @@ class ExamItemCreateRequest(BaseModel):
     description: str | None = None
     item_type: str | None = None
     need_code_repository: bool = False
-    use_preset_questions: bool = False
 
 
 class ExamItemUpdateRequest(BaseModel):
     exam_item_name: str | None = None
     dimensions: List[ExamItemDimension] | None = None
-    exam_available_valid_times: int | None = None
     description: str | None = None
     item_type: str | None = None
     need_code_repository: bool | None = None
-    use_preset_questions: bool | None = None
 
 
 class ExamItemAvailabilityRequest(BaseModel):
@@ -76,26 +70,6 @@ class GitRepositoryUploadRequest(BaseModel):
     git_url: str
     git_branch: str
     reload: bool = False
-
-
-class PresetQuestionCreateRequest(BaseModel):
-    question_dimension: str
-    question_content: str
-    standard_answer: str | None = None
-    score: float = 1.0
-    sort_order: int | None = None
-
-
-class PresetQuestionUpdateRequest(BaseModel):
-    question_dimension: str | None = None
-    question_content: str | None = None
-    standard_answer: str | None = None
-    score: float | None = None
-    sort_order: int | None = None
-
-
-class ExamSessionPresetUsageRequest(BaseModel):
-    use_preset_questions: bool
 
 
 def course_error_detail(code: str, message: str) -> dict:
@@ -121,17 +95,6 @@ def raise_course_value_error(error: ValueError) -> None:
         "INVITE_CODE_VALID_TIMES_INVALID": (400, "邀请码有效时长必须在 1 到 2592000 秒之间"),
         "EXAM_AVAILABLE_VALID_TIMES_INVALID": (400, "考试可开启时长必须在 1 到 2592000 秒之间"),
     }
-    error_map.update({
-        "EXAM_ITEM_NOT_FOUND": (404, "考试项不存在"),
-        "EXAM_SESSION_NOT_FOUND": (404, "考试记录不存在或已完成"),
-        "PRESET_QUESTION_NOT_FOUND": (404, "预设题目不存在"),
-        "PRESET_QUESTION_DIMENSION_REQUIRED": (400, "预设题目维度不能为空"),
-        "PRESET_QUESTION_DIMENSION_INVALID": (400, "预设题目维度必须属于该考试项"),
-        "PRESET_QUESTION_CONTENT_REQUIRED": (400, "预设题目内容不能为空"),
-        "PRESET_QUESTION_SCORE_INVALID": (400, "预设题目分值不合法"),
-        "PRESET_QUESTION_SORT_ORDER_INVALID": (400, "预设题目排序值不合法"),
-        "PRESET_QUESTION_BLOCKS_INVALID": (400, "预设题目结构化内容必须是列表"),
-    })
     if message in error_map:
         status_code, detail = error_map[message]
         raise HTTPException(
@@ -178,37 +141,6 @@ def _collect_files(root: Path) -> List[str]:
     ]
 
 
-def _remove_path(path: Path | None) -> None:
-    if not path or not path.exists():
-        return
-    if path.is_dir():
-        shutil.rmtree(path)
-    else:
-        path.unlink()
-
-
-def _move_path(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source), str(target))
-
-
-def _swap_repository_root(staging_root: Path, final_root: Path, backup_root: Path) -> bool:
-    had_original = final_root.exists()
-    if backup_root.exists():
-        _remove_path(backup_root)
-    if had_original:
-        _move_path(final_root, backup_root)
-    _move_path(staging_root, final_root)
-    return had_original
-
-
-def _restore_repository_root(final_root: Path, backup_root: Path, had_original: bool, final_root_swapped: bool) -> None:
-    if final_root_swapped and final_root.exists():
-        _remove_path(final_root)
-    if had_original and backup_root.exists():
-        _move_path(backup_root, final_root)
-
-
 def exam_routes(app, args):
     """Register course, exam, and git repository routes."""
 
@@ -228,28 +160,9 @@ def exam_routes(app, args):
         if not course_id or not user_id or not exam_id or not git_url or not git_branch:
             return _failure("course_id、user_id、exam_id、git_url、git_branch 不能为空")
 
-        upload_batch_id = str(uuid.uuid4())
-        tool = GitRepositoryTool("git_repository_tool")
-        final_root = tool._repo_cache_root(None, user_id, git_url, course_id, exam_id, git_branch)
-        staging_root = final_root.parent / f".staging-{final_root.name}-{upload_batch_id}"
-        backup_root = final_root.parent / f".backup-{final_root.name}-{upload_batch_id}"
-        old_repository_url = ""
-        insert_tool = None
-        had_original = False
-        final_root_swapped = False
-        db_updated = False
-
         try:
-            exam_session = await get_exam_session_by_exam_id(exam_id)
-            if (
-                not exam_session
-                or str(exam_session.get("user_id")) != str(user_id)
-                or str(exam_session.get("course_id")) != course_id
-            ):
-                return _failure("未找到当前用户对应的考试记录")
-            old_repository_url = str(exam_session.get("repository_url") or "")
-
-            _remove_path(staging_root)
+            tool = GitRepositoryTool("git_repository_tool")
+            # Wait for repository processing to finish before returning the API response.
             raw_result = await tool._run(
                 repo_url=git_url,
                 user_uuid=user_id,
@@ -259,85 +172,21 @@ def exam_routes(app, args):
                 course_id=course_id,
                 exam_id=exam_id,
                 git_branch=git_branch,
-                reload=True,
-                target_root=str(staging_root),
+                reload=req.reload,
             )
             result = json.loads(raw_result)
-            if _git_tool_failed(result):
-                raise RuntimeError(_git_tool_failure_reason(result))
-
-            doc_root = Path(str(result.get("repository_root", ""))) / "doc"
-            doc_work_dir = Path(str(result.get("repository_root", ""))) / "FILE"
-            doc_files = _collect_files(doc_root)
-            settings = get_settings()
-            monitor = GlobalMonitor()
-            monitor.start()
-            insert_tool = InsertTool("insert_tool", settings.mineru_api_key)
-            for doc_file in doc_files:
-                await insert_tool.execute(
-                    data=[doc_file],
-                    source=user_id,
-                    type="file",
-                    course_id=course_id,
-                    exam_id=exam_id,
-                    work_dir=str(doc_work_dir),
-                    reload=False,
-                    upload_batch_id=upload_batch_id,
-                )
-
-            had_original = _swap_repository_root(staging_root, final_root, backup_root)
-            final_root_swapped = True
-
-            if req.reload:
-                insert_tool.delete_existing_documents_except_batch(
-                    course_id=course_id,
-                    source=user_id,
-                    exam_id=exam_id,
-                    upload_batch_id=upload_batch_id,
-                )
-
-            updated = await update_exam_session_repository_url(
-                user_id=user_id,
-                course_id=course_id,
-                exam_id=exam_id,
-                repository_url=git_url,
-            )
-            if not updated:
-                raise RuntimeError("未找到对应的考试记录，数据库未更新")
-            db_updated = True
-
-            _remove_path(backup_root)
         except json.JSONDecodeError as e:
-            _remove_path(staging_root)
             logger.exception("Git 仓库工具返回结果不是合法 JSON")
             return _failure(f"Git 仓库工具返回结果解析失败: {str(e)}")
         except Exception as e:
             logger.exception("Git 仓库上传失败")
-            try:
-                if insert_tool is not None:
-                    insert_tool.delete_documents_by_batch(course_id, upload_batch_id)
-            except Exception:
-                logger.exception("Rollback failed while deleting inserted document batch")
-            try:
-                _restore_repository_root(final_root, backup_root, had_original, final_root_swapped)
-                _remove_path(staging_root)
-                _remove_path(backup_root)
-            except Exception:
-                logger.exception("Rollback failed while restoring repository files")
-            if db_updated:
-                try:
-                    await update_exam_session_repository_url(
-                        user_id=user_id,
-                        course_id=course_id,
-                        exam_id=exam_id,
-                        repository_url=old_repository_url,
-                    )
-                except Exception:
-                    logger.exception("Rollback failed while restoring repository_url")
             return _failure(str(e))
 
+        if _git_tool_failed(result):
+            return _failure(_git_tool_failure_reason(result))
+
         try:
-            if False and not req.reload:
+            if not req.reload:
                 updated = await update_exam_session_repository_url(
                     user_id=user_id,
                     course_id=course_id,
@@ -352,6 +201,29 @@ def exam_routes(app, args):
 
         if not updated:
             return _failure("Git 仓库已保存，但未找到对应的考试记录")
+
+        doc_root = Path(str(result.get("repository_root", ""))) / "doc"
+        doc_work_dir = Path(str(result.get("repository_root", ""))) / "FILE"
+        doc_files = _collect_files(doc_root)
+        if doc_files:
+            try:
+                settings = get_settings()
+                monitor = GlobalMonitor()
+                monitor.start()
+                insert_tool = InsertTool("insert_tool", settings.mineru_api_key)
+                for index, doc_file in enumerate(doc_files):
+                    await insert_tool.execute(
+                        data=[doc_file],
+                        source=user_id,
+                        type="file",
+                        course_id=course_id,
+                        exam_id=exam_id,
+                        work_dir=str(doc_work_dir),
+                        reload=req.reload and index == 0,
+                    )
+            except Exception as e:
+                logger.exception("Git documents insert failed")
+                return _failure(f"Git repository saved, but documents insert failed: {str(e)}")
 
         return {
             "success": True,
@@ -386,18 +258,10 @@ def exam_routes(app, args):
             "has_repository_url": has_repository_url,
         }
 
-    @app.get("/exam_history/{course_id}")
-    async def exam_history(
-        course_id: str,
-        exam_item_id: str | None = None,
-        current_user: dict = Depends(get_current_user),
-    ):
+    @app.get("/exam_history")
+    async def exam_history(current_user: dict = Depends(get_current_user)):
         try:
-            history = await QAserver.get_exam_history(
-                current_user,
-                course_id,
-                exam_item_id=exam_item_id,
-            )
+            history = await QAserver.get_exam_history(current_user)
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=str(e))
         except ValueError as e:
@@ -408,22 +272,6 @@ def exam_routes(app, args):
         return {
             "success": True,
             "data": history,
-        }
-
-    @app.get("/exam_items/{exam_item_id}/questions")
-    async def exam_item_questions(exam_item_id: str, current_user: dict = Depends(get_current_user)):
-        try:
-            questions = await QAserver.get_exam_questions_by_exam_item(current_user, exam_item_id)
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=str(e))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("查询考试题目失败")
-            raise HTTPException(status_code=500, detail=f"查询考试题目失败: {str(e)}")
-        return {
-            "success": True,
-            "data": questions,
         }
 
     @app.get("/exam_record")
@@ -674,7 +522,6 @@ def exam_routes(app, args):
                 description=req.description,
                 item_type=req.item_type,
                 need_code_repository=req.need_code_repository,
-                use_preset_questions=req.use_preset_questions,
             )
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
@@ -717,165 +564,6 @@ def exam_routes(app, args):
             "data": sessions,
         }
 
-    @app.put("/courses/{course_id}/exam_sessions/{exam_id}/preset_questions_usage")
-    async def update_exam_session_preset_questions_usage(
-        course_id: str,
-        exam_id: str,
-        req: ExamSessionPresetUsageRequest,
-        current_user: dict = Depends(get_current_user),
-    ):
-        try:
-            updated = await QAserver.update_exam_session_preset_question_usage(
-                current_user=current_user,
-                course_id=course_id,
-                exam_id=exam_id,
-                use_preset_questions=req.use_preset_questions,
-            )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("更新考试预设题目开关失败")
-            raise HTTPException(status_code=500, detail=f"更新考试预设题目开关失败: {str(e)}")
-        if not updated:
-            raise HTTPException(
-                status_code=404,
-                detail=course_error_detail("EXAM_SESSION_NOT_FOUND", "考试记录不存在或已完成"),
-            )
-        return {
-            "success": True,
-            "message": "考试预设题目开关更新成功",
-        }
-
-    @app.post("/courses/{course_id}/exam_items/{exam_item_id}/preset_questions")
-    async def create_preset_question(
-        course_id: str,
-        exam_item_id: str,
-        req: PresetQuestionCreateRequest,
-        current_user: dict = Depends(get_current_user),
-    ):
-        try:
-            result = await QAserver.manage_preset_question(
-                current_user=current_user,
-                action="create",
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                question_dimension=req.question_dimension,
-                question_content=req.question_content,
-                standard_answer=req.standard_answer,
-                score=req.score,
-                sort_order=req.sort_order,
-            )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("创建预设题目失败")
-            raise HTTPException(status_code=500, detail=f"创建预设题目失败: {str(e)}")
-        return {
-            "success": True,
-            "message": "预设题目创建成功",
-            "data": result,
-        }
-
-    @app.get("/courses/{course_id}/exam_items/{exam_item_id}/preset_questions")
-    async def list_preset_questions(
-        course_id: str,
-        exam_item_id: str,
-        current_user: dict = Depends(get_current_user),
-    ):
-        try:
-            questions = await QAserver.manage_preset_question(
-                current_user=current_user,
-                action="list",
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-            )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("查询预设题目失败")
-            raise HTTPException(status_code=500, detail=f"查询预设题目失败: {str(e)}")
-        return {
-            "success": True,
-            "data": questions,
-        }
-
-    @app.put("/courses/{course_id}/exam_items/{exam_item_id}/preset_questions/{preset_question_id}")
-    async def update_preset_question(
-        course_id: str,
-        exam_item_id: str,
-        preset_question_id: str,
-        req: PresetQuestionUpdateRequest,
-        current_user: dict = Depends(get_current_user),
-    ):
-        try:
-            updated = await QAserver.manage_preset_question(
-                current_user=current_user,
-                action="update",
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                preset_question_id=preset_question_id,
-                question_dimension=req.question_dimension,
-                question_content=req.question_content,
-                standard_answer=req.standard_answer,
-                score=req.score,
-                sort_order=req.sort_order,
-            )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("更新预设题目失败")
-            raise HTTPException(status_code=500, detail=f"更新预设题目失败: {str(e)}")
-        if not updated:
-            raise HTTPException(
-                status_code=404,
-                detail=course_error_detail("PRESET_QUESTION_NOT_FOUND", "预设题目不存在"),
-            )
-        return {
-            "success": True,
-            "message": "预设题目更新成功",
-            "data": updated,
-        }
-
-    @app.delete("/courses/{course_id}/exam_items/{exam_item_id}/preset_questions/{preset_question_id}")
-    async def delete_preset_question(
-        course_id: str,
-        exam_item_id: str,
-        preset_question_id: str,
-        current_user: dict = Depends(get_current_user),
-    ):
-        try:
-            deleted = await QAserver.manage_preset_question(
-                current_user=current_user,
-                action="delete",
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                preset_question_id=preset_question_id,
-            )
-        except PermissionError as e:
-            raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
-        except ValueError as e:
-            raise_course_value_error(e)
-        except Exception as e:
-            logger.exception("删除预设题目失败")
-            raise HTTPException(status_code=500, detail=f"删除预设题目失败: {str(e)}")
-        if not deleted:
-            raise HTTPException(
-                status_code=404,
-                detail=course_error_detail("PRESET_QUESTION_NOT_FOUND", "预设题目不存在"),
-            )
-        return {
-            "success": True,
-            "message": "预设题目删除成功",
-        }
-
     @app.put("/courses/{course_id}/exam_items/{exam_item_id}")
     async def update_exam_item(
         course_id: str,
@@ -891,11 +579,9 @@ def exam_routes(app, args):
                 exam_item_id=exam_item_id,
                 exam_item_name=req.exam_item_name,
                 dimension_scores=dimensions_to_scores(req.dimensions),
-                exam_available_valid_times=req.exam_available_valid_times,
                 description=req.description,
                 item_type=req.item_type,
                 need_code_repository=req.need_code_repository,
-                use_preset_questions=req.use_preset_questions,
             )
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))

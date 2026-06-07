@@ -15,11 +15,7 @@ def ensure_tables(connection) -> None:
         _ensure_courses_invite_code_fields(cursor)
         _ensure_course_exam_items_availability_fields(cursor)
         _ensure_course_exam_items_need_code_repository(cursor)
-        _ensure_course_exam_items_use_preset_questions(cursor)
-        _ensure_exam_preset_questions_extra_fields(cursor)
         _ensure_exam_sessions_no_candidate_id(cursor)
-        _ensure_exam_questions_is_preset_question(cursor)
-        _ensure_exam_questions_based_on_record_index_type(cursor)
         _ensure_exam_questions_exam_id_index(cursor)
 
 
@@ -30,18 +26,14 @@ def _create_exam_tables(cursor) -> None:
             user_id VARCHAR(128),
             course_id VARCHAR(128),
             exam_item_id CHAR(36),
-            exam_item_name VARCHAR(128) DEFAULT NULL,
             candidate_info_json JSON,
             total_score DOUBLE,
-            exam_score DOUBLE DEFAULT NULL,
             dimension_count INT,
             question_count INT,
             dimension_scores_json JSON,
-            exam_dimension_scores_json JSON,
             final_review_json JSON,
             repository_url TEXT DEFAULT NULL,
             need_code_repository TINYINT(1) NOT NULL DEFAULT 0,
-            use_preset_questions TINYINT(1) NOT NULL DEFAULT 0,
             exam_completed TINYINT(1) NOT NULL DEFAULT 0,
             ended_at DATETIME DEFAULT NULL,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -60,13 +52,12 @@ def _create_exam_tables(cursor) -> None:
             question_content TEXT,
             question_dimension VARCHAR(255),
             question_score DOUBLE,
-            based_on_record_index VARCHAR(128),
+            based_on_record_index INT,
             source_detail TEXT,
             student_answer TEXT,
             correctness_level VARCHAR(64),
             evaluation TEXT,
             standard_answer TEXT,
-            is_preset_question TINYINT(1) NOT NULL DEFAULT 0,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_exam_questions_exam_id (exam_id),
             INDEX idx_exam_questions_dimension (question_dimension),
@@ -162,7 +153,6 @@ def _create_course_tables(cursor) -> None:
             participant_count INT NOT NULL DEFAULT 0,
             attempt_count INT NOT NULL DEFAULT 0,
             need_code_repository TINYINT(1) NOT NULL DEFAULT 0,
-            use_preset_questions TINYINT(1) NOT NULL DEFAULT 0,
             exam_available_from DATETIME NOT NULL,
             exam_available_until DATETIME NOT NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
@@ -183,30 +173,6 @@ def _create_course_tables(cursor) -> None:
         ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
     _ensure_course_exam_item_active_name_unique_index(cursor)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS exam_preset_questions (
-            preset_question_id CHAR(36) PRIMARY KEY,
-            exam_item_id CHAR(36) NOT NULL,
-            question_dimension VARCHAR(255) NOT NULL,
-            question_content TEXT NOT NULL,
-            standard_answer TEXT DEFAULT NULL,
-            question_blocks_json JSON DEFAULT NULL,
-            code_fragments_json JSON DEFAULT NULL,
-            score DOUBLE NOT NULL DEFAULT 1,
-            sort_order INT NOT NULL DEFAULT 0,
-            status VARCHAR(20) NOT NULL DEFAULT 'active',
-            created_by VARCHAR(128) NOT NULL,
-            created_at DATETIME NOT NULL,
-            updated_at DATETIME NOT NULL,
-            INDEX idx_exam_preset_questions_exam_item_id (exam_item_id),
-            INDEX idx_exam_preset_questions_dimension (question_dimension),
-            INDEX idx_exam_preset_questions_status (status),
-            CONSTRAINT fk_exam_preset_questions_exam_item
-                FOREIGN KEY (exam_item_id)
-                REFERENCES course_exam_items(exam_item_id)
-                ON DELETE CASCADE
-        ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    """)
 
 
 def _ensure_course_join_requests_user_id(cursor) -> None:
@@ -587,25 +553,6 @@ def _ensure_course_exam_items_need_code_repository(cursor) -> None:
         )
 
 
-def _ensure_course_exam_items_use_preset_questions(cursor) -> None:
-    database = LOCAL_MYSQL_CONFIG["database"]
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s
-          AND TABLE_NAME = 'course_exam_items'
-          AND COLUMN_NAME = 'use_preset_questions'
-        """,
-        (database,),
-    )
-    if cursor.fetchone()[0] == 0:
-        cursor.execute(
-            "ALTER TABLE course_exam_items "
-            "ADD COLUMN use_preset_questions TINYINT(1) NOT NULL DEFAULT 0 AFTER need_code_repository"
-        )
-
-
 def _ensure_exam_questions_exam_id_index(cursor) -> None:
     database = LOCAL_MYSQL_CONFIG["database"]
     cursor.execute(
@@ -622,55 +569,12 @@ def _ensure_exam_questions_exam_id_index(cursor) -> None:
         cursor.execute("ALTER TABLE exam_questions ADD INDEX idx_exam_questions_exam_id (exam_id)")
 
 
-def _ensure_exam_questions_is_preset_question(cursor) -> None:
-    database = LOCAL_MYSQL_CONFIG["database"]
-    cursor.execute(
-        """
-        SELECT COUNT(*)
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s
-          AND TABLE_NAME = 'exam_questions'
-          AND COLUMN_NAME = 'is_preset_question'
-        """,
-        (database,),
-    )
-    if cursor.fetchone()[0] == 0:
-        cursor.execute(
-            "ALTER TABLE exam_questions "
-            "ADD COLUMN is_preset_question TINYINT(1) NOT NULL DEFAULT 0 AFTER standard_answer"
-        )
-
-
-def _ensure_exam_questions_based_on_record_index_type(cursor) -> None:
-    database = LOCAL_MYSQL_CONFIG["database"]
-    cursor.execute(
-        """
-        SELECT DATA_TYPE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s
-          AND TABLE_NAME = 'exam_questions'
-          AND COLUMN_NAME = 'based_on_record_index'
-        """,
-        (database,),
-    )
-    row = cursor.fetchone()
-    if row and str(row[0]).lower() != "varchar":
-        cursor.execute(
-            "ALTER TABLE exam_questions "
-            "MODIFY COLUMN based_on_record_index VARCHAR(128)"
-        )
-
-
 def _ensure_exam_sessions_extra_fields(cursor) -> None:
     database = LOCAL_MYSQL_CONFIG["database"]
     fields = (
         ("repository_url", "TEXT DEFAULT NULL"),
         ("need_code_repository", "TINYINT(1) NOT NULL DEFAULT 0"),
-        ("use_preset_questions", "TINYINT(1) NOT NULL DEFAULT 0"),
         ("exam_completed", "TINYINT(1) NOT NULL DEFAULT 0"),
-        ("exam_score", "DOUBLE DEFAULT NULL"),
-        ("exam_item_name", "VARCHAR(128) DEFAULT NULL"),
-        ("exam_dimension_scores_json", "JSON"),
     )
     for field_name, field_type in fields:
         cursor.execute(
@@ -685,48 +589,6 @@ def _ensure_exam_sessions_extra_fields(cursor) -> None:
         )
         if cursor.fetchone()[0] == 0:
             cursor.execute(f"ALTER TABLE exam_sessions ADD COLUMN {field_name} {field_type}")
-
-    cursor.execute(
-        """
-        UPDATE exam_sessions s
-        SET s.exam_score = s.total_score,
-            s.total_score = COALESCE((
-                SELECT i.total_score
-                FROM course_exam_items i
-                WHERE i.exam_item_id = s.exam_item_id
-                LIMIT 1
-            ), s.total_score)
-        WHERE s.exam_completed = 1
-          AND s.exam_score IS NULL
-        """
-    )
-    cursor.execute(
-        """
-        UPDATE exam_sessions s
-        SET s.exam_item_name = (
-            SELECT i.exam_item_name
-            FROM course_exam_items i
-            WHERE i.exam_item_id = s.exam_item_id
-            LIMIT 1
-        )
-        WHERE s.exam_item_name IS NULL
-          AND s.exam_item_id IS NOT NULL
-        """
-    )
-    cursor.execute(
-        """
-        UPDATE exam_sessions s
-        SET s.exam_dimension_scores_json = s.dimension_scores_json,
-            s.dimension_scores_json = COALESCE((
-                SELECT i.dimension_scores_json
-                FROM course_exam_items i
-                WHERE i.exam_item_id = s.exam_item_id
-                LIMIT 1
-            ), s.dimension_scores_json)
-        WHERE s.exam_completed = 1
-          AND s.exam_dimension_scores_json IS NULL
-        """
-    )
 
 
 def _ensure_exam_sessions_ended_at_nullable(cursor) -> None:
@@ -744,29 +606,6 @@ def _ensure_exam_sessions_ended_at_nullable(cursor) -> None:
     row = cursor.fetchone()
     if row and row[0] == "NO":
         cursor.execute("ALTER TABLE exam_sessions MODIFY COLUMN ended_at DATETIME DEFAULT NULL")
-
-
-def _ensure_exam_preset_questions_extra_fields(cursor) -> None:
-    database = LOCAL_MYSQL_CONFIG["database"]
-    fields = (
-        ("question_blocks_json", "JSON DEFAULT NULL"),
-        ("code_fragments_json", "JSON DEFAULT NULL"),
-        ("score", "DOUBLE NOT NULL DEFAULT 1"),
-        ("sort_order", "INT NOT NULL DEFAULT 0"),
-    )
-    for field_name, field_type in fields:
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = %s
-              AND TABLE_NAME = 'exam_preset_questions'
-              AND COLUMN_NAME = %s
-            """,
-            (database, field_name),
-        )
-        if cursor.fetchone()[0] == 0:
-            cursor.execute(f"ALTER TABLE exam_preset_questions ADD COLUMN {field_name} {field_type}")
 
 
 def _ensure_exam_sessions_unique_user_course_item(cursor) -> None:

@@ -9,7 +9,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@xyflow/react": "^12.11.0",
     "katex": "^0.16.46",
     "lamejs": "^1.2.1",
     "marked": "^15.0.0",

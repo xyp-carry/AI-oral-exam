@@ -10,15 +10,11 @@ from AIOralExamSystem.Exam.Examdata import (
     approve_course_join_request_by_user,
     create_course as create_course_record,
     create_exam_item as create_exam_item_record,
-    create_preset_question as create_preset_question_record,
     delete_course as delete_course_record,
     delete_exam_item as delete_exam_item_record,
-    delete_preset_question as delete_preset_question_record,
     get_course_by_invite_code as get_course_by_invite_code_record,
-    get_exam_history_by_course,
     get_exam_history_by_user,
     get_exam_item_by_id,
-    get_exam_questions_by_exam_item,
     get_exam_record_by_exam_id,
     get_teacher_course_ids,
     is_course_owner,
@@ -28,7 +24,6 @@ from AIOralExamSystem.Exam.Examdata import (
     list_course_join_requests,
     list_exam_sessions_by_course_and_user,
     list_exam_items_by_course,
-    list_preset_questions_by_exam_item,
     list_student_courses,
     list_teacher_courses,
     request_join_course,
@@ -37,8 +32,6 @@ from AIOralExamSystem.Exam.Examdata import (
     save_exam_data,
     update_course as update_course_record,
     update_exam_item as update_exam_item_record,
-    update_exam_session_use_preset_questions as update_exam_session_use_preset_questions_record,
-    update_preset_question as update_preset_question_record,
 )
 from AIOralExamSystem.Exam.Judger import MainJudgerAgent, StageJudgerAgent
 from AIOralExamSystem.Exam.OutputSetting import build_final_review_output
@@ -72,12 +65,6 @@ class QAserver:
         self.task_queue = None
         self._task = None
         self._prepare_generation_pending = False
-        self.need_code_repository = self._flag_enabled(current_user.get("need_code_repository"))
-        self.use_preset_questions = self._flag_enabled(current_user.get("use_preset_questions"))
-        self.preset_only_mode = (
-            not self.need_code_repository
-            and self.use_preset_questions
-        )
 
         if self.exam_state is None:
             return
@@ -88,16 +75,8 @@ class QAserver:
         model_settings = settings.model_dump(mode="json")
         course_id = current_user.get("course_id")
         exam_id = current_user.get("exam_id")
-        file_local_address = (
-            f"{course_id}/{exam_id}/main/doc"
-            if self.need_code_repository and course_id and exam_id
-            else None
-        )
-        code_local_address = (
-            f"{course_id}/{exam_id}/main/code"
-            if self.need_code_repository and course_id and exam_id
-            else None
-        )
+        file_local_address = f"{course_id}/{exam_id}" if course_id and exam_id else None
+        code_local_address = f"{course_id}/{exam_id}/main" if course_id and exam_id else None
         self.exam_setter = ExamSetterAgent(
             model_settings,
             current_user["uuid"],
@@ -124,50 +103,10 @@ class QAserver:
             temperature=0,
         )
 
-    @staticmethod
-    def _flag_enabled(value) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-        return bool(value)
-
     @classmethod
-    async def get_exam_history(
-        cls,
-        current_user: dict,
-        course_id: str,
-        exam_item_id: Optional[str] = None,
-    ) -> List[Dict[str, object]]:
-        user_id, include_all_users = await cls.resolve_course_exam_query_scope(current_user, course_id)
-        return await get_exam_history_by_course(
-            course_id=course_id,
-            user_id=user_id,
-            include_all_users=include_all_users,
-            exam_item_id=exam_item_id,
-        )
-
-    @classmethod
-    async def get_exam_questions_by_exam_item(
-        cls,
-        current_user: dict,
-        exam_item_id: str,
-    ) -> List[Dict[str, object]]:
-        if not exam_item_id:
-            raise ValueError("exam_item_id is required")
-        exam_item = await get_exam_item_by_id(exam_item_id)
-        if not exam_item:
-            raise ValueError("EXAM_ITEM_NOT_FOUND")
-        course_id = str(exam_item["course_id"])
-        user_id, include_all_users = await cls.resolve_course_exam_query_scope(current_user, course_id)
-        return await get_exam_questions_by_exam_item(
-            course_id=course_id,
-            exam_item_id=exam_item_id,
-            user_id=user_id,
-            include_all_users=include_all_users,
-        )
+    async def get_exam_history(cls, current_user: dict) -> List[Dict[str, object]]:
+        access_scope = await cls.resolve_exam_access_scope(current_user)
+        return await get_exam_history_by_user(**access_scope)
 
     @classmethod
     async def get_exam_record(cls, current_user: dict, exam_id: str) -> List[Dict[str, object]]:
@@ -209,28 +148,6 @@ class QAserver:
             "allow_course_scope": False,
             "allow_all": False,
         }
-
-    @classmethod
-    async def resolve_course_exam_query_scope(cls, current_user: dict, course_id: str) -> tuple[Optional[str], bool]:
-        if not course_id:
-            raise ValueError("course_id is required")
-        role = cls.get_user_role(current_user)
-        user_id = cls.get_user_id(current_user)
-
-        if role in cls.ADMIN_ROLES:
-            return user_id, True
-
-        if not user_id:
-            raise PermissionError("当前用户缺少 user_id")
-
-        if role in cls.TEACHER_ROLES:
-            if not await is_teacher_of_course(user_id, course_id):
-                raise PermissionError("无权查看该课程的考试信息")
-            return user_id, True
-
-        if not await is_student_in_course(user_id, course_id):
-            raise PermissionError("无权查看该课程的考试信息")
-        return user_id, False
 
     @classmethod
     async def manage_course(
@@ -372,7 +289,6 @@ class QAserver:
         description: Optional[str] = None,
         item_type: Optional[str] = None,
         need_code_repository: Optional[bool] = None,
-        use_preset_questions: Optional[bool] = None,
     ):
         action = str(action).strip().lower()
         user_id = cls.get_user_id(current_user)
@@ -415,8 +331,7 @@ class QAserver:
                 exam_available_valid_times=exam_available_valid_times,
                 description=description,
                 item_type=item_type,
-                need_code_repository=cls._flag_enabled(need_code_repository),
-                use_preset_questions=cls._flag_enabled(use_preset_questions),
+                need_code_repository=bool(need_code_repository),
             )
             return created_item
 
@@ -433,102 +348,11 @@ class QAserver:
                 exam_item_id=exam_item_id,
                 exam_item_name=exam_item_name,
                 dimension_scores=dimension_scores,
-                exam_available_valid_times=exam_available_valid_times,
                 description=description,
                 item_type=item_type,
-                need_code_repository=(
-                    None
-                    if need_code_repository is None
-                    else cls._flag_enabled(need_code_repository)
-                ),
-                use_preset_questions=(
-                    None
-                    if use_preset_questions is None
-                    else cls._flag_enabled(use_preset_questions)
-                ),
+                need_code_repository=need_code_repository,
             )
         return await delete_exam_item_record(course_id=course_id, exam_item_id=exam_item_id)
-
-    @classmethod
-    async def manage_preset_question(
-        cls,
-        current_user: dict,
-        action: str,
-        course_id: str,
-        exam_item_id: str,
-        preset_question_id: Optional[str] = None,
-        question_dimension: Optional[str] = None,
-        question_content: Optional[str] = None,
-        standard_answer: Optional[str] = None,
-        question_blocks: Optional[List[Dict[str, object]]] = None,
-        code_fragments: Optional[List[Dict[str, object]]] = None,
-        score: Optional[float] = None,
-        sort_order: Optional[int] = None,
-    ):
-        action = str(action).strip().lower()
-        user_id = cls.get_user_id(current_user)
-
-        if action == "list":
-            if not await cls.can_view_course(current_user, course_id):
-                raise PermissionError("无权查看该考试项的预设题库")
-            return await list_preset_questions_by_exam_item(course_id, exam_item_id)
-
-        if action not in {"create", "update", "delete"}:
-            raise ValueError(f"Unsupported preset question action: {action}")
-        if not user_id or not await is_course_owner(user_id, course_id):
-            raise PermissionError("只有课程主负责老师可以维护预设题库")
-
-        if action == "create":
-            return await create_preset_question_record(
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                created_by=user_id,
-                question_dimension=question_dimension,
-                question_content=question_content,
-                standard_answer=standard_answer,
-                question_blocks=question_blocks,
-                code_fragments=code_fragments,
-                score=1.0 if score is None else score,
-                sort_order=sort_order,
-            )
-
-        if not preset_question_id:
-            raise ValueError("preset_question_id is required")
-        if action == "update":
-            return await update_preset_question_record(
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                preset_question_id=preset_question_id,
-                question_dimension=question_dimension,
-                question_content=question_content,
-                standard_answer=standard_answer,
-                question_blocks=question_blocks,
-                code_fragments=code_fragments,
-                score=score,
-                sort_order=sort_order,
-            )
-        return await delete_preset_question_record(
-            course_id=course_id,
-            exam_item_id=exam_item_id,
-            preset_question_id=preset_question_id,
-        )
-
-    @classmethod
-    async def update_exam_session_preset_question_usage(
-        cls,
-        current_user: dict,
-        course_id: str,
-        exam_id: str,
-        use_preset_questions: bool,
-    ) -> bool:
-        user_id = cls.get_user_id(current_user)
-        if not user_id or not await is_course_owner(user_id, course_id):
-            raise PermissionError("只有课程主负责老师可以设置考试是否使用预设题目")
-        return await update_exam_session_use_preset_questions_record(
-            course_id=course_id,
-            exam_id=exam_id,
-            use_preset_questions=use_preset_questions,
-        )
 
     @classmethod
     async def can_view_course(cls, current_user: dict, course_id: str) -> bool:
@@ -692,16 +516,12 @@ class QAserver:
             answered_question,
             judge_res,
         )
-        if self.preset_only_mode:
-            return
         if plan.should_finish:
             return
         await self.generate_questions_for_plan(plan, judge_res)
 
     async def request_prepare_generation_if_needed(self) -> None:
         if self.exam_state is None or self.exam_finished:
-            return
-        if self.preset_only_mode:
             return
         if self.exam_state.has_ready_question() or self._prepare_generation_pending:
             return
@@ -717,17 +537,6 @@ class QAserver:
                 return [self._text_event(self.MISSING_EXAM_STATE_ERROR)]
             if self.exam_finished:
                 return []
-
-            if self.preset_only_mode:
-                if not can_request_prepare_generation:
-                    await self.task_queue.join()
-                    can_request_prepare_generation = True
-                    continue
-                next_question = self.take_preset_only_question()
-                if next_question is not None:
-                    return self.ask_question(next_question)
-                return await self.finish_interview()
-
             if self.exam_state.all_dimensions_finished():
                 return await self.finish_interview()
 
@@ -799,21 +608,8 @@ class QAserver:
             return None
         return self.exam_state.pop_ready_question()
 
-    def take_preset_only_question(self) -> Optional[Question]:
-        if not self.exam_state:
-            return None
-        for dimension in list(self.exam_state.preset_question_queues):
-            queue = self.exam_state.preset_question_queues.get(dimension)
-            if not queue:
-                continue
-            question = queue.popleft()
-            return self.exam_state._activate_popped_question(question)
-        return None
-
     async def ensure_ready_question_exists(self) -> None:
         if not self.exam_state:
-            return
-        if self.preset_only_mode:
             return
         if self.exam_state.has_ready_question():
             return
@@ -826,8 +622,6 @@ class QAserver:
         judge_res: Optional[dict] = None,
     ) -> None:
         if not self.exam_state or plan.should_finish:
-            return
-        if self.preset_only_mode:
             return
         if plan.difficulty_level is None or not plan.target_dimension:
             return
@@ -901,11 +695,6 @@ class QAserver:
         question_doc = self.parse_outer_json_block(self.get_agent_response_content(response))
         questions = []
         existing_question_count = self.get_existing_question_count()
-        based_on_record_index = "-1"
-        if source_question and self.exam_state:
-            record_index = self.exam_state.record_index_for_question(source_question)
-            if record_index is not None:
-                based_on_record_index = record_index
         for index, item in enumerate(question_doc.get("questions", [])[:question_count], start=1):
             content = str(item.get("Question", item.get("question", ""))).strip()
             if not content:
@@ -919,7 +708,7 @@ class QAserver:
                 code_fragments=item.get("code_fragments", []),
                 score=float(item.get("score", 1.0)),
                 standard_answer=item.get("standard_answer"),
-                based_on_record_index=based_on_record_index,
+                based_on_record_index=len(self.exam_state.exam_records) - 1 if self.exam_state else -1,
                 source_detail=str(item.get("reason", question_doc.get("project_summary", ""))),
             ))
         return questions
@@ -931,7 +720,6 @@ class QAserver:
             len(self.exam_state.exam_records)
             + len(self.exam_state.prepared_question_queue)
             + len(self.exam_state.priority_question_queue)
-            + len(self.exam_state.preset_question_queue)
         )
 
     async def finish_interview(self) -> List[Dict[str, str]]:

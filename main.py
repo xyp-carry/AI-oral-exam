@@ -36,11 +36,7 @@ from fastapi import File, UploadFile, HTTPException, Depends, Form
 from typing import List, Dict
 from AIOralExamSystem.Tool.rag.data_tool import SearchToolInput, SearchTool, InsertTool
 from AIOralExamSystem.utils.monitor import GlobalMonitor
-from AIOralExamSystem.Exam.Examdata import (
-    get_available_exam_item_by_exam_id,
-    get_exam_session_by_exam_id,
-    list_preset_questions_by_exam_item,
-)
+from AIOralExamSystem.Exam.Examdata import get_available_exam_item_by_exam_id, get_exam_session_by_exam_id
 from AIOralExamSystem.Exam.examSetter import ExamSetterAgent
 from AIOralExamSystem.Exam.examObject import CandidateExamState, Question
 from AIOralExamSystem.url import exam_routes
@@ -69,28 +65,6 @@ transport_params = {
 
 
 DEFAULT_INITIAL_SCORE = 5.0
-
-
-def flag_enabled(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
-def build_startup_error(message: str, exc: Exception | None = None) -> dict:
-    payload = {
-        "type": "exam_error",
-        "code": "EXAM_STARTUP_ERROR",
-        "message": message,
-    }
-    if exc is not None:
-        payload["error_class"] = exc.__class__.__name__
-        payload["detail"] = str(exc)
-    return payload
 
 
 def parse_outer_json_block(response: str) -> dict:
@@ -130,14 +104,11 @@ async def prepare_initial_questions(
     settings = get_settings()
     course_id = current_user.get("course_id")
     exam_id = current_user.get("exam_id")
-    need_code_repository = flag_enabled(current_user.get("need_code_repository"))
-    file_local_address = (
-        current_user.get("file_local_address")
-        or (f"{course_id}/{exam_id}/main/doc" if need_code_repository and course_id and exam_id else None)
+    file_local_address = current_user.get("file_local_address") or (
+        f"{course_id}/{exam_id}" if course_id and exam_id else None
     )
-    code_local_address = (
-        current_user.get("code_local_address")
-        or (f"{course_id}/{exam_id}/main/code" if need_code_repository and course_id and exam_id else None)
+    code_local_address = current_user.get("code_local_address") or (
+        f"{course_id}/{exam_id}/main" if course_id and exam_id else None
     )
     exam_setter = ExamSetterAgent(
         settings.model_dump(mode="json"),
@@ -184,7 +155,7 @@ async def prepare_initial_questions(
             code_fragments=item.get("code_fragments", []),
             score=float(item.get("score", 1.0)),
             standard_answer=item.get("standard_answer"),
-            based_on_record_index="-1",
+            based_on_record_index=-1,
             source_detail=str(item.get("reason", question_doc.get("project_summary", ""))),
         )
         exam_state.add_prepared_question(question)
@@ -196,101 +167,37 @@ async def prepare_initial_questions(
     return exam_state
 
 
-async def prepare_preset_questions(
-    current_user: dict,
-    exam_state: CandidateExamState,
-) -> CandidateExamState:
-    if not current_user.get("use_preset_questions"):
-        return exam_state
-
-    course_id = current_user.get("course_id")
-    exam_item_id = current_user.get("exam_item_id")
-    if not course_id or not exam_item_id:
-        return exam_state
-
-    preset_questions = await list_preset_questions_by_exam_item(
-        str(course_id),
-        str(exam_item_id),
-    )
-    for index, item in enumerate(preset_questions, start=1):
-        question = Question(
-            question_id=f"Preset{index}",
-            content=str(item.get("question_content", "")).strip(),
-            dimension=str(item.get("question_dimension", "")).strip(),
-            question_blocks=item.get("question_blocks", []),
-            code_fragments=item.get("code_fragments", []),
-            score=float(item.get("score", 1.0)),
-            standard_answer=item.get("standard_answer"),
-            based_on_record_index="-1",
-            source_detail=None,
-            is_preset_question=True,
-        )
-        exam_state.add_preset_question(question)
-
-    logger.info(
-        f"Prepared {len(exam_state.preset_question_queue)} preset questions "
-        f"for current user"
-    )
-    return exam_state
-
-
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, exam_info: dict, current_user: dict):
     logger.info(f"Starting bot")
 
-    startup_error = None
-    dimensions = []
-    exam_session = None
     exam_id = str(exam_info.get("exam_id", "")).strip()
-    exam_user = {**current_user, "exam_id": exam_id}
-    try:
-        if not exam_id:
-            raise ValueError("exam_info 缺少 exam_id")
-        exam_session = await get_exam_session_by_exam_id(exam_id)
-        if not exam_session:
-            raise ValueError("考试记录不存在")
-        current_user_id = str(current_user.get("uuid") or current_user.get("id") or current_user.get("user_id") or "")
-        if current_user_id and str(exam_session.get("user_id")) != current_user_id:
-            raise ValueError("当前用户无权开启该考试")
-        exam_item = await get_available_exam_item_by_exam_id(exam_id)
-        if not exam_item:
-            raise ValueError("考试项不存在或不在可开启时间内")
-        dimensions = exam_item.get("dimension_names") or []
-        if not dimensions:
-            raise ValueError("当前考试项没有配置考试维度")
-        course_id = exam_item.get("course_id")
-        need_code_repository = flag_enabled(exam_session.get("need_code_repository"))
-        use_preset_questions = flag_enabled(exam_session.get("use_preset_questions"))
-        if need_code_repository and not str(exam_session.get("repository_url") or "").strip():
-            raise ValueError("当前考试需要代码仓库，请先上传仓库")
-        file_local_address = (
-            f"{course_id}/{exam_id}/main/doc"
-            if need_code_repository and course_id and exam_id
-            else None
-        )
-        code_local_address = (
-            f"{course_id}/{exam_id}/main/code"
-            if need_code_repository and course_id and exam_id
-            else None
-        )
-        exam_user = {
-            **current_user,
-            "exam_id": exam_id,
-            "course_id": course_id,
-            "exam_item_id": exam_item.get("exam_item_id"),
-            "need_code_repository": need_code_repository,
-            "use_preset_questions": use_preset_questions,
-            "file_local_address": file_local_address,
-            "code_local_address": code_local_address,
-        }
-    except Exception as exc:
-        logger.exception("考试启动校验失败，将通过 WebRTC 发送错误提示")
-        startup_error = build_startup_error(
-            str(exc) or "考试启动失败，请联系老师或稍后重试。",
-            exc,
-        )
-     
+    if not exam_id:
+        raise ValueError("exam_info 缺少 exam_id")
+    exam_session = await get_exam_session_by_exam_id(exam_id)
+    if not exam_session:
+        raise ValueError("考试记录不存在")
+    current_user_id = str(current_user.get("uuid") or current_user.get("id") or current_user.get("user_id") or "")
+    if current_user_id and str(exam_session.get("user_id")) != current_user_id:
+        raise ValueError("当前用户无权开启该考试")
+    exam_item = await get_available_exam_item_by_exam_id(exam_id)
+    if not exam_item:
+        raise ValueError("考试项不存在或不在可开启时间内")
+    dimensions = exam_item.get("dimension_names") or []
+    if not dimensions:
+        raise ValueError("当前考试项没有配置考试维度")
+    course_id = exam_item.get("course_id")
+    file_local_address = f"{course_id}/{exam_id}" if course_id and exam_id else None
+    code_local_address = f"{course_id}/{exam_id}/main" if course_id and exam_id else None
+    exam_user = {
+        **current_user,
+        "exam_id": exam_id,
+        "course_id": course_id,
+        "file_local_address": file_local_address,
+        "code_local_address": code_local_address,
+    }
+    
     monitor = GlobalMonitor()
-     
+    
     history: List[Dict[str, str]] = []
     exam_state = CandidateExamState(
         initial_score=DEFAULT_INITIAL_SCORE,
@@ -300,13 +207,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, exam_i
 
 
     metrics_frame_processor = MetricsFrameLogger(history)
-    llm = InterviewService(
-        monitor,
-        exam_user,
-        history,
-        exam_state=exam_state,
-        startup_error=startup_error,
-    )
+    llm = InterviewService(monitor, exam_user, history, exam_state=exam_state)
     ttsaudio = TTSAudio()
 
     # Create audio buffer processor
@@ -349,24 +250,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments, exam_i
     monitor.task[exam_user['uuid']] = task
 
     runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
-
-    if startup_error is None:
-        try:
-            if exam_user.get("need_code_repository"):
-                await prepare_initial_questions(
-                    current_user=exam_user,
-                    exam_state=exam_state,
-                )
-            await prepare_preset_questions(
-                current_user=exam_user,
-                exam_state=exam_state,
-            )
-        except Exception as exc:
-            logger.exception("初始题目生成失败，将通过 WebRTC 发送错误提示")
-            llm.startup_error = build_startup_error(
-                str(exc) or "初始题目生成失败，请联系老师或稍后重试。",
-                exc,
-            )
+    
+    await prepare_initial_questions(
+        current_user=exam_user,
+        exam_state=exam_state,
+    )
     await runner.run(task)
 
 
