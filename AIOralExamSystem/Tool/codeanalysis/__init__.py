@@ -14,7 +14,6 @@ from AIOralExamSystem.Tool.codeanalysis.code_lsp import (
     CodeLspToolInput,
 )
 from AIOralExamSystem.Tool.codeanalysis.code_reader import (
-    CodeReadRange,
     CodeReaderDescription,
     CodeReaderTool,
     CodeReaderToolInput,
@@ -30,7 +29,6 @@ __all__ = [
     "CodeLspDescription",
     "CodeLspTool",
     "CodeLspToolInput",
-    "CodeReadRange",
     "CodeReaderDescription",
     "CodeReaderTool",
     "CodeReaderToolInput",

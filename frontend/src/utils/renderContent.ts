@@ -61,8 +61,48 @@ function restoreFormulas(html: string, formulas: string[]): string {
   return result
 }
 
+function isRichHtml(text: string): boolean {
+  return /<(p|figure|div|pre|code|h[1-6]|ul|ol|table|blockquote)\b[^>]*>/i.test(text)
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+}
+
+function renderRichHtml(text: string): { __html: string } {
+  let html = text
+
+  html = decodeHtmlEntities(html)
+
+  html = html.replace(/<code class="language-(\w+)">([\s\S]*?)<\/code>/g, (_, lang, code) => {
+    return `<code class="language-${lang} rich-code-block">${code}</code>`
+  })
+
+  html = html.replace(/<pre><code class="language-(\w+)">([\s\S]*?)<\/code><\/pre>/g, (_, lang, code) => {
+    return `<pre class="rich-pre"><code class="language-${lang} rich-code-block">${code}</code></pre>`
+  })
+
+  html = html.replace(/<figure class="code-fragment"[^>]*>/g, '<figure class="rich-figure code-fragment">')
+  html = html.replace(/<figcaption>([\s\S]*?)<\/figcaption>/g, '<figcaption class="rich-figcaption">$1</figcaption>')
+
+  const { formulas } = extractFormulas(html)
+  html = restoreFormulas(html, formulas)
+
+  return { __html: html }
+}
+
 export function renderContent(text: string): { __html: string } {
   if (!text) return { __html: '' }
+
+  if (isRichHtml(text)) {
+    return renderRichHtml(text)
+  }
 
   const { text: processedText, formulas } = extractFormulas(text)
 

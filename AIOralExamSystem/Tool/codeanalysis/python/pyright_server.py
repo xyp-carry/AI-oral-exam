@@ -124,6 +124,111 @@ def query_user_symbols(
     return response
 
 
+def generate_project_map_for_code_root(
+    user_uuid: str,
+    repository_name: str,
+    code_root: Path,
+    timeout: int = 20,
+    git_local_address: str | None = None,
+) -> dict:
+    repositories = []
+    logs = []
+    result = query_pyright(code_root, timeout)
+    if result.get("error"):
+        repositories.append(
+            {
+                "repository": repository_name,
+                "code_root": str(code_root),
+                "error": result["error"],
+            }
+        )
+        logs.extend(result.get("logs", []))
+    else:
+        markdown = _render_project_map(code_root, result)
+        map_path = code_root / "project_map.md"
+        map_path.write_text(markdown, encoding="utf-8")
+        repositories.append(
+            {
+                "repository": repository_name,
+                "code_root": str(code_root),
+                "map_path": str(map_path),
+                "markdown": markdown,
+                "file_count": len(result["python_files"]),
+            }
+        )
+        logs.extend(result.get("logs", []))
+        logs.append(
+            {
+                "step": "project_map_write",
+                "status": "success",
+                "repository": repository_name,
+                "map_path": str(map_path),
+            }
+        )
+    return {
+        "mode": "lsp",
+        "lsp_action": "project_map",
+        "language": "python",
+        "user_uuid": user_uuid,
+        "git_local_address": git_local_address,
+        "safe_git_local_address": _safe_path_part(git_local_address) if git_local_address else None,
+        "repositories": repositories,
+        "logs": logs,
+    }
+
+
+def query_symbols_for_code_root(
+    user_uuid: str,
+    repository_name: str,
+    code_root: Path,
+    timeout: int = 20,
+    query: str | None = None,
+    git_local_address: str | None = None,
+    limit: int = 20,
+) -> dict:
+    repositories = []
+    logs = []
+    matches = []
+    query_text = str(query or "").strip()
+    max_matches = min(100, max(1, int(limit or 20)))
+
+    result = query_pyright(code_root, timeout)
+    repositories.append({"repository": repository_name, **result})
+    logs.extend(result.get("logs", []))
+
+    if query_text and not result.get("error"):
+        matches.extend(
+            _filter_symbol_matches(
+                repository_name=repository_name,
+                result=result,
+                query=query_text,
+                remaining=max_matches,
+            )
+        )
+        matches = matches[:max_matches]
+
+    response = {
+        "mode": "lsp",
+        "lsp_action": "symbols",
+        "language": "python",
+        "user_uuid": user_uuid,
+        "git_local_address": git_local_address,
+        "safe_git_local_address": _safe_path_part(git_local_address) if git_local_address else None,
+        "repositories": repositories,
+        "logs": logs,
+    }
+    if query_text:
+        response.update(
+            {
+                "query": query_text,
+                "limit": max_matches,
+                "total_matches": len(matches),
+                "matches": matches,
+            }
+        )
+    return response
+
+
 def query_pyright(project_root: Path, timeout: int) -> dict:
     # 启动固定的 WSL Pyright 服务，读取一个代码目录的符号和诊断结果。
     logs = [{"step": "pyright_start", "status": "start", "command": f"{PYRIGHT_SERVER} --stdio"}]

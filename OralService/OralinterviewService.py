@@ -16,19 +16,35 @@ class InterviewService(FrameProcessor):
         current_user: dict,
         history: List[Dict[str, str]] = [],
         exam_state: Optional[CandidateExamState] = None,
+        startup_error: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
         self.monitor = monitor
         self.current_user = current_user
         self.history = history
         self.exam_state = exam_state
-        self.nickname = current_user["nickname"]
-        self.qa_server = QAserver(current_user, exam_state, history)
+        self.startup_error = startup_error
+        self.nickname = current_user.get("nickname") or current_user.get("username") or "同学"
+        self.qa_server = None
+        if not self.startup_error:
+            try:
+                self.qa_server = QAserver(current_user, exam_state, history)
+            except Exception as exc:
+                self.startup_error = {
+                    "code": exc.__class__.__name__,
+                    "message": str(exc) or "考试启动失败，请联系管理员",
+                }
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMContextFrame):
+            if self.startup_error:
+                content = self.render_startup_error(self.startup_error)
+                await self.push_frame(LLMTextFrame(content), FrameDirection.DOWNSTREAM)
+                return
+            if self.qa_server is None:
+                return
             await self.push_frame(LLMTextFrame("AI口试开始思考"), direction)
             output_events = await self.qa_server.put_messages(frame.context.get_messages())
             await self.push_output_events(output_events, direction)
@@ -36,6 +52,13 @@ class InterviewService(FrameProcessor):
 
         if isinstance(frame, StartFrame):
             await self.push_frame(frame, direction)
+            if self.startup_error:
+                content = self.render_startup_error(self.startup_error)
+                speech = str(self.startup_error.get("message") or "考试启动失败，请联系老师或稍后重试。")
+                await self.push_frame(LLMTextFrame(content), FrameDirection.DOWNSTREAM)
+                await self.push_frame(TTSSpeakFrame(speech), FrameDirection.DOWNSTREAM)
+                await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+                return
             await self.push_frame(
                 TTSSpeakFrame(f"你好，{self.nickname}同学，我是本次的考官，现在开始口试。"),
                 FrameDirection.DOWNSTREAM,
@@ -45,7 +68,8 @@ class InterviewService(FrameProcessor):
             return
 
         if isinstance(frame, EndFrame):
-            await self.qa_server.stop_request_loop()
+            if self.qa_server is not None:
+                await self.qa_server.stop_request_loop()
             print("XYPTEST: EndFrame")
             
 
@@ -53,6 +77,18 @@ class InterviewService(FrameProcessor):
 
     async def setup(self, setup):
         await super().setup(setup)
+
+    @staticmethod
+    def render_startup_error(error: Dict[str, object]) -> str:
+        code = escape(str(error.get("code") or "EXAM_STARTUP_ERROR"))
+        message = escape(str(error.get("message") or "考试启动失败，请联系老师或稍后重试。"))
+        return (
+            '<div class="exam-error" data-type="exam_error" '
+            f'data-code="{code}">'
+            "<h3>考试启动失败</h3>"
+            f"<p>{message}</p>"
+            "</div>"
+        )
 
     async def push_output_events(self, output_events: List[Dict[str, object]], direction: FrameDirection):
         for event in output_events:

@@ -64,15 +64,58 @@ class SearchTool(BaseTool):
         target_tokens = min(12000, max(2000, int(target_tokens or 6000)))
         max_block_tokens = max(1000, target_tokens)
 
-        results = self._search_documents(query, source, course_id, exam_id)
+        if not query.strip():
+            results = self._search_documents_sequential(source, course_id, exam_id)
+            blocks = self._build_text_blocks(results.get("hits", []), max_block_tokens)
+            return self._build_search_response(
+                query=query,
+                mode="sequential",
+                order_by="chunk_order:asc",
+                blocks=blocks,
+                batch_index=batch_index,
+                target_tokens=target_tokens,
+                empty_instruction="No indexed chunks were found for this source. The caller should upload/insert the document before reading it.",
+                next_instruction=(
+                    "If has_more is true, call search again with the same empty query and next_batch_index "
+                    "to continue reading the document in chunk_order order."
+                ),
+            )
+
+        results = self._search_documents_hybrid(query, source, course_id, exam_id)
         blocks = self._build_text_blocks(results.get("hits", []), max_block_tokens)
+        return self._build_search_response(
+            query=query,
+            mode="hybrid",
+            order_by="relevance",
+            blocks=blocks,
+            batch_index=batch_index,
+            target_tokens=target_tokens,
+            empty_instruction="No relevant indexed chunks were found for this query.",
+            next_instruction=(
+                "If has_more is true, call search again with the same query and next_batch_index "
+                "to continue reading relevant retrieved chunks."
+            ),
+        )
+
+    def _build_search_response(
+        self,
+        query: str,
+        mode: str,
+        order_by: str,
+        blocks: list,
+        batch_index: int,
+        target_tokens: int,
+        empty_instruction: str,
+        next_instruction: str,
+    ) -> str:
         batches = self._build_batches(blocks, target_tokens)
 
         if not batches:
             return json.dumps(
                 {
                     "query": query,
-                    "mode": "all" if not query.strip() else "hybrid",
+                    "mode": mode,
+                    "order_by": order_by,
                     "batch_index": 0,
                     "total_batches": 0,
                     "has_more": False,
@@ -80,8 +123,12 @@ class SearchTool(BaseTool):
                     "total_blocks": 0,
                     "total_tokens": 0,
                     "batch_tokens": 0,
+                    "first_chunk_order": None,
+                    "last_chunk_order": None,
+                    "returned_chunk_orders": [],
+                    "next_start_chunk_order": None,
                     "blocks": [],
-                    "instruction": "未检索到可用文本块；请基于已有上下文谨慎生成问题。",
+                    "instruction": empty_instruction,
                 },
                 ensure_ascii=False,
             )
@@ -91,10 +138,20 @@ class SearchTool(BaseTool):
 
         batch = batches[batch_index]
         has_more = batch_index < len(batches) - 1
+        returned_chunk_orders = self._collect_chunk_orders(batch)
+        first_chunk_order = returned_chunk_orders[0] if returned_chunk_orders else None
+        last_chunk_order = returned_chunk_orders[-1] if returned_chunk_orders else None
+        next_start_chunk_order = (
+            last_chunk_order + 1
+            if mode == "sequential" and has_more and isinstance(last_chunk_order, int)
+            else None
+        )
+
         return json.dumps(
             {
                 "query": query,
-                "mode": "all" if not query.strip() else "hybrid",
+                "mode": mode,
+                "order_by": order_by,
                 "batch_index": batch_index,
                 "total_batches": len(batches),
                 "has_more": has_more,
@@ -102,45 +159,67 @@ class SearchTool(BaseTool):
                 "total_blocks": len(blocks),
                 "total_tokens": sum(block["token_count"] for block in blocks),
                 "batch_tokens": sum(block["token_count"] for block in batch),
+                "first_chunk_order": first_chunk_order,
+                "last_chunk_order": last_chunk_order,
+                "returned_chunk_orders": returned_chunk_orders,
+                "next_start_chunk_order": next_start_chunk_order,
                 "blocks": batch,
-                "instruction": (
-                    "如果 has_more 为 true，请保持相同 query，并使用 next_batch_index 再次调用 search；"
-                    "全部批次读取完成后，再基于整体资料回答。"
-                ),
+                "instruction": next_instruction,
             },
             ensure_ascii=False,
         )
 
-    def _search_documents(self, query: str, source: str, course_id: str, exam_id: str | None = None) -> dict:
+    def _collect_chunk_orders(self, blocks: list) -> list:
+        orders = []
+        seen = set()
+        for block in blocks:
+            value = block.get("chunk_order")
+            if value is None:
+                continue
+            try:
+                order = int(value)
+            except (TypeError, ValueError):
+                continue
+            if order in seen:
+                continue
+            seen.add(order)
+            orders.append(order)
+        return orders
+
+    def _search_documents_sequential(self, source: str, course_id: str, exam_id: str | None = None) -> dict:
         index = self.client.index(self._course_index_name(course_id))
         filter_expr = self._build_filter(source, exam_id)
 
-        if not query.strip():
-            hits = []
-            offset = 0
-            limit = 100
+        hits = []
+        offset = 0
+        limit = 100
 
-            while True:
-                results = index.search(
-                    "",
-                    {
-                        "filter": filter_expr,
-                        "limit": limit,
-                        "offset": offset,
-                    },
-                )
-                batch_hits = results.get("hits", [])
-                hits.extend(batch_hits)
+        while True:
+            results = index.search(
+                "",
+                {
+                    "filter": filter_expr,
+                    "limit": limit,
+                    "offset": offset,
+                    "sort": ["chunk_order:asc"],
+                },
+            )
+            batch_hits = results.get("hits", [])
+            hits.extend(batch_hits)
 
-                if not batch_hits or len(batch_hits) < limit:
-                    break
+            if not batch_hits or len(batch_hits) < limit:
+                break
 
-                offset += limit
-                total_hits = results.get("estimatedTotalHits")
-                if total_hits is not None and offset >= total_hits:
-                    break
+            offset += limit
+            total_hits = results.get("estimatedTotalHits")
+            if total_hits is not None and offset >= total_hits:
+                break
 
-            return {"hits": hits}
+        return {"hits": hits}
+
+    def _search_documents_hybrid(self, query: str, source: str, course_id: str, exam_id: str | None = None) -> dict:
+        index = self.client.index(self._course_index_name(course_id))
+        filter_expr = self._build_filter(source, exam_id)
 
         return index.search(
             query,
@@ -195,6 +274,7 @@ class SearchTool(BaseTool):
                     {
                         "block_index": block_index,
                         "source_document_id": hit.get("id"),
+                        "chunk_order": hit.get("chunk_order"),
                         "part_index": part_index,
                         "token_count": self._count_tokens(part),
                         "content": part,
@@ -290,11 +370,22 @@ class InsertTool(BaseTool):
         exam_id: str | None = None,
         work_dir: str | None = None,
         reload: bool = False,
+        upload_batch_id: str | None = None,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
     ) -> str:
         if type == "file":
-            chunksList = await self.fileParser.execute(file_paths=data, work_dir=work_dir)
+            chunksList = await self.fileParser.execute(
+                file_paths=data,
+                work_dir=work_dir,
+                chunk_mode=chunk_mode,
+                chunk_ai_model_settings=chunk_ai_model_settings,
+            )
         else:
             chunksList = data
+
+        if chunk_mode == "ai_toc":
+            return chunksList
 
         if not chunksList:
             return "没有可插入的文档。"
@@ -324,7 +415,8 @@ class InsertTool(BaseTool):
                     },
                 }
             },
-            "filterableAttributes": ["source", "course_id", "exam_id"],
+            "filterableAttributes": ["source", "course_id", "exam_id", "upload_batch_id"],
+            "sortableAttributes": ["chunk_order"],
         }
 
         task = index.update_settings(settings)
@@ -333,20 +425,29 @@ class InsertTool(BaseTool):
             self._delete_existing_documents(index, source, exam_id)
         print(chunksList)
         print(len(chunksList))
-        print(len(chunksList[0]))
+        if chunksList:
+            print(len(chunksList[0]))
         inserted_count = 0
+        chunk_order = 0
         for chunks in chunksList:
-            documents = [
-                {
-                    "id": str(uuid.uuid4()),
-                    "source": source,
-                    "course_id": course_id,
-                    "exam_id": exam_id,
-                    "content": chunk,
-                }
-                for chunk in chunks
-                if self.is_meaningful_text(chunk)
-            ]
+            documents = []
+            for chunk in chunks:
+                if not self.is_meaningful_text(chunk):
+                    continue
+
+                chunk_order += 1
+                documents.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "source": source,
+                        "course_id": course_id,
+                        "exam_id": exam_id,
+                        "upload_batch_id": upload_batch_id,
+                        "chunk_order": chunk_order,
+                        "content": chunk,
+                    }
+                )
+
             if not documents:
                 continue
 
@@ -367,15 +468,74 @@ class InsertTool(BaseTool):
         safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
         return f"course_{safe_course_id}"
 
+    def delete_documents_by_batch(
+        self,
+        course_id: str | None,
+        upload_batch_id: str | None,
+    ) -> None:
+        if not upload_batch_id or not str(upload_batch_id).strip():
+            return
+        index = self.client.index(self._course_index_name(course_id))
+        self._delete_documents_by_filter(
+            index,
+            f'upload_batch_id = "{self._escape_filter_value(str(upload_batch_id).strip())}"',
+        )
+
+    def delete_course_documents_by_source(
+        self,
+        course_id: str | None,
+        source: str,
+    ) -> None:
+        source = str(source or "").strip()
+        if not source:
+            raise ValueError("source is required")
+        course_id_value = str(course_id or "").strip()
+        if not course_id_value:
+            raise ValueError("course_id is required")
+        index = self.client.index(self._course_index_name(course_id_value))
+        self._delete_documents_by_filter(
+            index,
+            (
+                f'source = "{self._escape_filter_value(source)}" '
+                f'AND course_id = "{self._escape_filter_value(course_id_value)}"'
+            ),
+        )
+
+    def delete_existing_documents_except_batch(
+        self,
+        course_id: str | None,
+        source: str,
+        exam_id: str | None,
+        upload_batch_id: str | None,
+    ) -> None:
+        filter_expr = self._existing_documents_filter(source, exam_id)
+        index = self.client.index(self._course_index_name(course_id))
+        excluded_batch_id = str(upload_batch_id or "").strip()
+        self._delete_documents_by_filter(
+            index,
+            filter_expr,
+            exclude_upload_batch_id=excluded_batch_id or None,
+        )
+
     def _delete_existing_documents(self, index, source: str, exam_id: str | None) -> None:
+        self._delete_documents_by_filter(index, self._existing_documents_filter(source, exam_id))
+
+    def _existing_documents_filter(self, source: str, exam_id: str | None) -> str:
         if not source or not str(source).strip():
             raise ValueError("source is required when reload is true")
         if not exam_id or not str(exam_id).strip():
             raise ValueError("exam_id is required when reload is true")
-        filter_expr = (
+        return (
             f'source = "{self._escape_filter_value(source)}" '
             f'AND exam_id = "{self._escape_filter_value(str(exam_id).strip())}"'
         )
+
+    def _delete_documents_by_filter(
+        self,
+        index,
+        filter_expr: str,
+        exclude_upload_batch_id: str | None = None,
+    ) -> None:
         document_ids = []
         offset = 0
         limit = 1000
@@ -387,11 +547,19 @@ class InsertTool(BaseTool):
                     "filter": filter_expr,
                     "limit": limit,
                     "offset": offset,
-                    "attributesToRetrieve": ["id"],
+                    "attributesToRetrieve": ["id", "upload_batch_id"],
                 },
             )
             hits = results.get("hits", [])
-            document_ids.extend(hit["id"] for hit in hits if hit.get("id"))
+            document_ids.extend(
+                hit["id"]
+                for hit in hits
+                if hit.get("id")
+                and (
+                    exclude_upload_batch_id is None
+                    or str(hit.get("upload_batch_id") or "") != exclude_upload_batch_id
+                )
+            )
 
             if not hits or len(hits) < limit:
                 break

@@ -1,29 +1,46 @@
-from AIOralExamSystem.utils.base_object import BaseObject
+﻿from AIOralExamSystem.utils.base_object import BaseObject
 from langchain_openai import ChatOpenAI
 
 from loguru import logger
 
 from langchain_core.messages import AIMessage
 from langchain_core.tools import BaseTool
-
+from langchain_core.agents import AgentAction, AgentFinish
 from typing import List
 import inspect
 from abc import abstractmethod
 from langchain.agents import create_agent
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain.agents.middleware import SummarizationMiddleware
 from AIOralExamSystem.utils.monitor import GlobalMonitor
 import asyncio
 import json
 
 
 
+
+class ToolPrintHandler(BaseCallbackHandler):
+    """打印工具调用的名称、输入参数和返回结果。"""
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        serialized = serialized or {}
+        print(f"\n>>> 正在调用工具: {serialized.get('name', '')}")
+        print(f">>> 输入参数: {input_str}")
+
+    def on_tool_end(self, output, **kwargs):
+        print(f">>> 工具返回结果: {output}")
+        print(">>> 工具调用结束\n")
+
 class BaseAgent(BaseObject):
-    def __init__(self, name: str, model_settings: dict, thinking: bool = False, response_format: bool = False, temperature: float = 0.0):
+    def __init__(self, name: str, model_settings: dict, thinking: bool = False, response_format: bool = False, temperature: float = 0.0, top_p = 1, show_tool_io: bool | None = None):
         super().__init__()
         self._name = name
         self.tools: List[BaseTool] = self.get_tools()
         if self.tools:
             tool_names = [t.name for t in self.tools]
-            print(f"[{self.__class__.__name__}] 自动注册了 {len(self.tools)} 个工具: {tool_names}")
+            logger.info(f"[{self.__class__.__name__}] registered {len(self.tools)} tools: {tool_names}")
+        else:
+            logger.warning(f"[{self.__class__.__name__}] registered no tools")
         if model_settings.get("model_name"):
             model_name = model_settings["model_name"]
         else:
@@ -43,26 +60,29 @@ class BaseAgent(BaseObject):
             model_params["thinking"] = {"type": "disabled"}
         if response_format:
             model_params["response_format"] = {"type": "json_object"}
-        model_params["temperature"] = temperature
-        self.model = self.init_model(model_name, url, api_key, model_params)
+        
+        self.model = self.init_model(model_name, url, api_key, temperature, top_p, model_params)
     
-    #     self.model = self.init_model(model_name, url, api_key, {"response_format": {
-    # "type": "json_object"}, "temperature": 0})
         if self.get_response_format():
             self.model.with_structured_output(self.get_response_format())
         logger.info(f"model {model_name} init success")
         self.agent = create_agent(
             self.model,
-            tools=self.tools
+            tools=self.tools,
+            middleware=self._build_middlewares(model_settings),
             # response_format=self.get_response_format(),
         )
+        if show_tool_io is True:
+            self.agent = self.agent.with_config({
+                "callbacks": [ToolPrintHandler()],
+            })
         logger.info(f"agent {self._name} init success")
         self.queue = asyncio.Queue()
 
-        # 加载全局监测
         self.global_monitor = GlobalMonitor()
 
     
+
     async def run(self, **kwargs):
         await self.start_heartbeat()
         self.event_signal = asyncio.Event()
@@ -185,18 +205,41 @@ class BaseAgent(BaseObject):
     async def execute(self, **kwargs) -> str:
         pass
 
-    def init_model(self, model_name: str, url: str, api_key: str, extra_body: dict):
+    def init_model(self, model_name: str, url: str, api_key: str, temperature: float, top_p: float, extra_body: dict):
         return ChatOpenAI(
             openai_api_base=url,
             openai_api_key=api_key,
             model=model_name,
+            temperature=temperature,
+            top_p=top_p,
             extra_body= extra_body
         )
     
+    def _build_middlewares(self, model_settings: dict):
+        summarization_config = model_settings.get("summarization") or {}
+        if not summarization_config.get("enabled", False):
+            return []
+
+        middleware_kwargs = {
+            "model": summarization_config.get("model", self.model),
+            "trigger": summarization_config.get("trigger", ("tokens", 8000)),
+            "keep": summarization_config.get("keep", ("messages", 8)),
+        }
+
+        if summarization_config.get("trim_tokens_to_summarize") is not None:
+            middleware_kwargs["trim_tokens_to_summarize"] = summarization_config["trim_tokens_to_summarize"]
+        if summarization_config.get("summary_prompt") is not None:
+            middleware_kwargs["summary_prompt"] = summarization_config["summary_prompt"]
+        if summarization_config.get("token_counter") is not None:
+            middleware_kwargs["token_counter"] = summarization_config["token_counter"]
+
+        return [SummarizationMiddleware(**middleware_kwargs)]
+    
     async def rule(self, obj_id: str, active_nodes: dict) -> bool:
         if obj_id in active_nodes:
+            logger.info(f"obj_id {obj_id} is in active_nodes")
             return False
-        if len(active_nodes) > 3:
+            logger.info(f"active_nodes={active_nodes}")
             return False
         return True
         

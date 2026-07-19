@@ -5,8 +5,8 @@ from pydantic import BaseModel
 
 
 class InterviewerAgent(BaseAgent):
-    def __init__(self, model_settings: dict, source: str, course_id: str | None = None, exam_id: str | None = None):
-        super().__init__("InterviewerAgent", model_settings)
+    def __init__(self, model_settings: dict, source: str, course_id: str | None = None, exam_id: str | None = None, *, show_tool_io: bool = False):
+        super().__init__("InterviewerAgent", model_settings, show_tool_io=show_tool_io)
         self.source = source
         self.course_id = course_id
         self.exam_id = exam_id
@@ -58,6 +58,7 @@ class InterviewerAgent(BaseAgent):
         4. 如果问题中需要展示表格，必须使用 HTML 标签：
         <table>...</table>
         """
+    
     def get_tools(self):
         @tool(args_schema=SearchToolInput, description=SearchDescription)
         async def search(query: str) -> str:

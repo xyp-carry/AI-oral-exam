@@ -1,27 +1,28 @@
 from AIOralExamSystem.Tool.base_tool import BaseTool
-import requests
-import zipfile
-import os
+import json
+import pickle
 import re
 from concurrent.futures import ThreadPoolExecutor
-import time
 import asyncio
-from urllib.parse import urlparse
-import glob
 from pathlib import Path
+from AIOralExamSystem.Agent.Directorysearcher import Directorysearcher
+from AIOralExamSystem.Tool.files.minerUTool import MinerUFileTool
+from config import get_settings
 
 class FileParserTool(BaseTool):
     """文件解析工具"""
     def __init__(self, token: str, name: str):
         super().__init__(name)
-        self.description = """解析文件内容"""
-        self.mineru_api_url = "https://mineru.net/api/v4/file-urls/batch"
-        self.header = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}"
-        }
+        self.description = "Parse file content"
+        self.mineru_tool = MinerUFileTool(token)
 
-    async def _run(self, file_paths: list, work_dir: str | None = None) -> str:
+    async def _run(
+        self,
+        file_paths: list,
+        work_dir: str | None = None,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
+    ) -> str:
         """
         query: 用户查询的信息
         source: 用户的id，用于指定查询的文档来源
@@ -33,37 +34,347 @@ class FileParserTool(BaseTool):
                 self.getfile,
                 file_paths,
                 work_dir,
+                chunk_mode,
+                chunk_ai_model_settings,
             )
         return chunks
     
-    def getfile(self, file_paths: list, work_dir: str | None = None):
+    def getfile(
+        self,
+        file_paths: list,
+        work_dir: str | None = None,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
+    ):
         if isinstance(file_paths, str):
             file_paths = [file_paths]
-        work_root = self._resolve_work_root(work_dir)
-        zip_dir = work_root / "zips"
-        extract_dir = work_root / "extracted"
-        res = self.batch_upload(file_paths)
-        if not res:
-            raise RuntimeError("MinerU batch upload failed; no batch result returned.")
-        batch_id = res["batch_id"]
-        zip_paths = self.download_zip(batch_id, str(zip_dir))
-
         file_chunks = []
-        for zip_path in zip_paths:
-            file_path = self.unzip_file(zip_path, str(extract_dir), os.path.basename(zip_path))
-            if not file_path:
-                continue
-            md_files = glob.glob(os.path.join(file_path, "**", "full.md"), recursive=True)
-            print(md_files)
-            if not md_files:
-                print(f"在 {file_path} 下未找到 full.md")
-                continue
-            with open(md_files[0], 'r', encoding='utf-8') as f:
-                content = f.read()
-                md_content = self.parse_md_to_chunks(content)
-                file_chunks.append(md_content)
+        mineru_file_paths = []
+        for file_path in file_paths:
+            path = Path(file_path)
+            suffix = path.suffix.lower()
+            if suffix in {".pdf", ".doc", ".docx"}:
+                mineru_file_paths.append(str(path))
+            elif suffix in {".md", ".markdown"}:
+                file_chunks.append(self.parse_md_file(path, chunk_mode, chunk_ai_model_settings))
+            elif suffix in {".json", ".jsonl", ".ndjson"}:
+                file_chunks.append(self.parse_json_file(path))
+            elif suffix == ".pkl":
+                file_chunks.append(self.parse_pkl_file(path))
+            else:
+                print(f"Skip unsupported file type: {path}")
+
+        if mineru_file_paths:
+            file_chunks.extend(
+                self.parse_mineru_files(
+                    mineru_file_paths,
+                    work_dir,
+                    chunk_mode,
+                    chunk_ai_model_settings,
+                )
+            )
         
         return file_chunks
+
+    def parse_mineru_files(
+        self,
+        file_paths: list,
+        work_dir: str | None = None,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
+    ):
+        work_root = self._resolve_work_root(work_dir)
+        md_files = self.mineru_tool.parse_to_markdown_files(file_paths, work_root)
+        return [
+            self.parse_md_file(md_file, chunk_mode, chunk_ai_model_settings)
+            for md_file in md_files
+        ]
+
+    def parse_md_file(
+        self,
+        file_path: Path,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
+    ) -> list | dict:
+        if chunk_mode == "ai_toc":
+            return self.detect_md_toc_with_ai(str(file_path), chunk_ai_model_settings)
+        if chunk_mode == "ai_chunk":
+            return self.parse_md_to_chunks_by_ai_toc(file_path, chunk_ai_model_settings)
+        content = file_path.read_text(encoding="utf-8")
+        return self.parse_md_file_content(content, chunk_mode, chunk_ai_model_settings)
+
+    def parse_md_file_content(
+        self,
+        content: str,
+        chunk_mode: str = "traditional",
+        chunk_ai_model_settings: dict | None = None,
+    ) -> list | dict:
+        if chunk_mode == "ai_toc":
+            return self._build_toc_not_found_result(0, "DOCUMENT_PATH_REQUIRED")
+        if chunk_mode == "ai_chunk":
+            return self.parse_md_to_chunks(content)
+        return self.parse_md_to_chunks(content)
+
+    def detect_md_toc_with_ai(
+        self,
+        document_dir: str,
+        ai_model_settings: dict | None = None,
+    ) -> dict:
+        try:
+            model_settings = self._resolve_toc_model_settings(ai_model_settings)
+            agent = Directorysearcher(model_settings)
+            return asyncio.run(agent.execute(document_dir=str(document_dir)))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "mode": "ai_toc",
+                "flag": "AI_TOC_DETECTION_FAILED",
+                "has_toc": False,
+                "document_path": str(document_dir or ""),
+                "preview_line_count": 0,
+                "directory_list": [],
+                "toc_items": [],
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc),
+            }
+
+    def _resolve_toc_model_settings(self, ai_model_settings: dict | None = None) -> dict:
+        if ai_model_settings:
+            model_settings = dict(ai_model_settings)
+        else:
+            settings = get_settings()
+            model_settings = {
+                "model_name": settings.model_name,
+                "model_url": settings.model_url,
+                "model_api_key": settings.model_api_key,
+            }
+        if model_settings.get("base_url") and not model_settings.get("model_url"):
+            model_settings["model_url"] = model_settings["base_url"]
+        for key in ("model_name", "model_url", "model_api_key"):
+            if not model_settings.get(key):
+                raise ValueError(f"{key} is required for ai_toc mode")
+        return model_settings
+
+    def _build_toc_not_found_result(
+        self,
+        preview_line_count: int,
+        reason: str,
+        confidence=None,
+        raw_response: str | None = None,
+    ) -> dict:
+        result = {
+            "ok": False,
+            "mode": "ai_toc",
+            "flag": "TOC_NOT_FOUND",
+            "reason": reason,
+            "has_toc": False,
+            "preview_line_count": preview_line_count,
+            "confidence": confidence,
+            "directory_list": [],
+            "toc_items": [],
+        }
+        if raw_response:
+            result["raw_response"] = raw_response[:1000]
+        return result
+
+    def parse_md_to_chunks_by_ai_toc(
+        self,
+        file_path: Path,
+        ai_model_settings: dict | None = None,
+    ) -> list:
+        toc_result = self.detect_md_toc_with_ai(str(file_path), ai_model_settings)
+        text = file_path.read_text(encoding="utf-8")
+        if not toc_result.get("has_toc"):
+            return self.parse_md_to_chunks(text)
+
+        toc_items = toc_result.get("toc_items") or []
+        if not toc_items:
+            return self.parse_md_to_chunks(text)
+
+        chunks = self.split_md_by_toc_items(text, toc_items)
+        if not chunks:
+            return self.parse_md_to_chunks(text)
+        return chunks
+
+    def split_md_by_toc_items(self, text: str, toc_items: list) -> list:
+        text = self.format_document(text)
+        lines = text.splitlines()
+        located_items = self.locate_toc_headings(lines, toc_items)
+        if len(located_items) < 2:
+            return []
+
+        chunks = []
+        title_stack = []
+        for index, located in enumerate(located_items):
+            item = located["item"]
+            start = located["line_index"]
+            end = located_items[index + 1]["line_index"] if index + 1 < len(located_items) else len(lines)
+            content = "\n".join(lines[start:end]).strip()
+            if not content:
+                continue
+
+            level = int(item.get("level") or 1)
+            title = str(item.get("title") or "").strip()
+            while title_stack and title_stack[-1][0] >= level:
+                title_stack.pop()
+            title_stack.append((level, title))
+
+            path_str = " > ".join([f"{'#' * lv} {t}" for lv, t in title_stack])
+            chunks.append(f"{path_str}\n\n{content}")
+        return chunks
+
+    def locate_toc_headings(self, lines: list, toc_items: list) -> list:
+        search_start = self.get_toc_search_start_line(toc_items)
+        located_items = []
+        current_line_index = search_start
+
+        for item in toc_items:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            normalized_title = self.normalize_toc_title(title)
+            if not normalized_title:
+                continue
+
+            matched_index = self.find_toc_heading_line(
+                lines,
+                normalized_title,
+                current_line_index,
+            )
+            if matched_index is None:
+                continue
+
+            located_items.append({
+                "item": item,
+                "line_index": matched_index,
+            })
+            current_line_index = matched_index + 1
+
+        if len(toc_items) and len(located_items) / len(toc_items) < 0.5:
+            return []
+        return located_items
+
+    def get_toc_search_start_line(self, toc_items: list) -> int:
+        source_lines = []
+        for item in toc_items:
+            source_line = item.get("source_line") if isinstance(item, dict) else None
+            try:
+                if source_line is not None:
+                    source_lines.append(int(source_line))
+            except (TypeError, ValueError):
+                continue
+        if not source_lines:
+            return 0
+        return max(source_lines)
+
+    def find_toc_heading_line(self, lines: list, normalized_title: str, start_index: int) -> int | None:
+        for index in range(start_index, len(lines)):
+            line = lines[index].strip()
+            if not line:
+                continue
+            normalized_line = self.normalize_toc_title(line)
+            if normalized_line == normalized_title:
+                return index
+        return None
+
+    def normalize_toc_title(self, value: str) -> str:
+        value = re.sub(r'^(#{1,6})\s*', '', str(value or "").strip())
+        value = re.sub(r'\s+', ' ', value)
+        value = re.sub(r'\s*[.·…]{2,}\s*\d+\s*$', '', value)
+        value = re.sub(r'\s+\d+\s*$', '', value)
+        return value.strip()
+
+    def parse_json_file(self, file_path: Path) -> list:
+        suffix = file_path.suffix.lower()
+        if suffix in {".jsonl", ".ndjson"}:
+            return self.parse_json_lines(file_path)
+
+        raw_text = file_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON file: {file_path}") from exc
+
+        if isinstance(data, list):
+            chunks = []
+            for item in data:
+                text = self.json_to_search_text(item)
+                if text.strip():
+                    chunks.append(text)
+            return chunks
+
+        text = self.json_to_search_text(data)
+        return [text] if text.strip() else []
+
+    def parse_json_lines(self, file_path: Path) -> list:
+        chunks = []
+        for line_number, line in enumerate(file_path.read_text(encoding="utf-8").splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL line {line_number} in {file_path}") from exc
+            text = self.json_to_search_text(data)
+            if text.strip():
+                chunks.append(text)
+        return chunks
+
+    def parse_pkl_file(self, file_path: Path) -> list:
+        with file_path.open("rb") as f:
+            data = pickle.load(f)
+
+        if isinstance(data, list):
+            chunks = []
+            for item in data:
+                text = self.json_to_search_text(item)
+                if text.strip():
+                    chunks.append(text)
+            return chunks
+
+        text = self.json_to_search_text(data)
+        return [text] if text.strip() else []
+
+    def json_to_search_text(self, data) -> str:
+        if isinstance(data, dict):
+            lines = []
+            self.flatten_json_lines(data, lines)
+            return "\n".join(lines)
+        if isinstance(data, list):
+            parts = []
+            for item in data:
+                text = self.json_to_search_text(item)
+                if text.strip():
+                    parts.append(text)
+            return "\n".join(parts)
+        if data is None:
+            return ""
+        return str(data)
+
+    def flatten_json_lines(self, data: dict, lines: list, prefix: str = "") -> None:
+        for key, value in data.items():
+            field_name = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                self.flatten_json_lines(value, lines, field_name)
+            elif isinstance(value, list):
+                if all(not isinstance(item, (dict, list)) for item in value):
+                    values = [str(item) for item in value if item is not None]
+                    if values:
+                        lines.append(f"{field_name}: {', '.join(values)}")
+                else:
+                    for index, item in enumerate(value, start=1):
+                        item_field_name = f"{field_name}[{index}]"
+                        if isinstance(item, dict):
+                            self.flatten_json_lines(item, lines, item_field_name)
+                        elif isinstance(item, list):
+                            nested_text = self.json_to_search_text(item)
+                            if nested_text.strip():
+                                lines.append(f"{item_field_name}: {nested_text}")
+                        elif item is not None:
+                            lines.append(f"{item_field_name}: {item}")
+            elif value is not None:
+                lines.append(f"{field_name}: {value}")
 
     def _resolve_work_root(self, work_dir: str | None) -> Path:
         if work_dir and str(work_dir).strip():
@@ -82,163 +393,6 @@ class FileParserTool(BaseTool):
 
     def get_description(self) -> str:
         return self.description
-    
-    def upload_file(self, presigned_url, file_path):
-        """异步上传单个文件到预签名URL"""
-        try:
-            # 异步读取文件内容
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
-
-            # 异步PUT上传
-            res = requests.put(presigned_url, data=file_data)
-            if res.status_code == 200:
-                print(f"✅ {file_path} 上传成功")
-                return True
-            else:
-                text = res.text
-                print(f"上传失败2,{text}")
-                return False
-        except Exception as e:
-            print(f"上传失败3")
-            return False
-
-    def batch_upload(self, file_paths):
-        """异步批量上传主函数"""
-        # 创建异步HTTP会话
-        data = {
-                "files": [
-                    {"name": os.path.basename(file_path), "data_id": str(i+1)}
-                    for i, file_path in enumerate(file_paths)
-                ],
-                "model_version":"vlm"
-            }
-        try:
-            response = requests.post(self.mineru_api_url,headers=self.header,json=data)
-            if response.status_code == 200:
-                result = response.json()
-                if result["code"] == 0:
-                    batch_id = result["data"]["batch_id"]
-                    urls = result["data"]["file_urls"]
-                    print('batch_id:{},urls:{}'.format(batch_id, urls))
-                    for i in range(0, len(urls)):
-                        with open(file_paths[i], 'rb') as f:
-                            res_upload = requests.put(urls[i], data=f)
-                    return {
-                        "batch_id": batch_id,
-                        "urls": urls
-                    }
-                else:
-                    print('apply upload url failed,reason:{}'.format(result["msg"]))
-            else:
-                print('response not success. status:{} ,result:{}'.format(response.status_code, response))
-        except Exception as err:
-            print(err)
-
-
-    def download_zip(self, batch_id: str, SAVE_DIR: str):
-        """
-        同步下载ZIP文件到本地
-        """
-        ZIP_URL = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
-        
-        # 1. 准备保存目录和路径
-        os.makedirs(SAVE_DIR, exist_ok=True)
-        
-        
-
-        while True:
-            response = requests.get(ZIP_URL, headers=self.header)
-            result = response.json()
-            all_done = True
-            for status in result["data"]["extract_result"]:
-                print(status)
-                if status["state"] != "done":
-                    all_done = False
-                    break
-            if all_done:
-                break
-            time.sleep(5)
-
-        zip_paths = []
-          # 如果状态码不是200，抛出异常
-        total = int(response.headers.get("Content-Length", 0))
-        downloaded = 0
-
-        
-        # 3. 分块写入文件并显示进度
-        for file in result["data"]["extract_result"]:
-            response = requests.get(file["full_zip_url"], stream=True)
-            response.raise_for_status()
-            print(f"开始下载 {batch_id} 的结果...")
-            filename = self.get_zip_filename_from_url(file["full_zip_url"])
-            zip_path = os.path.join(SAVE_DIR, filename)
-            with open(zip_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB/块
-                    if chunk:  # 过滤掉保持连接的新块
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            progress = downloaded / total * 100
-                            print(f"\r下载进度: {progress:.1f}% ({downloaded}/{total} bytes)", end="")
-            print(f"\n✅ 下载完成: {zip_path}")
-            zip_paths.append(zip_path)
-        return zip_paths
-    
-    def get_zip_filename_from_url(self, url: str):
-        """
-        从 URL 中提取 zip 文件名
-        """
-        if not url:
-            return None
-        
-        # 1. 解析 URL，去掉 ? 和 # 后面的内容
-        parsed_url = urlparse(url)
-        path = parsed_url.path
-        
-        # 2. 获取路径的最后一部分
-        filename = os.path.basename(path)
-        
-        # 3. (可选) 安全检查：确保它真的是个 zip 文件
-        if filename.lower().endswith('.zip'):
-            return filename
-        else:
-            return filename 
-
-
-
-    def unzip_file(self, zip_path: str, SAVE_DIR: str, ZIP_FILENAME: str):
-        """
-        同步解压ZIP文件
-        """
-        extract_dir = os.path.join(SAVE_DIR, ZIP_FILENAME.replace(".zip", ""))
-        os.makedirs(extract_dir, exist_ok=True)
-        
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                # 计算总大小用于显示进度（可选）
-                total_size = sum(file.file_size for file in zf.infolist())
-                extracted_size = 0
-                
-                print(f"开始解压到 {extract_dir}...")
-                for file in zf.infolist():  # 使用tqdm显示更美观的进度条<span 
-                    zf.extract(file, extract_dir)
-                    extracted_size += file.file_size
-
-                
-                print(f"\n✅ 解压完成: {extract_dir}")
-                # 打印解压出来的文件列表
-                for name in zf.namelist():
-                    print(f"  📄 {name}")
-                    
-            return extract_dir
-            
-        except zipfile.BadZipFile:
-            print(f"❌ 错误: {zip_path} 不是有效的ZIP文件或已损坏。")
-            return None
-        except Exception as e:
-            print(f"❌ 解压时发生错误: {e}")
-            return None
     
     def format_document(self, text: str) -> str:
         """保留整个文档结构，仅将里面的 <table> 替换为标准 MD 表格"""

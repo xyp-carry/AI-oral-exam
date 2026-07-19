@@ -5,9 +5,11 @@ import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Exam from './pages/Exam'
 import ExamList from './pages/ExamList'
-import DataUpload from './pages/DataUpload'
 import ExamHistory from './pages/ExamHistory'
 import CourseManagement from './pages/CourseManagement'
+import CourseJoin from './pages/CourseJoin'
+import JoinRequestManagement from './pages/JoinRequestManagement'
+import ModelSettings from './pages/ModelSettings'
 import { AuthProvider, useAuth } from './hooks/useAuth'
 import { ExamSessionProvider } from './hooks/useExamSession'
 
@@ -38,9 +40,11 @@ export default function App() {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/exam" element={<ExamList />} />
             <Route path="/exam/:examId" element={<Exam />} />
-            <Route path="/upload" element={<DataUpload />} />
             <Route path="/history" element={<ExamHistory />} />
             <Route path="/courses" element={<CourseManagement />} />
+            <Route path="/join" element={<CourseJoin />} />
+            <Route path="/join-mgmt" element={<JoinRequestManagement />} />
+            <Route path="/model-settings" element={<ModelSettings />} />
           </Route>
           <Route path="*" element={<Navigate to="/login" replace />} />
         </Routes>

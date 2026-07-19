@@ -18,13 +18,13 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 
 
 class GitRepositoryToolInput(BaseModel):
-    repo_url: str = Field(description="Git repository URL.")
+    repo_url: Optional[str] = Field(default=None, description="Git repository URL.")
     user_uuid: str = Field(description="Current user uuid used to scope repository cache.")
     course_id: Optional[str] = Field(default=None, description="Optional course id for exam-scoped repository cache.")
     exam_id: Optional[str] = Field(default=None, description="Optional exam id for exam-scoped repository cache.")
     git_branch: Optional[str] = Field(default=None, description="Optional branch folder name for exam-scoped repository cache.")
-    code_path: Optional[str] = Field(default=None, description="Optional code directory or file path in the repository.")
-    doc_path: Optional[str] = Field(default=None, description="Optional document directory or file path in the repository.")
+    archive_path: Optional[str] = Field(default=None, description="Optional local zip archive path to extract instead of cloning a git repository.")
+    archive_name: Optional[str] = Field(default=None, description="Optional original zip archive file name for logs and manifest metadata.")
     storage_dir: Optional[str] = Field(default=None, description="Optional storage root. Defaults to the project root directory.")
     branch: Optional[str] = Field(default=None, description="Optional branch, tag, or commit-ish to fetch.")
     accelerator_urls: Optional[list[str]] = Field(default=None, description="Optional git or zip accelerator URL prefixes.")
@@ -32,11 +32,12 @@ class GitRepositoryToolInput(BaseModel):
 
 
 GitRepositoryDescription = (
-    "Fetch a git repository for a user. If code_path or doc_path is provided, copy those repository paths into "
-    "Gitrepositorys/{user_uuid}/{repo}/code and/or doc, or into "
-    "Gitrepositorys/{user_uuid}/{course_id}/{exam_id}/{git_branch}/code and/or doc when exam-scoped fields are "
-    "provided, then return readable file contents. If neither path is provided, return repository files with their "
-    "directory hierarchy and do not store code/doc files."
+    "Fetch a git repository URL or extract an uploaded local zip archive for a user. "
+    "The repository is stored as-is under Gitrepositorys/{user_uuid}/{repo} or "
+    "Gitrepositorys/{user_uuid}/{course_id}/{exam_id}/{git_branch}. "
+    "This tool only downloads or extracts the repository and returns repository_root metadata. "
+    "It does not parse, read, copy, or classify repository files. "
+    "Git clones preserve .git metadata for history queries."
 )
 
 
@@ -49,10 +50,10 @@ class GitRepositoryTool(BaseTool):
 
     async def _run(
         self,
-        repo_url: str,
-        user_uuid: str,
-        code_path: Optional[str] = None,
-        doc_path: Optional[str] = None,
+        repo_url: Optional[str] = None,
+        user_uuid: str = "",
+        archive_path: Optional[str] = None,
+        archive_name: Optional[str] = None,
         storage_dir: Optional[str] = None,
         branch: Optional[str] = None,
         accelerator_urls: Optional[list[str]] = None,
@@ -60,31 +61,34 @@ class GitRepositoryTool(BaseTool):
         exam_id: Optional[str] = None,
         git_branch: Optional[str] = None,
         reload: bool = False,
+        target_root: Optional[str] = None,
     ) -> str:
         with ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
                 executor,
-                self.fetch_repository,
-                repo_url,
-                user_uuid,
-                code_path,
-                doc_path,
-                storage_dir,
-                branch,
-                accelerator_urls,
-                course_id,
-                exam_id,
-                git_branch,
-                reload,
+                lambda: self.fetch_repository(
+                    repo_url=repo_url,
+                    user_uuid=user_uuid,
+                    archive_path=archive_path,
+                    archive_name=archive_name,
+                    storage_dir=storage_dir,
+                    branch=branch,
+                    accelerator_urls=accelerator_urls,
+                    course_id=course_id,
+                    exam_id=exam_id,
+                    git_branch=git_branch,
+                    reload=reload,
+                    target_root=target_root,
+                ),
             )
 
     def fetch_repository(
         self,
-        repo_url: str,
-        user_uuid: str,
-        code_path: Optional[str] = None,
-        doc_path: Optional[str] = None,
+        repo_url: Optional[str] = None,
+        user_uuid: str = "",
+        archive_path: Optional[str] = None,
+        archive_name: Optional[str] = None,
         storage_dir: Optional[str] = None,
         branch: Optional[str] = None,
         accelerator_urls: Optional[list[str]] = None,
@@ -92,15 +96,21 @@ class GitRepositoryTool(BaseTool):
         exam_id: Optional[str] = None,
         git_branch: Optional[str] = None,
         reload: bool = False,
+        target_root: Optional[str] = None,
     ) -> str:
         logs = []
-        repo_url = self._require_text(repo_url, "repo_url")
+        archive_path = self._normalize_optional_text(archive_path)
+        archive_name = self._normalize_optional_text(archive_name)
+        source_type = "archive" if archive_path else "git"
+        repo_url = self._normalize_optional_text(repo_url)
+        if archive_path and not repo_url:
+            repo_url = archive_name or Path(archive_path).name
+        if not archive_path:
+            repo_url = self._require_text(repo_url, "repo_url")
         user_uuid = self._require_text(user_uuid, "user_uuid")
         course_id = self._normalize_optional_path(course_id)
         exam_id = self._normalize_optional_path(exam_id)
         git_branch = self._normalize_optional_path(git_branch)
-        code_path = self._normalize_optional_path(code_path)
-        doc_path = self._normalize_optional_path(doc_path)
         branch = branch.strip() if branch and branch.strip() else None
         accelerator_urls = self._get_accelerator_prefixes(accelerator_urls)
 
@@ -111,29 +121,37 @@ class GitRepositoryTool(BaseTool):
             "Start fetching repository.",
             repo_url=repo_url,
             user_uuid=user_uuid,
+            source_type=source_type,
             course_id=course_id,
             exam_id=exam_id,
             git_branch=git_branch,
-            code_path=code_path,
-            doc_path=doc_path,
+            archive_path=archive_path,
+            archive_name=archive_name,
             branch=branch,
             reload=reload,
             accelerator_count=len(accelerator_urls),
         )
 
         try:
-            if not code_path and not doc_path:
-                self._append_log(logs, "mode", "success", "No code_path/doc_path provided; listing files and tree only.")
-                return self._list_repository_directories(repo_url, branch, accelerator_urls, logs)
-
-            repo_root = self._repo_cache_root(storage_dir, user_uuid, repo_url, course_id, exam_id, git_branch)
-            manifest_path = repo_root / "manifest.json"
+            repo_root = (
+                Path(target_root).expanduser().resolve()
+                if target_root and str(target_root).strip()
+                else self._repo_cache_root(storage_dir, user_uuid, repo_url, course_id, exam_id, git_branch)
+            )
+            manifest_path = self._repo_manifest_path(repo_root)
             self._append_log(logs, "cache_check", "success", "Checking local repository cache.", repository_root=str(repo_root))
 
             if not reload:
-                cached = self._read_cached_result(repo_root, manifest_path, repo_url, code_path, doc_path, branch)
+                cached = self._read_cached_result(
+                    repo_root,
+                    manifest_path,
+                    repo_url,
+                    branch,
+                    source_type,
+                    archive_name,
+                )
                 if cached is not None:
-                    self._append_log(logs, "cache_hit", "success", "Matched local cache; reading stored files.")
+                    self._append_log(logs, "cache_hit", "success", "Matched local cache; using stored repository.")
                     cached["logs"] = logs
                     return json.dumps(cached, ensure_ascii=False)
 
@@ -143,62 +161,37 @@ class GitRepositoryTool(BaseTool):
             if repo_root.exists():
                 shutil.rmtree(repo_root)
                 self._append_log(logs, "storage_cleanup", "success", "Removed stale repository cache.")
-            repo_root.mkdir(parents=True, exist_ok=True)
+            if manifest_path.exists():
+                manifest_path.unlink()
 
-            with tempfile.TemporaryDirectory(prefix="git_repository_") as temp_dir:
-                temp_repo = Path(temp_dir) / "repo"
-                self._append_log(logs, "temp_create", "success", "Created temporary repository directory.", temp_dir=temp_dir)
-                self._clone_repository(repo_url, temp_repo, branch, accelerator_urls, logs)
+            repo_root.parent.mkdir(parents=True, exist_ok=True)
+            if archive_path:
+                self._append_log(logs, "store_repository", "start", "Extracting uploaded archive directly into repository root.")
+                self._extract_local_zip_repository(archive_path, repo_root, logs)
+            else:
+                self._append_log(logs, "store_repository", "start", "Cloning repository directly into repository root.")
+                self._clone_repository(repo_url, repo_root, branch, accelerator_urls, logs, allow_zip_fallback=False)
 
-                copied = {}
-                errors = []
-                if code_path:
-                    self._append_log(logs, "copy_code", "start", "Copying requested code path.", path=code_path)
-                    copied["code"] = self._copy_requested_path(temp_repo, code_path, repo_root / "code")
-                    if "error" in copied["code"]:
-                        errors.append(copied["code"]["error"])
-                        self._append_log(logs, "copy_code", "error", copied["code"]["error"])
-                    else:
-                        self._append_log(
-                            logs,
-                            "copy_code",
-                            "success",
-                            "Copied requested code path.",
-                            copied_file_count=copied["code"]["copied_file_count"],
-                        )
-                if doc_path:
-                    self._append_log(logs, "copy_doc", "start", "Copying requested doc path.", path=doc_path)
-                    copied["doc"] = self._copy_requested_path(temp_repo, doc_path, repo_root / "doc")
-                    if "error" in copied["doc"]:
-                        errors.append(copied["doc"]["error"])
-                        self._append_log(logs, "copy_doc", "error", copied["doc"]["error"])
-                    else:
-                        self._append_log(
-                            logs,
-                            "copy_doc",
-                            "success",
-                            "Copied requested doc path.",
-                            copied_file_count=copied["doc"]["copied_file_count"],
-                        )
-
-                manifest = {
-                    "repo_url": repo_url,
-                    "safe_repo_name": repo_root.name,
-                    "user_uuid": user_uuid,
-                    "course_id": course_id,
-                    "exam_id": exam_id,
-                    "git_branch": git_branch,
-                    "branch": branch,
-                    "code_path": code_path,
-                    "doc_path": doc_path,
-                    "storage_root": str(repo_root.parent.parent.parent),
-                    "repository_root": str(repo_root),
-                }
-                self._write_json(manifest_path, manifest)
-                self._append_log(logs, "manifest_write", "success", "Wrote repository manifest.", manifest_path=str(manifest_path))
+            errors = []
+            manifest = {
+                "repo_url": repo_url,
+                "source_type": source_type,
+                "archive_name": archive_name,
+                "archive_path": archive_path,
+                "safe_repo_name": repo_root.name,
+                "user_uuid": user_uuid,
+                "course_id": course_id,
+                "exam_id": exam_id,
+                "git_branch": git_branch,
+                "branch": branch,
+                "storage_root": str(repo_root.parent.parent.parent),
+                "repository_root": str(repo_root),
+                "layout": "repository_root",
+            }
+            self._write_json(manifest_path, manifest)
+            self._append_log(logs, "manifest_write", "success", "Wrote repository sidecar manifest.", manifest_path=str(manifest_path))
 
             result = self._build_stored_result(repo_root, manifest, cached=False, errors=errors)
-            result["copied"] = copied
             result["logs"] = logs
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:
@@ -206,6 +199,7 @@ class GitRepositoryTool(BaseTool):
             return json.dumps(
                 {
                     "repo_url": repo_url,
+                    "source_type": source_type,
                     "branch": branch,
                     "mode": "error",
                     "cached": False,
@@ -215,51 +209,14 @@ class GitRepositoryTool(BaseTool):
                 ensure_ascii=False,
             )
 
-    def _list_repository_directories(
-        self,
-        repo_url: str,
-        branch: Optional[str],
-        accelerator_urls: list[str],
-        logs: list,
-    ) -> str:
-        with tempfile.TemporaryDirectory(prefix="git_repository_") as temp_dir:
-            temp_repo = Path(temp_dir) / "repo"
-            self._append_log(logs, "temp_create", "success", "Created temporary repository directory.", temp_dir=temp_dir)
-            self._clone_repository(repo_url, temp_repo, branch, accelerator_urls, logs)
-            self._append_log(logs, "collect_directories", "start", "Collecting repository directories.")
-            directories = self._collect_directories(temp_repo)
-            self._append_log(logs, "collect_directories", "success", "Collected repository directories.", count=len(directories))
-            self._append_log(logs, "collect_files", "start", "Collecting repository files.")
-            files = self._collect_files(temp_repo)
-            self._append_log(logs, "collect_files", "success", "Collected repository files.", count=len(files))
-            self._append_log(logs, "collect_tree", "start", "Building repository hierarchy tree.")
-            tree = self._collect_repository_tree(temp_repo)
-            self._append_log(logs, "collect_tree", "success", "Built repository hierarchy tree.")
-
-        return json.dumps(
-            {
-                "repo_url": repo_url,
-                "branch": branch,
-                "mode": "repository_tree",
-                "cached": False,
-                "directories": directories,
-                "directory_count": len(directories),
-                "files": files,
-                "file_count": len(files),
-                "tree": tree,
-                "logs": logs,
-            },
-            ensure_ascii=False,
-        )
-
     def _read_cached_result(
         self,
         repo_root: Path,
         manifest_path: Path,
         repo_url: str,
-        code_path: Optional[str],
-        doc_path: Optional[str],
         branch: Optional[str],
+        source_type: str = "git",
+        archive_name: Optional[str] = None,
     ) -> Optional[dict]:
         if not manifest_path.exists():
             return None
@@ -269,41 +226,35 @@ class GitRepositoryTool(BaseTool):
         except (OSError, json.JSONDecodeError):
             return None
 
+        manifest_source_type = manifest.get("source_type") or "git"
+        if manifest_source_type != source_type:
+            return None
         if manifest.get("repo_url") != repo_url:
+            return None
+        if source_type == "archive" and manifest.get("archive_name") != archive_name:
             return None
         if manifest.get("branch") != branch:
             return None
-        if manifest.get("code_path") != code_path:
+        if not repo_root.exists() or not repo_root.is_dir():
             return None
-        if manifest.get("doc_path") != doc_path:
-            return None
-        if code_path and not (repo_root / "code").exists():
-            return None
-        if doc_path and not (repo_root / "doc").exists():
+        if source_type == "git" and not (repo_root / ".git").exists():
             return None
 
         return self._build_stored_result(repo_root, manifest, cached=True, errors=[])
 
     def _build_stored_result(self, repo_root: Path, manifest: dict, cached: bool, errors: list) -> dict:
-        result = {
+        return {
             "repo_url": manifest.get("repo_url"),
+            "source_type": manifest.get("source_type") or "git",
+            "archive_name": manifest.get("archive_name"),
             "branch": manifest.get("branch"),
-            "mode": "stored_files",
+            "mode": "stored_repository",
             "cached": cached,
             "repository_root": str(repo_root),
-            "code_path": manifest.get("code_path"),
-            "doc_path": manifest.get("doc_path"),
-            "code": None,
-            "doc": None,
+            "history_available": (repo_root / ".git").exists(),
+            "layout": manifest.get("layout") or "repository_root",
             "errors": errors,
         }
-
-        if manifest.get("code_path"):
-            result["code"] = self._read_directory_texts(repo_root / "code")
-        if manifest.get("doc_path"):
-            result["doc"] = self._read_directory_texts(repo_root / "doc")
-
-        return result
 
     def _clone_repository(
         self,
@@ -312,11 +263,12 @@ class GitRepositoryTool(BaseTool):
         branch: Optional[str],
         accelerator_urls: list[str],
         logs: list,
+        allow_zip_fallback: bool = True,
     ) -> None:
         clone_errors = []
         clone_candidates = self._build_clone_url_candidates(repo_url, accelerator_urls)
         for clone_url in clone_candidates:
-            command = ["git", "clone", "--depth", "1"]
+            command = ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "clone"]
             if branch:
                 command.extend(["--branch", branch])
             command.extend([clone_url, str(target_dir)])
@@ -350,11 +302,35 @@ class GitRepositoryTool(BaseTool):
             if target_dir.exists():
                 shutil.rmtree(target_dir, ignore_errors=True)
 
+        if not allow_zip_fallback:
+            raise RuntimeError(f"git clone failed: {'; '.join(clone_errors)}")
+
         try:
             self._append_log(logs, "zip_fallback", "start", "Git clone failed; trying zip archive fallback.")
             self._download_zip_repository(repo_url, target_dir, branch, accelerator_urls, logs)
         except Exception as exc:
             raise RuntimeError(f"git clone failed: {'; '.join(clone_errors)}; zip download failed: {exc}") from exc
+
+    def _extract_local_zip_repository(
+        self,
+        archive_path: str,
+        target_dir: Path,
+        logs: list,
+    ) -> None:
+        zip_path = Path(archive_path).expanduser().resolve()
+        if not zip_path.exists() or not zip_path.is_file():
+            raise RuntimeError(f"archive file does not exist: {archive_path}")
+        if zip_path.suffix.lower() != ".zip":
+            raise RuntimeError("only .zip archive is supported.")
+
+        with tempfile.TemporaryDirectory(prefix="git_repository_upload_zip_") as temp_dir:
+            extract_dir = Path(temp_dir) / "extract"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            self._append_log(logs, "local_zip_extract", "start", "Extracting local zip archive.", archive_path=str(zip_path))
+            self._extract_zip_safely(zip_path, extract_dir)
+            self._append_log(logs, "local_zip_extract", "success", "Extracted local zip archive.")
+            self._move_extracted_repository(extract_dir, target_dir)
+            self._append_log(logs, "local_zip_move", "success", "Moved extracted archive to temporary repository.")
 
     def _download_zip_repository(
         self,
@@ -554,146 +530,8 @@ class GitRepositoryTool(BaseTool):
             shutil.rmtree(target_dir)
         shutil.copytree(source_dir, target_dir)
 
-    def _copy_requested_path(self, repo_dir: Path, requested_path: str, destination_dir: Path) -> dict:
-        source_path = self._resolve_repo_path(repo_dir, requested_path)
-        if not source_path.exists():
-            return {
-                "requested_path": requested_path,
-                "destination": str(destination_dir),
-                "error": f"Path does not exist in repository: {requested_path}",
-            }
-
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        if source_path.is_file():
-            shutil.copy2(source_path, destination_dir / source_path.name)
-            copied_files = [source_path.name]
-        else:
-            copied_files = self._copy_directory_files(source_path, destination_dir)
-
-        return {
-            "requested_path": requested_path,
-            "destination": str(destination_dir),
-            "copied_file_count": len(copied_files),
-            "copied_files": copied_files,
-        }
-
-    def _copy_directory_files(self, source_dir: Path, destination_dir: Path) -> list:
-        copied_files = []
-        for file_path in source_dir.rglob("*"):
-            if not file_path.is_file() or self._should_skip(file_path):
-                continue
-            relative_path = file_path.relative_to(source_dir)
-            target_path = destination_dir / relative_path
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(file_path, target_path)
-            copied_files.append(relative_path.as_posix())
-        return copied_files
-
-    def _read_directory_texts(self, directory: Path) -> dict:
-        files = []
-        skipped = []
-        if not directory.exists():
-            return {"root": str(directory), "files": files, "skipped": skipped, "file_count": 0}
-
-        for file_path in directory.rglob("*"):
-            if not file_path.is_file():
-                continue
-
-            relative_path = file_path.relative_to(directory).as_posix()
-            if self._should_skip(file_path):
-                skipped.append({"path": relative_path, "reason": "ignored"})
-                continue
-
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                try:
-                    content = file_path.read_text(encoding="gb18030")
-                except UnicodeDecodeError:
-                    skipped.append({"path": relative_path, "reason": "not_text"})
-                    continue
-            except OSError as exc:
-                skipped.append({"path": relative_path, "reason": str(exc)})
-                continue
-
-            files.append({"path": relative_path, "content": content})
-
-        return {
-            "root": str(directory),
-            "file_count": len(files),
-            "skipped_count": len(skipped),
-            "files": files,
-            "skipped": skipped,
-        }
-
-    def _collect_directories(self, repo_dir: Path) -> list:
-        directories = []
-        for dir_path in repo_dir.rglob("*"):
-            if not dir_path.is_dir():
-                continue
-            if ".git" in dir_path.relative_to(repo_dir).parts:
-                continue
-            directories.append(dir_path.relative_to(repo_dir).as_posix())
-        return sorted(directories)
-
-    def _collect_files(self, repo_dir: Path) -> list:
-        files = []
-        for file_path in repo_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            relative_path = file_path.relative_to(repo_dir)
-            if ".git" in relative_path.parts:
-                continue
-            files.append(
-                {
-                    "path": relative_path.as_posix(),
-                    "name": file_path.name,
-                    "parent": relative_path.parent.as_posix() if relative_path.parent.as_posix() != "." else "",
-                    "size": self._safe_file_size(file_path),
-                }
-            )
-        return sorted(files, key=lambda item: item["path"])
-
-    def _collect_repository_tree(self, repo_dir: Path) -> dict:
-        def build_node(path: Path, relative_path: Path) -> dict:
-            node_path = "" if str(relative_path) == "." else relative_path.as_posix()
-            if path.is_file():
-                return {
-                    "type": "file",
-                    "name": path.name,
-                    "path": node_path,
-                    "size": self._safe_file_size(path),
-                }
-
-            children = []
-            for child in sorted(path.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
-                child_relative = child.relative_to(repo_dir)
-                if ".git" in child_relative.parts:
-                    continue
-                children.append(build_node(child, child_relative))
-
-            return {
-                "type": "directory",
-                "name": path.name if node_path else "",
-                "path": node_path,
-                "children": children,
-            }
-
-        return build_node(repo_dir, Path("."))
-
-    def _safe_file_size(self, file_path: Path) -> Optional[int]:
-        try:
-            return file_path.stat().st_size
-        except OSError:
-            return None
-
-    def _resolve_repo_path(self, repo_dir: Path, requested_path: str) -> Path:
-        clean_path = requested_path.replace("\\", "/").strip("/")
-        candidate = (repo_dir / clean_path).resolve()
-        repo_real = repo_dir.resolve()
-        if candidate != repo_real and repo_real not in candidate.parents:
-            raise ValueError(f"Path escapes repository root: {requested_path}")
-        return candidate
+    def _repo_manifest_path(self, repo_root: Path) -> Path:
+        return repo_root.parent / f".{repo_root.name}.manifest.json"
 
     def _repo_cache_root(
         self,
@@ -733,46 +571,16 @@ class GitRepositoryTool(BaseTool):
         value = str(value).strip()
         return value.strip("/") if value else None
 
+    def _normalize_optional_text(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
     def _require_text(self, value: str, name: str) -> str:
         if value is None or not str(value).strip():
             raise ValueError(f"{name} is required.")
         return str(value).strip()
-
-    def _should_skip(self, file_path: Path) -> bool:
-        parts = set(file_path.parts)
-        if ".git" in parts or "__pycache__" in parts:
-            return True
-        if file_path.name in {".DS_Store"}:
-            return True
-        if file_path.suffix.lower() in {
-            ".7z",
-            ".bin",
-            ".bmp",
-            ".class",
-            ".dll",
-            ".exe",
-            ".gif",
-            ".ico",
-            ".jar",
-            ".jpeg",
-            ".jpg",
-            ".lock",
-            ".mp3",
-            ".mp4",
-            ".png",
-            ".pyc",
-            ".rar",
-            ".so",
-            ".ttf",
-            ".webp",
-            ".xlsx",
-            ".zip",
-        }:
-            return True
-        try:
-            return file_path.stat().st_size > 1024 * 1024
-        except OSError:
-            return True
 
     def _write_json(self, path: Path, data: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -780,3 +588,190 @@ class GitRepositoryTool(BaseTool):
 
     def get_description(self) -> str:
         return self.description
+
+
+
+class GitHistoryToolInput(BaseModel):
+    repo_path: str = Field(description="Local git repository path.")
+    mode: str = Field(default="history", description="history or commit_detail.")
+    commit_hash: Optional[str] = Field(default=None, description="Commit hash for commit_detail mode.")
+
+
+GitHistoryDescription = (
+    "Read all local git branch/history information and commit details with read-only git commands. "
+    "History mode returns all commits; commit_detail mode reads the requested commit. "
+    "If repo_path is not a git repository, return NO_GIT_BRANCH_INFO."
+)
+
+
+class GitHistoryTool(BaseTool):
+    """Read-only git history and commit detail tool."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.description = GitHistoryDescription
+
+    async def _run(
+        self,
+        repo_path: str,
+        mode: str = "history",
+        commit_hash: Optional[str] = None,
+    ) -> str:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                executor,
+                self.read_git_history,
+                repo_path,
+                mode,
+                commit_hash,
+            )
+
+    def read_git_history(
+        self,
+        repo_path: str,
+        mode: str = "history",
+        commit_hash: Optional[str] = None,
+    ) -> str:
+        repo = self._resolve_git_repo_path(repo_path)
+        if repo is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "flag": "NO_GIT_BRANCH_INFO",
+                    "repo_path": str(repo_path or ""),
+                    "message": "没有git分支信息。",
+                    "history": [],
+                    "commit_detail": None,
+                },
+                ensure_ascii=False,
+            )
+
+        mode = str(mode or "history").strip()
+        branch = self._run_git(repo, ["git", "branch", "--show-current"])
+        status = self._run_git(repo, ["git", "status", "--short"])
+
+        if mode == "commit_detail":
+            commit_hash = self._require_commit_hash(commit_hash)
+            detail = self._read_commit_detail(repo, commit_hash)
+            return json.dumps(
+                {
+                    "ok": detail["ok"],
+                    "flag": "GIT_COMMIT_DETAIL_READY" if detail["ok"] else "GIT_COMMIT_DETAIL_FAILED",
+                    "repo_path": str(repo),
+                    "branch": branch["stdout"].strip(),
+                    "status": status["stdout"],
+                    "history": [],
+                    "commit_detail": detail,
+                },
+                ensure_ascii=False,
+            )
+
+        history = self._read_history(repo)
+        return json.dumps(
+            {
+                "ok": history["ok"],
+                "flag": "GIT_HISTORY_READY" if history["ok"] else "GIT_HISTORY_FAILED",
+                "repo_path": str(repo),
+                "branch": branch["stdout"].strip(),
+                "status": status["stdout"],
+                "history": history["commits"],
+                "commit_detail": None,
+            },
+            ensure_ascii=False,
+        )
+
+    def _resolve_git_repo_path(self, repo_path: str) -> Optional[Path]:
+        if not repo_path or not str(repo_path).strip():
+            return None
+        repo = Path(str(repo_path)).expanduser().resolve()
+        if not repo.exists() or not repo.is_dir():
+            return None
+        git_check = self._run_git(repo, ["git", "rev-parse", "--is-inside-work-tree"])
+        if not git_check["ok"] or git_check["stdout"].strip() != "true":
+            return None
+        root = self._run_git(repo, ["git", "rev-parse", "--show-toplevel"])
+        if not root["ok"] or not root["stdout"].strip():
+            return repo
+        return Path(root["stdout"].strip()).resolve()
+
+    def _read_history(self, repo: Path) -> dict:
+        pretty = "%H%x1f%h%x1f%ad%x1f%an%x1f%s"
+        result = self._run_git(
+            repo,
+            [
+                "git",
+                "log",
+                "--date=iso-strict",
+                f"--pretty=format:{pretty}",
+            ],
+        )
+        commits = []
+        if result["ok"]:
+            for line in result["stdout"].splitlines():
+                parts = line.split("\x1f")
+                if len(parts) < 5:
+                    continue
+                commits.append(
+                    {
+                        "commit_hash": parts[0],
+                        "short_hash": parts[1],
+                        "date": parts[2],
+                        "author": parts[3],
+                        "subject": parts[4],
+                    }
+                )
+        result["commits"] = commits
+        return result
+
+    def _read_commit_detail(self, repo: Path, commit_hash: str) -> dict:
+        stat = self._run_git(repo, ["git", "show", "--stat", "--find-renames", "--format=fuller", commit_hash])
+        patch = self._run_git(repo, ["git", "show", "--patch", "--find-renames", "--format=fuller", commit_hash])
+        return {
+            "ok": stat["ok"] and patch["ok"],
+            "commit_hash": commit_hash,
+            "stat": stat["stdout"],
+            "patch": patch["stdout"],
+            "stderr": "\n".join(text for text in [stat["stderr"], patch["stderr"]] if text),
+        }
+
+    def _require_commit_hash(self, value: Optional[str]) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("commit_hash is required for commit_detail mode.")
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", text):
+            raise ValueError("commit_hash contains unsupported characters.")
+        return text
+
+    def _run_git(self, repo: Path, command: list[str]) -> dict:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                shell=False,
+                check=False,
+                timeout=30,
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(exc),
+                "command": command,
+            }
+        return {
+            "ok": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout or "",
+            "stderr": completed.stderr or "",
+            "command": command,
+        }
+
+
+GithistoryTool = GitHistoryTool
+githistoryTool = GitHistoryTool

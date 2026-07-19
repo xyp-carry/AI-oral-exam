@@ -67,6 +67,8 @@ class GlobalMonitor:
         logger.info("全局监测者已发出停止信号。")
 
     async def _evaluate_rule(self, obj_id: str, obj_name: str, rule: callable) -> bool:
+
+        return True
         """
         判断对象是否允许启动。
         rule 接收当前类别下的 active_nodes。

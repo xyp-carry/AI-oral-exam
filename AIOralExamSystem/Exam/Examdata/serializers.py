@@ -79,13 +79,22 @@ def history_row_to_dict(row) -> Dict[str, object]:
         "exam_id",
         "course_id",
         "exam_item_id",
+        "exam_item_name",
         "total_score",
+        "exam_score",
+        "dimension_scores_json",
+        "exam_dimension_scores_json",
         "dimension_count",
         "question_count",
         "ended_at",
         "created_at",
     )
     result = dict(zip(fields, row))
+    result["dimension_scores"] = _json_loads(result.pop("dimension_scores_json"), {})
+    result["exam_dimension_scores"] = _json_loads(
+        result.pop("exam_dimension_scores_json"),
+        None,
+    )
     for key in ("ended_at", "created_at"):
         value = result.get(key)
         if value is not None:
@@ -106,9 +115,11 @@ def record_row_to_dict(row) -> Dict[str, object]:
         "correctness_level",
         "evaluation",
         "standard_answer",
+        "is_preset_question",
         "created_at",
     )
     result = dict(zip(fields, row))
+    result["is_preset_question"] = bool(result.get("is_preset_question"))
     value = result.get("created_at")
     if value is not None:
         result["created_at"] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -152,6 +163,11 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
         "participant_count",
         "attempt_count",
         "need_code_repository",
+        "use_preset_questions",
+        "enable_report_analysis",
+        "report_total_score",
+        "report_judge_rule",
+        "course_document_sources_json",
         "exam_available_from",
         "exam_available_until",
         "status",
@@ -162,7 +178,12 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
     result = dict(zip(fields, row))
     result["dimension_names"] = _json_loads(result.pop("dimension_names_json"), [])
     result["dimension_scores"] = _json_loads(result.pop("dimension_scores_json"), {})
+    result["course_document_sources"] = _normalize_text_list(
+        _json_loads(result.pop("course_document_sources_json"), [])
+    )
     result["need_code_repository"] = bool(result.get("need_code_repository"))
+    result["use_preset_questions"] = bool(result.get("use_preset_questions"))
+    result["enable_report_analysis"] = bool(result.get("enable_report_analysis"))
     result.pop("created_by", None)
     available_from = result.get("exam_available_from")
     available_until = result.get("exam_available_until")
@@ -170,6 +191,35 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
         available_from and available_until and available_from <= datetime.now() < available_until
     )
     for key in ("exam_available_from", "exam_available_until", "created_at", "updated_at"):
+        value = result.get(key)
+        if value is not None:
+            result[key] = value.strftime("%Y-%m-%d %H:%M:%S")
+    return result
+
+
+def preset_question_row_to_dict(row) -> Dict[str, object]:
+    fields = (
+        "preset_question_id",
+        "exam_item_id",
+        "user_id",
+        "question_dimension",
+        "question_content",
+        "standard_answer",
+        "question_blocks_json",
+        "code_fragments_json",
+        "score",
+        "sort_order",
+        "status",
+        "created_by",
+        "created_at",
+        "updated_at",
+    )
+    result = dict(zip(fields, row))
+    result["question_blocks"] = _json_loads(result.pop("question_blocks_json"), [])
+    result["code_fragments"] = _json_loads(result.pop("code_fragments_json"), [])
+    result.pop("user_id", None)
+    result.pop("created_by", None)
+    for key in ("created_at", "updated_at"):
         value = result.get(key)
         if value is not None:
             result[key] = value.strftime("%Y-%m-%d %H:%M:%S")
@@ -185,6 +235,20 @@ def _json_loads(value, default):
         return json.loads(value)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_text_list(value) -> list:
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for item in value:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        result.append(text)
+        seen.add(text)
+    return result
 
 
 def join_request_row_to_dict(row) -> Dict[str, object]:

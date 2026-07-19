@@ -20,11 +20,14 @@ class Question:
     # 当前默认每题 1 分，保留字段是为了后续支持不同题目分值。
     score: float = 1.0
     standard_answer: Optional[str] = None
-    # -1 表示基础题；其他值表示该题依赖的历史答题记录下标。
-    based_on_record_index: int = -1
+    record_index: Optional[int] = None
+    based_on_record_index: str = "-1"
+    # "-1" 表示基础题；其他值表示该题依赖的父题 question_id。
+    based_on_record_index: str = "-1"
 
     # 生成题目时的补充来源信息，便于日志排查。
     source_detail: Optional[str] = None
+    is_preset_question: bool = False
 
     def __post_init__(self):
         question_blocks = self._normalize_question_blocks(self.question_blocks)
@@ -144,9 +147,11 @@ class CandidateExamState:
         initial_score: float = 5.0,
         initial_difficulty_level: int = 3,
         dimensions: Optional[List[str]] = None,
+        dimension_scores: Optional[Dict[str, float]] = None,
     ):
         self.default_score = self._clamp_score(initial_score)
         self.default_difficulty_level = self._clamp_difficulty_level(initial_difficulty_level)
+        self.configured_dimension_scores = self._normalize_dimension_scores(dimension_scores or {})
 
         # 当前维度只是状态视图，实际各维度状态分别存在下面的字典中。
         self.current_dimension: Optional[str] = None
@@ -154,14 +159,17 @@ class CandidateExamState:
         self.current_difficulty_level = self.default_difficulty_level
 
         # 每个维度独立维护用户状态分数、难度、theta 和完成状态。
+        # dimension_scores is the single runtime score source; configured_dimension_scores keeps the max scores.
         self.dimension_scores: Dict[str, float] = {}
         self.dimension_difficulty_levels: Dict[str, int] = {}
         self.dimension_thetas: Dict[str, float] = {}
         self.dimension_finished: Dict[str, bool] = {}
+        self.dimension_answer_histories: Dict[str, List[dict]] = {}
 
         # 预备队列按 FIFO 出题，优先队列按 priority/sequence 出题。
         self.prepared_question_queues: Dict[str, Deque[Question]] = {}
         self.priority_question_queues: Dict[str, List[PriorityQuestion]] = {}
+        self.preset_question_queues: Dict[str, Deque[Question]] = {}
 
         # 当前正在等待用户回答的题目，在 AI 真正发出题目时更新。
         self.current_question: Optional[Question] = None
@@ -189,18 +197,63 @@ class CandidateExamState:
             questions.extend(queue)
         return questions
 
+    @property
+    def preset_question_queue(self) -> Deque[Question]:
+        questions: Deque[Question] = deque()
+        for queue in self.preset_question_queues.values():
+            questions.extend(queue)
+        return questions
+
     def _ensure_dimension_state(self, dimension: str) -> str:
         dimension = str(dimension or "default").strip() or "default"
-        self.dimension_scores.setdefault(dimension, self.default_score)
+        self.dimension_scores.setdefault(dimension, self._default_dimension_score(dimension))
         self.dimension_difficulty_levels.setdefault(
             dimension,
             self.default_difficulty_level,
         )
         self.dimension_thetas.setdefault(dimension, self.INITIAL_THETA)
         self.dimension_finished.setdefault(dimension, False)
+        self.dimension_answer_histories.setdefault(dimension, [])
         self.prepared_question_queues.setdefault(dimension, deque())
         self.priority_question_queues.setdefault(dimension, [])
+        self.preset_question_queues.setdefault(dimension, deque())
         return dimension
+
+    def _normalize_dimension_scores(self, dimension_scores: Dict[str, float]) -> Dict[str, float]:
+        normalized: Dict[str, float] = {}
+        for name, score in dimension_scores.items():
+            dimension = str(name).strip()
+            if not dimension:
+                continue
+            try:
+                normalized[dimension] = max(0.0, float(score))
+            except (TypeError, ValueError):
+                normalized[dimension] = 0.0
+        return normalized
+
+    def _default_dimension_score(self, dimension: str) -> float:
+        max_score = self._max_dimension_score(dimension)
+        return max_score * (self.default_score / self.MAX_SCORE)
+
+    def get_total_score(self) -> float:
+        total_score = sum(self.configured_dimension_scores.values())
+        return total_score if total_score > 0 else self.MAX_SCORE
+
+    def _max_dimension_score(self, dimension: Optional[str] = None) -> float:
+        if dimension and dimension in self.configured_dimension_scores:
+            return self.configured_dimension_scores[dimension]
+        dimension_count = len(self.configured_dimensions) if hasattr(self, "configured_dimensions") else 0
+        total_score = self.get_total_score()
+        if dimension_count > 0 and total_score > 0:
+            return total_score / dimension_count
+        return self.MAX_SCORE
+
+    def get_question_score(self) -> float:
+        return self.get_total_score() * 0.1
+
+    def _normalize_question_score(self, question: Question) -> Question:
+        object.__setattr__(question, "score", self.get_question_score())
+        return question
 
     def initialize_dimensions(self, dimensions: List[str]) -> None:
         """初始化考试项配置的维度，并为每个维度建立独立状态。"""
@@ -293,20 +346,32 @@ class CandidateExamState:
         answered_question: Question,
         judge_res: dict,
     ) -> QuestionGenerationPlan:
-        answer_correct = self._is_answer_correct(judge_res)
         dimension = self._ensure_dimension_state(answered_question.dimension)
+        answer_result = self.record_dimension_answer_result(dimension, answered_question, judge_res)
         current_score = self.get_score(dimension)
         current_theta = self.get_theta(dimension)
-        delta_score = float(answered_question.score) * current_theta
-        projected_score = current_score + delta_score if answer_correct else current_score - delta_score
-        next_score = self._clamp_score(projected_score)
+        delta_score = self._delta_score(answered_question.score, dimension) * current_theta
+        projected_score = current_score + delta_score if answer_result != "wrong" else current_score - delta_score
+        next_score = self._clamp_score(projected_score, dimension)
         self.update_score(next_score, dimension)
 
-        target_level = self._difficulty_level_from_score(next_score)
+        # Difficulty still uses the old 0-10 scale, while dimension_scores uses real dimension points.
+        target_level = self._difficulty_level_from_score(self._normalized_score(next_score, dimension))
         self.update_difficulty_level(target_level, dimension)
         next_theta = self.update_theta_after_judge(dimension, judge_res)
+        recent_results = self.get_recent_dimension_results(dimension)
+        if len(recent_results) == 3 and recent_results == ["wrong", "wrong", "wrong"]:
+            next_score = self.apply_consecutive_wrong_penalty(dimension)
+            target_level = self._difficulty_level_from_score(self._normalized_score(next_score, dimension))
+            self.update_difficulty_level(target_level, dimension)
+        elif len(recent_results) == 3 and recent_results == ["correct", "correct", "correct"]:
+            next_theta = self.boost_theta_after_consecutive_correct(dimension)
 
-        if projected_score > self.MAX_SCORE or next_theta < self.MIN_THETA:
+        if next_theta < 0.5:
+            self.mark_dimension_finished(dimension)
+            return QuestionGenerationPlan(should_finish=self.all_dimensions_finished())
+
+        if projected_score > self._max_dimension_score(dimension):
             self.mark_dimension_finished(dimension)
             return QuestionGenerationPlan(should_finish=self.all_dimensions_finished())
 
@@ -316,6 +381,49 @@ class CandidateExamState:
             source_question=answered_question,
         )
 
+    def record_dimension_answer_result(self, dimension: str, question: Question, judge_res: dict) -> str:
+        dimension = self._ensure_dimension_state(dimension)
+        result = self._normalize_answer_result(judge_res)
+        self.dimension_answer_histories[dimension].append(
+            {
+                "question_id": question.question_id,
+                "record_index": question.record_index,
+                "result": result,
+                "correctness_level": judge_res.get("correctness_level"),
+            }
+        )
+        return result
+
+    def get_recent_dimension_results(self, dimension: str, limit: int = 3) -> List[str]:
+        dimension = self._ensure_dimension_state(dimension)
+        return [
+            str(item.get("result"))
+            for item in self.dimension_answer_histories.get(dimension, [])[-limit:]
+        ]
+
+    def apply_consecutive_wrong_penalty(self, dimension: str) -> float:
+        dimension = self._ensure_dimension_state(dimension)
+        penalty = self.get_total_score() * 0.15
+        self.update_score(self.dimension_scores[dimension] - penalty, dimension)
+        return self.dimension_scores[dimension]
+
+    def boost_theta_after_consecutive_correct(self, dimension: str) -> float:
+        dimension = self._ensure_dimension_state(dimension)
+        current_theta = self.dimension_thetas[dimension]
+        self.dimension_thetas[dimension] = current_theta * 2 if current_theta <= 1 else 2
+        return self.dimension_thetas[dimension]
+
+    def _delta_score(self, question_score: float, dimension: str) -> float:
+        try:
+            score = float(question_score)
+        except (TypeError, ValueError):
+            score = self.get_question_score()
+        total_score = self.get_total_score()
+        if total_score <= 0:
+            return 1.0
+        # Convert this question's total-score share into the current dimension's point scale.
+        return max(0.0, score / total_score * self._max_dimension_score(dimension))
+
     def update_theta_after_judge(self, dimension: str, judge_res: dict) -> float:
         dimension = self._ensure_dimension_state(dimension)
         quality = self._judge_quality(judge_res)
@@ -324,10 +432,17 @@ class CandidateExamState:
             "correct": 1.0,
             "average": 0.7,
             "wrong": 0.5,
-            "absurd": 0.3,
         }
         self.dimension_thetas[dimension] *= decay_by_quality.get(quality, 1.0)
         return self.dimension_thetas[dimension]
+
+    def _normalize_answer_result(self, judge_res: dict) -> str:
+        quality = self._judge_quality(judge_res)
+        if quality in {"excellent", "correct"}:
+            return "correct"
+        if quality == "average":
+            return "average"
+        return "wrong"
 
     def _judge_quality(self, judge_res: dict) -> str:
         raw_quality = str(
@@ -345,7 +460,7 @@ class CandidateExamState:
         if any(keyword in raw_quality for keyword in ("average", "partial", "\u4e00\u822c", "\u90e8\u5206")):
             return "average"
         if any(keyword in raw_quality for keyword in ("absurd", "irrelevant", "nonsense", "\u79bb\u8c31", "\u65e0\u5173")):
-            return "absurd"
+            return "wrong"
         if any(keyword in raw_quality for keyword in ("wrong", "incorrect", "bad", "\u9519\u8bef")):
             return "wrong"
 
@@ -362,7 +477,7 @@ class CandidateExamState:
             return "average"
         if score >= 0.3:
             return "wrong"
-        return "absurd"
+        return "wrong"
 
     def _is_answer_correct(self, judge_res: dict) -> bool:
         answer_correct = judge_res.get("answer_correct")
@@ -375,6 +490,10 @@ class CandidateExamState:
     def mark_dimension_finished(self, dimension: str) -> None:
         dimension = self._ensure_dimension_state(dimension)
         self.dimension_finished[dimension] = True
+
+    def mark_exam_finished(self) -> None:
+        for dimension in list(self.dimension_finished):
+            self.dimension_finished[dimension] = True
 
     def all_dimensions_finished(self) -> bool:
         return bool(self.dimension_finished) and all(self.dimension_finished.values())
@@ -396,6 +515,7 @@ class CandidateExamState:
     def add_prepared_question(self, question: Question) -> None:
         """向预备题队列添加题目。"""
 
+        question = self._normalize_question_score(question)
         dimension = self._ensure_dimension_state(question.dimension)
         self.prepared_question_queues[dimension].append(question)
         self._log_question_event("prepared_question_added", question)
@@ -403,6 +523,7 @@ class CandidateExamState:
     def add_priority_question(self, question: Question, priority: int = 100) -> None:
         """向优先题队列添加题目。"""
 
+        question = self._normalize_question_score(question)
         dimension = self._ensure_dimension_state(question.dimension)
         heappush(
             self.priority_question_queues[dimension],
@@ -414,6 +535,12 @@ class CandidateExamState:
         )
         self._log_question_event("priority_question_added", question, priority=priority)
 
+    def add_preset_question(self, question: Question) -> None:
+        question = self._normalize_question_score(question)
+        dimension = self._ensure_dimension_state(question.dimension)
+        self.preset_question_queues[dimension].append(question)
+        self._log_question_event("preset_question_added", question)
+
     def has_next_question(self, dimension: Optional[str] = None) -> bool:
         """判断指定维度或全局是否还有可用题目。"""
 
@@ -422,10 +549,11 @@ class CandidateExamState:
             return bool(
                 self.priority_question_queues[dimension]
                 or self.prepared_question_queues[dimension]
+                or self.preset_question_queues[dimension]
             )
         return any(self.priority_question_queues.values()) or any(
             self.prepared_question_queues.values()
-        )
+        ) or any(self.preset_question_queues.values())
 
     def pop_next_question(self, dimension: Optional[str] = None) -> Optional[Question]:
         """按旧规则弹出下一题：先优先队列，再预备队列。"""
@@ -444,6 +572,11 @@ class CandidateExamState:
             if question:
                 return question
 
+        for active_dimension in list(self.preset_question_queues):
+            question = self._pop_next_preset_question(active_dimension)
+            if question:
+                return question
+
         return None
 
     def pop_ready_question(
@@ -456,8 +589,8 @@ class CandidateExamState:
 
         last_record_index = self._record_index_for_question(last_answered_question)
         if last_answered_question is None and self.exam_records:
-            last_record_index = len(self.exam_records) - 1
-            last_answered_question = self.exam_records[last_record_index].question
+            last_answered_question = self.exam_records[-1].question
+            last_record_index = self._record_index_for_question(last_answered_question)
 
         if last_answered_question is None:
             return self._pop_any_ready_question()
@@ -486,8 +619,8 @@ class CandidateExamState:
 
         last_record_index = self._record_index_for_question(last_answered_question)
         if last_answered_question is None and self.exam_records:
-            last_record_index = len(self.exam_records) - 1
-            last_answered_question = self.exam_records[last_record_index].question
+            last_answered_question = self.exam_records[-1].question
+            last_record_index = self._record_index_for_question(last_answered_question)
 
         if last_answered_question is None:
             return self._has_any_ready_question()
@@ -505,24 +638,23 @@ class CandidateExamState:
 
         return self._has_any_ready_question()
 
-    def _record_index_for_question(self, question: Optional[Question]) -> Optional[int]:
+    def _record_index_for_question(self, question: Optional[Question]) -> Optional[str]:
         if question is None:
             return None
-        for index in range(len(self.exam_records) - 1, -1, -1):
-            recorded_question = self.exam_records[index].question
-            if recorded_question is question:
-                return index
-            if recorded_question.question_id == question.question_id:
-                return index
-        return None
+        return question.question_id
+
+    def record_index_for_question(self, question: Optional[Question]) -> Optional[str]:
+        return self._record_index_for_question(question)
 
     def _question_has_ready_parent(self, question: Question) -> bool:
-        parent_index = question.based_on_record_index
-        if parent_index == -1:
+        parent_question_id = str(question.based_on_record_index or "").strip()
+        if not parent_question_id or parent_question_id == "-1":
             return True
-        if not 0 <= parent_index < len(self.exam_records):
-            return False
-        return bool(self.exam_records[parent_index].question.question_id)
+        return any(
+            record.question.question_id == parent_question_id
+            for record in self.exam_records
+            if record.question is not None
+        )
 
     def _pop_any_ready_question(self, excluded_dimension: Optional[str] = None) -> Optional[Question]:
         question = self._pop_best_ready_priority_question(excluded_dimension)
@@ -539,6 +671,16 @@ class CandidateExamState:
             if question:
                 return question
 
+        for active_dimension in list(self.preset_question_queues):
+            if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
+                continue
+            question = self._pop_preset_question_matching(
+                active_dimension,
+                self._question_has_ready_parent,
+            )
+            if question:
+                return question
+
         return None
 
     def _has_any_ready_question(self, excluded_dimension: Optional[str] = None) -> bool:
@@ -549,6 +691,12 @@ class CandidateExamState:
                 return True
 
         for active_dimension, queue in self.prepared_question_queues.items():
+            if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
+                continue
+            if any(self._question_has_ready_parent(question) for question in queue):
+                return True
+
+        for active_dimension, queue in self.preset_question_queues.items():
             if active_dimension == excluded_dimension or self.is_dimension_finished(active_dimension):
                 continue
             if any(self._question_has_ready_parent(question) for question in queue):
@@ -617,6 +765,19 @@ class CandidateExamState:
 
         return None
 
+    def _pop_preset_question_matching(self, dimension: str, predicate) -> Optional[Question]:
+        queue = self.preset_question_queues.get(dimension)
+        if not queue:
+            return None
+
+        for _ in range(len(queue)):
+            question = queue.popleft()
+            if predicate(question):
+                return self._activate_popped_question(question)
+            queue.append(question)
+
+        return None
+
     def _activate_popped_question(self, question: Question) -> Question:
         self.set_current_dimension(question.dimension)
         return question
@@ -625,7 +786,10 @@ class CandidateExamState:
         question = self._pop_next_priority_question(dimension)
         if question:
             return question
-        return self._pop_next_prepared_question(dimension)
+        question = self._pop_next_prepared_question(dimension)
+        if question:
+            return question
+        return self._pop_next_preset_question(dimension)
 
     def _pop_next_priority_question(self, dimension: Optional[str] = None) -> Optional[Question]:
         if dimension is not None:
@@ -653,6 +817,13 @@ class CandidateExamState:
         question = queue.popleft()
         return self._activate_popped_question(question)
 
+    def _pop_next_preset_question(self, dimension: str) -> Optional[Question]:
+        queue = self.preset_question_queues.get(dimension)
+        if not queue:
+            return None
+        question = queue.popleft()
+        return self._activate_popped_question(question)
+
     def record_answer(
         self,
         question: Question,
@@ -663,6 +834,7 @@ class CandidateExamState:
         """记录一次已完成答题。"""
 
         self.set_current_dimension(question.dimension)
+        object.__setattr__(question, "record_index", len(self.exam_records))
         record = QARecord(
             question=question,
             correctness_level=correctness_level,
@@ -687,13 +859,14 @@ class CandidateExamState:
     ) -> None:
         """更新候选人在某个维度上的状态分数。"""
 
-        next_score = self._clamp_score(next_score)
         dimension = dimension or self.current_dimension
         if dimension is None:
+            next_score = self._clamp_score(next_score)
             self.default_score = next_score
             self.current_score = next_score
             return
         dimension = self._ensure_dimension_state(dimension)
+        next_score = self._clamp_score(next_score, dimension)
         self.dimension_scores[dimension] = next_score
         if self.current_dimension == dimension:
             self.current_score = next_score
@@ -704,8 +877,15 @@ class CandidateExamState:
             min(self.MAX_DIFFICULTY_LEVEL, int(level)),
         )
 
-    def _clamp_score(self, score: float) -> float:
-        return max(self.MIN_SCORE, min(self.MAX_SCORE, float(score)))
+    def _clamp_score(self, score: float, dimension: Optional[str] = None) -> float:
+        max_score = self._max_dimension_score(dimension) if dimension else self.MAX_SCORE
+        return max(self.MIN_SCORE, min(max_score, float(score)))
+
+    def _normalized_score(self, score: float, dimension: str) -> float:
+        max_score = self._max_dimension_score(dimension)
+        if max_score <= 0:
+            return self.MIN_SCORE
+        return self._clamp_score(score, dimension) / max_score * self.MAX_SCORE
 
     def _difficulty_level_from_score(self, score: float) -> int:
         score = self._clamp_score(score)
@@ -759,12 +939,20 @@ class CandidateExamState:
             lines.append(f"{dimension}: {contents}")
         return "\n".join(lines) if lines else "(empty)"
 
+    def _format_preset_queue_contents(self) -> str:
+        lines: List[str] = []
+        for dimension, queue in self.preset_question_queues.items():
+            contents = [question.content for question in queue]
+            lines.append(f"{dimension}: {contents}")
+        return "\n".join(lines) if lines else "(empty)"
+
     def _log_question_event(self, event: str, question: Question, priority: Optional[int] = None) -> None:
-        if event in {"prepared_question_added", "priority_question_added"}:
+        if event in {"prepared_question_added", "priority_question_added", "preset_question_added"}:
             logger.info(
                 "\n[CandidateExamState] Question queue snapshot\n"
                 f"priority_question_queue:\n{self._format_priority_queue_contents()}\n"
-                f"prepared_question_queue:\n{self._format_prepared_queue_contents()}"
+                f"prepared_question_queue:\n{self._format_prepared_queue_contents()}\n"
+                f"preset_question_queue:\n{self._format_preset_queue_contents()}"
             )
             return
 

@@ -39,7 +39,7 @@ class MetricsFrameLogger(FrameProcessor):
         self.initialize()
         self.Framelist = []
         self.history: List[Dict[str, str]] = history
-        settings = get_settings()
+
         # self.Textfixer = TextfixAgent(model_settings={"model_name": settings.deepseek_model,"model_url":settings.deepseek_url,"model_api_key":settings.deepseek_api_key}, source=current_user['uuid'])
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -70,12 +70,6 @@ class MetricsFrameLogger(FrameProcessor):
                     
                     self.initialize()
                     logger.info(f"User stop Speak")
-                    # logs = "\n".join(
-                    #             f"{m['role']}: {m['content']}"
-                    #             for m in self.history
-                    #         )
-                    # main_judge_doc = await self.Textfixer.run(history=[{"role": "user", "content": f"以下是历史上文:{self.history[-1]['content']} \n 当前STT生成的文本:{text}"}])
-                    # framenew = LLMContextFrame(context=LLMContext(messages = [{'role':'user','content':main_judge_doc['messages'][-1].content}]))
                     framenew = LLMContextFrame(context=LLMContext(messages = [{'role':'user','content':text}]))
 
                     # await self.push_frame(frame, direction)

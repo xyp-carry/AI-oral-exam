@@ -10,11 +10,20 @@ from AIOralExamSystem.Exam.Examdata import (
     approve_course_join_request_by_user,
     create_course as create_course_record,
     create_exam_item as create_exam_item_record,
+    create_preset_question as create_preset_question_record,
+    create_report_score as create_report_score_record,
+    add_exam_item_course_document_source,
+    deactivate_ai_preset_questions_by_exam_item_and_user,
     delete_course as delete_course_record,
     delete_exam_item as delete_exam_item_record,
+    delete_preset_question as delete_preset_question_record,
     get_course_by_invite_code as get_course_by_invite_code_record,
+    get_exam_history_by_course,
     get_exam_history_by_user,
     get_exam_item_by_id,
+    get_exam_item_course_document_sources,
+    get_exam_judge_config_by_exam_item,
+    get_exam_questions_by_exam_item,
     get_exam_record_by_exam_id,
     get_teacher_course_ids,
     is_course_owner,
@@ -24,20 +33,24 @@ from AIOralExamSystem.Exam.Examdata import (
     list_course_join_requests,
     list_exam_sessions_by_course_and_user,
     list_exam_items_by_course,
+    list_preset_questions_by_exam_item,
     list_student_courses,
     list_teacher_courses,
     request_join_course,
     reset_course_invite_code as reset_course_invite_code_record,
     reset_exam_item_availability as reset_exam_item_availability_record,
+    remove_exam_item_course_document_source,
     save_exam_data,
     update_course as update_course_record,
     update_exam_item as update_exam_item_record,
+    update_exam_session_use_preset_questions as update_exam_session_use_preset_questions_record,
+    update_preset_question as update_preset_question_record,
 )
-from AIOralExamSystem.Exam.Judger import MainJudgerAgent, StageJudgerAgent
+from AIOralExamSystem.Exam.Judger import DocJudgerAgent, MainJudgerAgent
 from AIOralExamSystem.Exam.OutputSetting import build_final_review_output
+from AIOralExamSystem.Exam.PanelJudgeFlow import PanelJudgeFlow
 from AIOralExamSystem.Exam.examObject import CandidateExamState, Question, QuestionGenerationPlan
 from AIOralExamSystem.Exam.examSetter import ExamSetterAgent
-from config import get_settings
 
 
 class QAserver:
@@ -48,6 +61,8 @@ class QAserver:
     STUDENT_ROLES = {"student", "candidate", ""}
     TEACHER_ROLES = {"teacher", "instructor"}
     ADMIN_ROLES = {"admin", "administrator", "super_admin"}
+    MISSING_MODEL_CONFIG_ERROR = "未配置模型参数，请联系管理员"
+    MISSING_REPORT_MODEL_CONFIG_ERROR = "REPORT_MODEL_CONFIG_REQUIRED"
 
     def __init__(
         self,
@@ -60,53 +75,136 @@ class QAserver:
         self.history = history
         self.exam_finished = False
         self.exam_setter = None
-        self.stage_judger = None
+        self.panel_judge_flow = None
         self.main_judger = None
         self.task_queue = None
         self._task = None
         self._prepare_generation_pending = False
+        self.need_code_repository = self._flag_enabled(current_user.get("need_code_repository"))
+        self.use_preset_questions = self._flag_enabled(current_user.get("use_preset_questions"))
+        self.preset_only_mode = (
+            not self.need_code_repository
+            and self.use_preset_questions
+        )
 
         if self.exam_state is None:
             return
 
         self.task_queue = asyncio.Queue()
 
-        settings = get_settings()
-        model_settings = settings.model_dump(mode="json")
         course_id = current_user.get("course_id")
         exam_id = current_user.get("exam_id")
-        file_local_address = f"{course_id}/{exam_id}" if course_id and exam_id else None
-        code_local_address = f"{course_id}/{exam_id}/main" if course_id and exam_id else None
+        judge_config = self.require_judge_config(current_user.get("judge_config"))
+        file_local_address = (
+            f"{course_id}/{exam_id}/main/doc"
+            if self.need_code_repository and course_id and exam_id
+            else None
+        )
+        code_local_address = (
+            f"{course_id}/{exam_id}/main/code"
+            if self.need_code_repository and course_id and exam_id
+            else None
+        )
+        setter_settings = self.require_agent_settings(judge_config, "setter")
+        main_judger_settings = self.require_agent_settings(judge_config, "main_judger")
         self.exam_setter = ExamSetterAgent(
-            model_settings,
+            setter_settings,
             current_user["uuid"],
             thinking=False,
             response_format=True,
-            temperature=0,
+            temperature=float(setter_settings.get("temperature", 0)),
             course_id=course_id,
             exam_id=exam_id,
             file_local_address=file_local_address,
             code_local_address=code_local_address,
+            course_document_sources=current_user.get("course_document_sources"),
         )
-        self.stage_judger = StageJudgerAgent(
-            model_settings,
+        self.panel_judge_flow = PanelJudgeFlow.from_config(
+            self.require_panel_judge_config(judge_config),
+            {},
             current_user["uuid"],
-            thinking=True,
-            response_format=True,
-            temperature=0,
         )
         self.main_judger = MainJudgerAgent(
-            model_settings,
+            main_judger_settings,
             current_user["uuid"],
             thinking=True,
             response_format=True,
-            temperature=0,
+            temperature=float(main_judger_settings.get("temperature", 0)),
         )
 
     @classmethod
-    async def get_exam_history(cls, current_user: dict) -> List[Dict[str, object]]:
-        access_scope = await cls.resolve_exam_access_scope(current_user)
-        return await get_exam_history_by_user(**access_scope)
+    def require_judge_config(cls, judge_config) -> Dict[str, object]:
+        if not isinstance(judge_config, dict) or not judge_config:
+            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
+        return judge_config
+
+    @classmethod
+    def require_agent_settings(cls, judge_config: Dict[str, object], role: str) -> Dict[str, object]:
+        agent_config = judge_config.get(role)
+        if not isinstance(agent_config, dict):
+            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
+        model_settings = agent_config.get("runtime_model_settings")
+        if not isinstance(model_settings, dict) or not model_settings.get("model_name"):
+            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
+        return model_settings
+
+    @classmethod
+    def require_panel_judge_config(cls, judge_config: Dict[str, object]) -> Dict[str, object]:
+        if not judge_config.get("scorers"):
+            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
+        return judge_config
+
+    @classmethod
+    def require_report_judger_settings(cls, judge_config: Dict[str, object]) -> Dict[str, object]:
+        try:
+            return cls.require_agent_settings(judge_config, "report_judger")
+        except ValueError as exc:
+            raise ValueError(cls.MISSING_REPORT_MODEL_CONFIG_ERROR) from exc
+
+    @staticmethod
+    def _flag_enabled(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(value)
+
+    @classmethod
+    async def get_exam_history(
+        cls,
+        current_user: dict,
+        course_id: str,
+        exam_item_id: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        user_id, include_all_users = await cls.resolve_course_exam_query_scope(current_user, course_id)
+        return await get_exam_history_by_course(
+            course_id=course_id,
+            user_id=user_id,
+            include_all_users=include_all_users,
+            exam_item_id=exam_item_id,
+        )
+
+    @classmethod
+    async def get_exam_questions_by_exam_item(
+        cls,
+        current_user: dict,
+        exam_item_id: str,
+    ) -> List[Dict[str, object]]:
+        if not exam_item_id:
+            raise ValueError("exam_item_id is required")
+        exam_item = await get_exam_item_by_id(exam_item_id)
+        if not exam_item:
+            raise ValueError("EXAM_ITEM_NOT_FOUND")
+        course_id = str(exam_item["course_id"])
+        user_id, include_all_users = await cls.resolve_course_exam_query_scope(current_user, course_id)
+        return await get_exam_questions_by_exam_item(
+            course_id=course_id,
+            exam_item_id=exam_item_id,
+            user_id=user_id,
+            include_all_users=include_all_users,
+        )
 
     @classmethod
     async def get_exam_record(cls, current_user: dict, exam_id: str) -> List[Dict[str, object]]:
@@ -148,6 +246,28 @@ class QAserver:
             "allow_course_scope": False,
             "allow_all": False,
         }
+
+    @classmethod
+    async def resolve_course_exam_query_scope(cls, current_user: dict, course_id: str) -> tuple[Optional[str], bool]:
+        if not course_id:
+            raise ValueError("course_id is required")
+        role = cls.get_user_role(current_user)
+        user_id = cls.get_user_id(current_user)
+
+        if role in cls.ADMIN_ROLES:
+            return user_id, True
+
+        if not user_id:
+            raise PermissionError("当前用户缺少 user_id")
+
+        if role in cls.TEACHER_ROLES:
+            if not await is_teacher_of_course(user_id, course_id):
+                raise PermissionError("无权查看该课程的考试信息")
+            return user_id, True
+
+        if not await is_student_in_course(user_id, course_id):
+            raise PermissionError("无权查看该课程的考试信息")
+        return user_id, False
 
     @classmethod
     async def manage_course(
@@ -289,6 +409,11 @@ class QAserver:
         description: Optional[str] = None,
         item_type: Optional[str] = None,
         need_code_repository: Optional[bool] = None,
+        use_preset_questions: Optional[bool] = None,
+        enable_report_analysis: Optional[bool] = None,
+        report_total_score: Optional[float] = None,
+        report_judge_rule: Optional[str] = None,
+        document_name: Optional[str] = None,
     ):
         action = str(action).strip().lower()
         user_id = cls.get_user_id(current_user)
@@ -331,9 +456,42 @@ class QAserver:
                 exam_available_valid_times=exam_available_valid_times,
                 description=description,
                 item_type=item_type,
-                need_code_repository=bool(need_code_repository),
+                need_code_repository=cls._flag_enabled(need_code_repository),
+                use_preset_questions=cls._flag_enabled(use_preset_questions),
+                enable_report_analysis=cls._flag_enabled(enable_report_analysis),
+                report_total_score=report_total_score,
+                report_judge_rule=report_judge_rule,
             )
             return created_item
+
+        if action == "add_course_document_source":
+            if not exam_item_id:
+                raise ValueError("exam_item_id is required")
+            if not user_id or not await is_course_owner(user_id, course_id):
+                raise PermissionError("只有课程主负责老师可以添加课程资料")
+            return await add_exam_item_course_document_source(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                document_name=document_name,
+            )
+
+        if action == "list_course_document_sources":
+            if not exam_item_id:
+                raise ValueError("exam_item_id is required")
+            if not await cls.can_view_course(current_user, course_id):
+                raise PermissionError("No permission to view course documents")
+            return await get_exam_item_course_document_sources(course_id, exam_item_id)
+
+        if action == "remove_course_document_source":
+            if not exam_item_id:
+                raise ValueError("exam_item_id is required")
+            if not user_id or not await is_course_owner(user_id, course_id):
+                raise PermissionError("Only the course owner can delete course documents")
+            return await remove_exam_item_course_document_source(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                document_name=document_name,
+            )
 
         if action not in {"update", "delete"}:
             raise ValueError(f"Unsupported exam item action: {action}")
@@ -348,11 +506,272 @@ class QAserver:
                 exam_item_id=exam_item_id,
                 exam_item_name=exam_item_name,
                 dimension_scores=dimension_scores,
+                exam_available_valid_times=exam_available_valid_times,
                 description=description,
                 item_type=item_type,
-                need_code_repository=need_code_repository,
+                need_code_repository=(
+                    None
+                    if need_code_repository is None
+                    else cls._flag_enabled(need_code_repository)
+                ),
+                use_preset_questions=(
+                    None
+                    if use_preset_questions is None
+                    else cls._flag_enabled(use_preset_questions)
+                ),
+                enable_report_analysis=(
+                    None
+                    if enable_report_analysis is None
+                    else cls._flag_enabled(enable_report_analysis)
+                ),
+                report_total_score=report_total_score,
+                report_judge_rule=report_judge_rule,
             )
         return await delete_exam_item_record(course_id=course_id, exam_item_id=exam_item_id)
+
+    @classmethod
+    async def manage_preset_question(
+        cls,
+        current_user: dict,
+        action: str,
+        course_id: str,
+        exam_item_id: str,
+        preset_question_id: Optional[str] = None,
+        question_dimension: Optional[str] = None,
+        question_content: Optional[str] = None,
+        standard_answer: Optional[str] = None,
+        question_blocks: Optional[List[Dict[str, object]]] = None,
+        code_fragments: Optional[List[Dict[str, object]]] = None,
+        score: Optional[float] = None,
+        sort_order: Optional[int] = None,
+    ):
+        action = str(action).strip().lower()
+        user_id = cls.get_user_id(current_user)
+
+        if action == "list":
+            if not await cls.can_view_course(current_user, course_id):
+                raise PermissionError("无权查看该考试项的预设题库")
+            return await list_preset_questions_by_exam_item(course_id, exam_item_id, user_id=user_id)
+
+        if action not in {"create", "update", "delete"}:
+            raise ValueError(f"Unsupported preset question action: {action}")
+        if not user_id or not await is_course_owner(user_id, course_id):
+            raise PermissionError("只有课程主负责老师可以维护预设题库")
+
+        if action == "create":
+            return await create_preset_question_record(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                created_by=user_id,
+                question_dimension=question_dimension,
+                question_content=question_content,
+                standard_answer=standard_answer,
+                question_blocks=question_blocks,
+                code_fragments=code_fragments,
+                score=1.0 if score is None else score,
+                sort_order=sort_order,
+            )
+
+        if not preset_question_id:
+            raise ValueError("preset_question_id is required")
+        if action == "update":
+            return await update_preset_question_record(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                preset_question_id=preset_question_id,
+                question_dimension=question_dimension,
+                question_content=question_content,
+                standard_answer=standard_answer,
+                question_blocks=question_blocks,
+                code_fragments=code_fragments,
+                score=score,
+                sort_order=sort_order,
+            )
+        return await delete_preset_question_record(
+            course_id=course_id,
+            exam_item_id=exam_item_id,
+            preset_question_id=preset_question_id,
+        )
+
+    @classmethod
+    async def score_report_and_prepare_questions(
+        cls,
+        current_user: dict,
+        course_id: str,
+        exam_item_id: str,
+        target_user_id: Optional[str] = None,
+        exam_id: Optional[str] = None,
+        report_total_score: Optional[float] = None,
+        report_judge_rule: Optional[str] = None,
+        prepare_questions: bool = True,
+    ) -> Dict[str, object]:
+        requester_id = cls.get_user_id(current_user)
+        if not requester_id:
+            raise PermissionError("当前用户缺少 user_id")
+
+        role = cls.get_user_role(current_user)
+        if role in cls.TEACHER_ROLES or role in cls.ADMIN_ROLES:
+            if role not in cls.ADMIN_ROLES and not await is_teacher_of_course(requester_id, course_id):
+                raise PermissionError("无权评价该课程报告")
+            user_id = str(target_user_id or "").strip()
+            if not user_id:
+                raise ValueError("user_id is required")
+            if not await is_student_in_course(user_id, course_id):
+                raise PermissionError("目标用户不属于该课程")
+        else:
+            user_id = requester_id
+            if target_user_id and str(target_user_id) != requester_id:
+                raise PermissionError("无权评价其他用户报告")
+            if not await is_student_in_course(user_id, course_id):
+                raise PermissionError("无权评价该课程报告")
+
+        exam_item = await get_exam_item_by_id(exam_item_id)
+        if not exam_item or str(exam_item.get("course_id")) != str(course_id):
+            raise ValueError("EXAM_ITEM_NOT_FOUND")
+        report_total_score = cls._normalize_report_total_score(report_total_score)
+        report_judge_rule = str(report_judge_rule or "").strip()
+        if not report_judge_rule:
+            raise ValueError("REPORT_JUDGE_RULE_REQUIRED")
+
+        judge_config = await get_exam_judge_config_by_exam_item(exam_item_id)
+        if not judge_config:
+            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
+        report_judger_settings = cls.require_report_judger_settings(judge_config)
+        doc_judger = DocJudgerAgent(
+            report_judger_settings,
+            report_source=user_id,
+            course_id=course_id,
+            exam_id=exam_id,
+            teacher_document_sources=exam_item.get("course_document_sources") or [],
+            report_judge_rule=report_judge_rule,
+        )
+        response = await doc_judger.execute(history=[{
+            "role": "user",
+            "content": json.dumps({
+                "task": "score_report",
+                "course_id": course_id,
+                "exam_item_id": exam_item_id,
+                "user_id": user_id,
+                "exam_id": exam_id,
+                "report_total_score": report_total_score,
+            }, ensure_ascii=False),
+        }])
+        report_result = cls.parse_agent_json_response(response)
+        report_score = cls._clamp_report_score(
+            report_result.get("report_score"),
+            report_total_score,
+        )
+        saved_score = await create_report_score_record(
+            course_id=course_id,
+            exam_item_id=exam_item_id,
+            user_id=user_id,
+            exam_id=exam_id,
+            report_score=report_score,
+            report_total_score=report_total_score,
+            report_result=report_result,
+        )
+
+        prepared_question_count = 0
+        if prepare_questions:
+            prepared_question_count = await cls.prepare_report_questions(
+                target_user_id=user_id,
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                exam_id=exam_id,
+                exam_item=exam_item,
+                judge_config=judge_config,
+                report_score=saved_score,
+            )
+
+        saved_score["prepared_question_count"] = prepared_question_count
+        return saved_score
+
+    @classmethod
+    async def prepare_report_questions(
+        cls,
+        target_user_id: str,
+        course_id: str,
+        exam_item_id: str,
+        exam_id: Optional[str],
+        exam_item: Dict[str, object],
+        judge_config: Dict[str, object],
+        report_score: Dict[str, object],
+    ) -> int:
+        question_dimensions = exam_item.get("dimension_names") or []
+        if not question_dimensions:
+            return 0
+        setter_settings = cls.require_agent_settings(judge_config, "setter")
+        exam_setter = ExamSetterAgent(
+            setter_settings,
+            target_user_id,
+            thinking=False,
+            response_format=True,
+            temperature=float(setter_settings.get("temperature", 0)),
+            question_count=len(question_dimensions),
+            question_dimensions=question_dimensions,
+            course_id=course_id,
+            exam_id=exam_id,
+            course_document_sources=exam_item.get("course_document_sources") or [],
+        )
+        response = await exam_setter.run(
+            history=[{
+                "role": "user",
+                "content": json.dumps({
+                    "task": "prepare oral-exam questions after report scoring",
+                    "report_score": report_score,
+                    "question_dimensions": question_dimensions,
+                    "instruction": "Generate one prepared oral-exam question for each configured dimension. Questions should follow up on the report evaluation, but must not quote long report content.",
+                }, ensure_ascii=False),
+            }],
+            question_count=len(question_dimensions),
+            question_dimensions=question_dimensions,
+            is_initial_generation=True,
+        )
+        question_doc = cls.parse_agent_json_response(response)
+        questions = question_doc.get("questions", [])[:len(question_dimensions)]
+        await deactivate_ai_preset_questions_by_exam_item_and_user(
+            course_id,
+            exam_item_id,
+            target_user_id,
+        )
+        created_count = 0
+        for index, item in enumerate(questions, start=1):
+            dimension = question_dimensions[index - 1]
+            content = str(item.get("Question", item.get("question", ""))).strip()
+            if not content:
+                continue
+            await create_preset_question_record(
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                created_by="AI",
+                user_id=target_user_id,
+                question_dimension=dimension,
+                question_content=content,
+                standard_answer=item.get("standard_answer"),
+                question_blocks=item.get("question_blocks", []),
+                code_fragments=item.get("code_fragments", []),
+                score=float(item.get("score", 1.0)),
+                sort_order=index,
+            )
+            created_count += 1
+        return created_count
+
+    @classmethod
+    async def update_exam_session_preset_question_usage(
+        cls,
+        current_user: dict,
+        course_id: str,
+        exam_id: str,
+        use_preset_questions: bool,
+    ) -> bool:
+        user_id = cls.get_user_id(current_user)
+        if not user_id or not await is_course_owner(user_id, course_id):
+            raise PermissionError("只有课程主负责老师可以设置考试是否使用预设题目")
+        return await update_exam_session_use_preset_questions_record(
+            course_id=course_id,
+            exam_id=exam_id,
+            use_preset_questions=use_preset_questions,
+        )
 
     @classmethod
     async def can_view_course(cls, current_user: dict, course_id: str) -> bool:
@@ -516,12 +935,16 @@ class QAserver:
             answered_question,
             judge_res,
         )
+        if self.preset_only_mode:
+            return
         if plan.should_finish:
             return
         await self.generate_questions_for_plan(plan, judge_res)
 
     async def request_prepare_generation_if_needed(self) -> None:
         if self.exam_state is None or self.exam_finished:
+            return
+        if self.preset_only_mode:
             return
         if self.exam_state.has_ready_question() or self._prepare_generation_pending:
             return
@@ -537,6 +960,17 @@ class QAserver:
                 return [self._text_event(self.MISSING_EXAM_STATE_ERROR)]
             if self.exam_finished:
                 return []
+
+            if self.preset_only_mode:
+                if not can_request_prepare_generation:
+                    await self.task_queue.join()
+                    can_request_prepare_generation = True
+                    continue
+                next_question = self.take_preset_only_question()
+                if next_question is not None:
+                    return self.ask_question(next_question)
+                return await self.finish_interview()
+
             if self.exam_state.all_dimensions_finished():
                 return await self.finish_interview()
 
@@ -567,7 +1001,6 @@ class QAserver:
         if judged_question is None:
             return {}
 
-        recent_history = list(self.history[-8:])
         payload = {
             "question": {
                 "question_id": judged_question.question_id,
@@ -580,14 +1013,11 @@ class QAserver:
                 "standard_answer": judged_question.standard_answer,
             },
             "student_answer": student_answer,
-            "history": recent_history,
         }
 
-        response = await self.stage_judger.run(history=[{
-            "role": "user",
-            "content": json.dumps(payload, ensure_ascii=False),
-        }])
-        judge_res = self.parse_outer_json_block(self.get_agent_response_content(response))
+        if self.panel_judge_flow is None:
+            raise ValueError(self.MISSING_MODEL_CONFIG_ERROR)
+        judge_res = await self.panel_judge_flow.run(payload)
 
         self.exam_state.record_answer(
             question=judged_question,
@@ -608,8 +1038,21 @@ class QAserver:
             return None
         return self.exam_state.pop_ready_question()
 
+    def take_preset_only_question(self) -> Optional[Question]:
+        if not self.exam_state:
+            return None
+        for dimension in list(self.exam_state.preset_question_queues):
+            queue = self.exam_state.preset_question_queues.get(dimension)
+            if not queue:
+                continue
+            question = queue.popleft()
+            return self.exam_state._activate_popped_question(question)
+        return None
+
     async def ensure_ready_question_exists(self) -> None:
         if not self.exam_state:
+            return
+        if self.preset_only_mode:
             return
         if self.exam_state.has_ready_question():
             return
@@ -622,6 +1065,8 @@ class QAserver:
         judge_res: Optional[dict] = None,
     ) -> None:
         if not self.exam_state or plan.should_finish:
+            return
+        if self.preset_only_mode:
             return
         if plan.difficulty_level is None or not plan.target_dimension:
             return
@@ -680,7 +1125,7 @@ class QAserver:
                 "dimension": source_question.dimension,
             } if source_question else None,
             "latest_judge": judge_res,
-            "history": self.history[-8:],
+            "history": self.history[-1:],
         }
         response = await self.exam_setter.run(
             history=[{
@@ -695,6 +1140,11 @@ class QAserver:
         question_doc = self.parse_outer_json_block(self.get_agent_response_content(response))
         questions = []
         existing_question_count = self.get_existing_question_count()
+        based_on_record_index = "-1"
+        if source_question and self.exam_state:
+            record_index = self.exam_state.record_index_for_question(source_question)
+            if record_index is not None:
+                based_on_record_index = record_index
         for index, item in enumerate(question_doc.get("questions", [])[:question_count], start=1):
             content = str(item.get("Question", item.get("question", ""))).strip()
             if not content:
@@ -708,7 +1158,7 @@ class QAserver:
                 code_fragments=item.get("code_fragments", []),
                 score=float(item.get("score", 1.0)),
                 standard_answer=item.get("standard_answer"),
-                based_on_record_index=len(self.exam_state.exam_records) - 1 if self.exam_state else -1,
+                based_on_record_index=based_on_record_index,
                 source_detail=str(item.get("reason", question_doc.get("project_summary", ""))),
             ))
         return questions
@@ -720,6 +1170,7 @@ class QAserver:
             len(self.exam_state.exam_records)
             + len(self.exam_state.prepared_question_queue)
             + len(self.exam_state.priority_question_queue)
+            + len(self.exam_state.preset_question_queue)
         )
 
     async def finish_interview(self) -> List[Dict[str, str]]:
@@ -808,6 +1259,46 @@ class QAserver:
 
     def _question_event(self, question: Question) -> Dict[str, object]:
         return {"type": "question", "question": question}
+
+    @classmethod
+    def parse_agent_json_response(cls, response) -> dict:
+        message = response["messages"][-1]
+        content = getattr(message, "content", None)
+        if content is None and isinstance(message, dict):
+            content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(
+                str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                for item in content
+            )
+        text = str(content).strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json|JSON)?\s*\n?", "", text, count=1)
+            text = re.sub(r"\n?```\s*$", "", text, count=1)
+        if not text.startswith("{"):
+            obj_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            if not obj_match:
+                raise ValueError("No JSON object found in model response")
+            text = obj_match.group(0)
+        return json.loads(text)
+
+    @staticmethod
+    def _normalize_report_total_score(value) -> float:
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("REPORT_TOTAL_SCORE_REQUIRED") from exc
+        if score <= 0:
+            raise ValueError("REPORT_TOTAL_SCORE_REQUIRED")
+        return score
+
+    @staticmethod
+    def _clamp_report_score(value, report_total_score: float) -> float:
+        try:
+            score = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("REPORT_SCORE_INVALID") from exc
+        return max(0.0, min(report_total_score, score))
 
     def get_agent_response_content(self, response) -> str:
         """获取 langchain 的 Agent 结果的最后一个消息内容，作为 Agent 输出。"""
