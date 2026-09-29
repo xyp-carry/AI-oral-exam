@@ -12,8 +12,18 @@ import requests
 
 
 class MinerUFileTool:
-    def __init__(self, token: str, api_url: str | None = None):
+    def __init__(
+        self,
+        token: str,
+        api_url: str | None = None,
+        model_version: str = "vlm",
+    ):
         self.mineru_api_url = api_url or "https://mineru.net/api/v4/file-urls/batch"
+        self.mineru_result_url = self.mineru_api_url.replace(
+            "/file-urls/batch",
+            "/extract-results/batch",
+        )
+        self.model_version = str(model_version or "vlm").strip() or "vlm"
         self.header = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}",
@@ -55,7 +65,7 @@ class MinerUFileTool:
         zip_dir = work_root / "zips"
         extract_dir = work_root / "extracted"
         file_paths = [str(spec["path"]) for spec in pending_specs]
-
+        
         res = self.batch_upload(file_paths)
         if not res:
             raise RuntimeError("MinerU batch upload failed; no batch result returned.")
@@ -158,7 +168,7 @@ class MinerUFileTool:
                 {"name": os.path.basename(file_path), "data_id": str(i + 1)}
                 for i, file_path in enumerate(file_paths)
             ],
-            "model_version": "vlm",
+            "model_version": self.model_version,
         }
         try:
             response = requests.post(self.mineru_api_url, headers=self.header, json=data)
@@ -183,7 +193,7 @@ class MinerUFileTool:
         return None
 
     def download_zip(self, batch_id: str, save_dir: str):
-        zip_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
+        zip_url = f"{self.mineru_result_url.rstrip('/')}/{batch_id}"
         os.makedirs(save_dir, exist_ok=True)
 
         while True:

@@ -16,7 +16,12 @@ def build_eval_card_html(data: dict) -> str:
 
     scores = data.get("scores") or {}
     dim_scores = scores.get("dimensions") or {}
-    max_score = sum(float(score or 0) for score in dim_scores.values())
+    try:
+        max_score = float(scores.get("max_total") or scores.get("max") or 0)
+    except (TypeError, ValueError):
+        max_score = 0
+    if max_score <= 0:
+        max_score = sum(float(score or 0) for score in dim_scores.values())
 
     dim_html = []
     for index, dim in enumerate(data.get("dimension_summaries") or []):

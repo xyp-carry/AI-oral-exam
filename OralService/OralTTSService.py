@@ -60,19 +60,21 @@ class TTSAudio(FrameProcessor):
             Frame = await self.task_queue.get()
             self.payload['text'] = Frame[0].text
             async with httpx.AsyncClient(timeout=None) as client:
-                response = await client.post(url=self.url,headers=self.headers, json=self.payload)
+                # response = await client.post(url=self.url,headers=self.headers, json=self.payload)
                 try:
-                    chunk_bytes = bytes.fromhex(response.json()['data']['audio'])
-                    frame_iterator = iter(lambda i=iter(chunk_bytes): bytes(itertools.islice(i, 1920)), b'')
+                    # chunk_bytes = bytes.fromhex(response.json()['data']['audio'])
+                    # frame_iterator = iter(lambda i=iter(chunk_bytes): bytes(itertools.islice(i, 1920)), b'')
                     bt = b''
-                    for frame_index, frame_data in enumerate(frame_iterator):
-                        bt += frame_data
-                        OutAudioFrame = OutputAudioRawFrame(frame_data, sample_rate=32000, num_channels=1)
-                        await self.push_frame(OutAudioFrame, Frame[1])
-                    with open("output12.wav", "wb") as f:
-                        f.write(chunk_bytes)
+                    bt += b'\x00' * 1920
+                    OutAudioFrame = OutputAudioRawFrame(bt, sample_rate=32000, num_channels=1)
+                    await self.push_frame(OutAudioFrame, Frame[1])
+                    # for frame_index, frame_data in enumerate(frame_iterator):
+                    #     bt += frame_data
+                    #     OutAudioFrame = OutputAudioRawFrame(frame_data, sample_rate=32000, num_channels=1)
+                    #     await self.push_frame(OutAudioFrame, Frame[1])
+                    # with open("output12.wav", "wb") as f:
+                    #     f.write(chunk_bytes)
                 except Exception as e:
-                    print(response.json())
                     continue
     async def setup(self, setup):
         await super().setup(setup)

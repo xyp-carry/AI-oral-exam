@@ -168,9 +168,18 @@ class GitRepositoryTool(BaseTool):
             if archive_path:
                 self._append_log(logs, "store_repository", "start", "Extracting uploaded archive directly into repository root.")
                 self._extract_local_zip_repository(archive_path, repo_root, logs)
+                resolved_branch = branch
+                branch_source = "archive"
             else:
                 self._append_log(logs, "store_repository", "start", "Cloning repository directly into repository root.")
-                self._clone_repository(repo_url, repo_root, branch, accelerator_urls, logs, allow_zip_fallback=False)
+                resolved_branch, branch_source = self._clone_repository(
+                    repo_url,
+                    repo_root,
+                    branch,
+                    accelerator_urls,
+                    logs,
+                    allow_zip_fallback=False,
+                )
 
             errors = []
             manifest = {
@@ -183,7 +192,9 @@ class GitRepositoryTool(BaseTool):
                 "course_id": course_id,
                 "exam_id": exam_id,
                 "git_branch": git_branch,
-                "branch": branch,
+                "requested_branch": branch,
+                "branch": resolved_branch,
+                "branch_source": branch_source,
                 "storage_root": str(repo_root.parent.parent.parent),
                 "repository_root": str(repo_root),
                 "layout": "repository_root",
@@ -200,7 +211,8 @@ class GitRepositoryTool(BaseTool):
                 {
                     "repo_url": repo_url,
                     "source_type": source_type,
-                    "branch": branch,
+                    "requested_branch": branch,
+                    "branch": None,
                     "mode": "error",
                     "cached": False,
                     "error": str(exc),
@@ -233,7 +245,8 @@ class GitRepositoryTool(BaseTool):
             return None
         if source_type == "archive" and manifest.get("archive_name") != archive_name:
             return None
-        if manifest.get("branch") != branch:
+        cached_requested_branch = manifest.get("requested_branch", manifest.get("branch"))
+        if cached_requested_branch != branch:
             return None
         if not repo_root.exists() or not repo_root.is_dir():
             return None
@@ -247,7 +260,10 @@ class GitRepositoryTool(BaseTool):
             "repo_url": manifest.get("repo_url"),
             "source_type": manifest.get("source_type") or "git",
             "archive_name": manifest.get("archive_name"),
+            "requested_branch": manifest.get("requested_branch", manifest.get("branch")),
             "branch": manifest.get("branch"),
+            "branch_source": manifest.get("branch_source") or "requested",
+            "used_default_branch": manifest.get("branch_source") == "remote_default",
             "mode": "stored_repository",
             "cached": cached,
             "repository_root": str(repo_root),
@@ -264,13 +280,28 @@ class GitRepositoryTool(BaseTool):
         accelerator_urls: list[str],
         logs: list,
         allow_zip_fallback: bool = True,
-    ) -> None:
+    ) -> tuple[Optional[str], str]:
         clone_errors = []
         clone_candidates = self._build_clone_url_candidates(repo_url, accelerator_urls)
         for clone_url in clone_candidates:
+            effective_branch = branch
+            branch_source = "requested" if branch else "remote_default"
+            if branch == "main":
+                try:
+                    main_exists = self._remote_branch_exists(clone_url, "main", logs)
+                except RuntimeError as exc:
+                    clone_errors.append(f"{clone_url}: {exc}")
+                    self._append_log(logs, "git_branch_probe", "error", str(exc), url=clone_url, branch="main")
+                    continue
+                if main_exists:
+                    branch_source = "preferred"
+                else:
+                    effective_branch = None
+                    branch_source = "remote_default"
+
             command = ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf", "clone"]
-            if branch:
-                command.extend(["--branch", branch])
+            if effective_branch:
+                command.extend(["--branch", effective_branch])
             command.extend([clone_url, str(target_dir)])
 
             self._append_log(
@@ -280,6 +311,9 @@ class GitRepositoryTool(BaseTool):
                 "Trying git clone.",
                 url=clone_url,
                 accelerated=clone_url != repo_url,
+                requested_branch=branch,
+                effective_branch=effective_branch,
+                branch_source=branch_source,
             )
             try:
                 result = subprocess.run(
@@ -291,8 +325,25 @@ class GitRepositoryTool(BaseTool):
                     errors="replace",
                 )
                 if result.returncode == 0:
-                    self._append_log(logs, "git_clone", "success", "Repository cloned successfully.", url=clone_url)
-                    return
+                    resolved_branch = self._current_branch(target_dir) or effective_branch
+                    if not resolved_branch:
+                        clone_error = "repository cloned but the remote default branch could not be checked out."
+                        clone_errors.append(f"{clone_url}: {clone_error}")
+                        self._append_log(logs, "git_clone", "error", clone_error, url=clone_url)
+                        if target_dir.exists():
+                            shutil.rmtree(target_dir, ignore_errors=True)
+                        continue
+                    self._append_log(
+                        logs,
+                        "git_clone",
+                        "success",
+                        "Repository cloned successfully.",
+                        url=clone_url,
+                        requested_branch=branch,
+                        resolved_branch=resolved_branch,
+                        branch_source=branch_source,
+                    )
+                    return resolved_branch, branch_source
                 clone_error = result.stderr.strip() or result.stdout.strip()
             except FileNotFoundError:
                 clone_error = "git command is not available in the current environment."
@@ -308,8 +359,79 @@ class GitRepositoryTool(BaseTool):
         try:
             self._append_log(logs, "zip_fallback", "start", "Git clone failed; trying zip archive fallback.")
             self._download_zip_repository(repo_url, target_dir, branch, accelerator_urls, logs)
+            return branch, "zip_fallback"
         except Exception as exc:
             raise RuntimeError(f"git clone failed: {'; '.join(clone_errors)}; zip download failed: {exc}") from exc
+
+    def _remote_branch_exists(self, repo_url: str, branch: str, logs: list) -> bool:
+        command = [
+            "git",
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            repo_url,
+            f"refs/heads/{branch}",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("git command is not available in the current environment.") from exc
+
+        if result.returncode == 0:
+            self._append_log(
+                logs,
+                "git_branch_probe",
+                "success",
+                "Preferred branch exists on the remote.",
+                url=repo_url,
+                branch=branch,
+            )
+            return True
+        if result.returncode == 2:
+            self._append_log(
+                logs,
+                "git_branch_probe",
+                "success",
+                "Preferred branch does not exist; the remote default branch will be used.",
+                url=repo_url,
+                branch=branch,
+            )
+            return False
+
+        error = result.stderr.strip() or result.stdout.strip() or f"git ls-remote exited with status {result.returncode}"
+        raise RuntimeError(f"failed to inspect remote branch {branch}: {error}")
+
+    def _current_branch(self, repo_root: Path) -> Optional[str]:
+        try:
+            head_result = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if head_result.returncode != 0:
+                return None
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "branch", "--show-current"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
+            return None
+        branch = result.stdout.strip() if result.returncode == 0 else ""
+        return branch or None
 
     def _extract_local_zip_repository(
         self,

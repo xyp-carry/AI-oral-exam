@@ -1,14 +1,16 @@
 import asyncio
 import json
+import math
 import re
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from AIOralExamSystem.Tool.base_tool import BaseTool
+from AIOralExamSystem.Tool.rag.faiss_store import FaissDocumentStore, embed_texts
 from AIOralExamSystem.Tool.rag.file_tool import FileParserTool
-from meilisearch import Client
+from LLM.model_repository import get_user_model
 from pydantic import BaseModel, Field
-from config import get_settings
 
 class SearchToolInput(BaseModel):
     query: str = Field(description="用于查询信息的一段话；如果传入空字符串，则读取该 source 下的全部文本块")
@@ -26,7 +28,78 @@ class SearchTool(BaseTool):
     def __init__(self, name: str):
         super().__init__(name)
         self.description = SearchDescription
-        self.client = Client("http://localhost:7700")
+        self.store = FaissDocumentStore()
+
+    async def _embedding_settings_for_scope(
+        self, course_id: str, source: str, exam_id: str | None,
+    ) -> dict | None:
+        scope = await asyncio.to_thread(
+            self.store.get_scope_info, course_id, source, exam_id,
+        )
+        if not scope:
+            return None
+        model_id = str(scope.get("model_id") or "").strip()
+        if not model_id:
+            raise ValueError("EMBEDDING_MODEL_ID_NOT_FOUND")
+        model = await get_user_model(model_id, include_api_key=True)
+        if not model or not str(model.get("model_api_key") or "").strip():
+            raise ValueError("EMBEDDING_MODEL_NOT_AVAILABLE")
+        return {
+            "model_id": model_id,
+            "model_name": scope["model_name"],
+            "model_url": scope["model_url"],
+            "model_api_key": model["model_api_key"],
+            "dimensions": scope["dimensions"],
+            "embedding_max_bytes": scope["embedding_max_bytes"],
+        }
+
+    async def search_top_documents(
+        self, query: str, sources: list[str], course_id: str,
+        top_n: int = 10,
+    ) -> list[dict]:
+        if not str(query or "").strip():
+            raise ValueError("QUERY_REQUIRED")
+        if not 1 <= top_n <= 100:
+            raise ValueError("TOP_N_OUT_OF_RANGE")
+
+        rank_limit = max(60, top_n)
+        vector_cache = {}
+        semantic_hits = []
+        documents = []
+        for source in dict.fromkeys(sources):
+            settings = await self._embedding_settings_for_scope(
+                course_id, source, None,
+            )
+            if settings is None:
+                continue
+            model_key = (
+                settings["model_id"],
+                settings["model_name"],
+                settings["model_url"],
+                settings["dimensions"],
+                settings["embedding_max_bytes"],
+            )
+            if model_key not in vector_cache:
+                vector_cache[model_key] = (
+                    await asyncio.to_thread(embed_texts, [query], settings)
+                )[0]
+            source_hits, source_documents = await asyncio.to_thread(
+                self.store.search,
+                course_id, source, None, vector_cache[model_key],
+                settings, rank_limit,
+            )
+            semantic_hits.extend(source_hits)
+            documents.extend(source_documents)
+
+        if not documents:
+            return []
+        semantic_hits.sort(
+            key=lambda row: row["_semantic_score"], reverse=True,
+        )
+        return await asyncio.to_thread(
+            self._rank_documents, query, semantic_hits[:rank_limit],
+            documents, top_n,
+        )
 
     async def _run(
         self,
@@ -37,6 +110,11 @@ class SearchTool(BaseTool):
         batch_index: int = 0,
         target_tokens: int = 6000,
     ) -> str:
+        embedding_settings = None
+        if str(query or "").strip():
+            embedding_settings = await self._embedding_settings_for_scope(
+                course_id, source, exam_id,
+            )
         with ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -48,6 +126,7 @@ class SearchTool(BaseTool):
                 exam_id,
                 batch_index,
                 target_tokens,
+                embedding_settings,
             )
 
     def search(
@@ -58,6 +137,7 @@ class SearchTool(BaseTool):
         exam_id: str | None = None,
         batch_index: int = 0,
         target_tokens: int = 6000,
+        embedding_settings: dict | None = None,
     ) -> str:
         query = query or ""
         batch_index = max(0, int(batch_index or 0))
@@ -81,7 +161,7 @@ class SearchTool(BaseTool):
                 ),
             )
 
-        results = self._search_documents_hybrid(query, source, course_id, exam_id)
+        results = self._search_documents_hybrid(query, source, course_id, exam_id, embedding_settings)
         blocks = self._build_text_blocks(results.get("hits", []), max_block_tokens)
         return self._build_search_response(
             query=query,
@@ -186,68 +266,88 @@ class SearchTool(BaseTool):
             orders.append(order)
         return orders
 
-    def _search_documents_sequential(self, source: str, course_id: str, exam_id: str | None = None) -> dict:
-        index = self.client.index(self._course_index_name(course_id))
-        filter_expr = self._build_filter(source, exam_id)
+    def _search_documents_sequential(
+        self, source: str, course_id: str, exam_id: str | None = None,
+    ) -> dict:
+        return {"hits": self.store.list_documents(course_id, source, exam_id)}
 
-        hits = []
-        offset = 0
-        limit = 100
-
-        while True:
-            results = index.search(
-                "",
-                {
-                    "filter": filter_expr,
-                    "limit": limit,
-                    "offset": offset,
-                    "sort": ["chunk_order:asc"],
-                },
-            )
-            batch_hits = results.get("hits", [])
-            hits.extend(batch_hits)
-
-            if not batch_hits or len(batch_hits) < limit:
-                break
-
-            offset += limit
-            total_hits = results.get("estimatedTotalHits")
-            if total_hits is not None and offset >= total_hits:
-                break
-
-        return {"hits": hits}
-
-    def _search_documents_hybrid(self, query: str, source: str, course_id: str, exam_id: str | None = None) -> dict:
-        index = self.client.index(self._course_index_name(course_id))
-        filter_expr = self._build_filter(source, exam_id)
-
-        return index.search(
-            query,
-            {
-                "filter": filter_expr,
-                "limit": 30,
-                "hybrid": {
-                    "embedder": "default",
-                    "semanticRatio": 0.7,
-                },
-            },
+    def _search_documents_hybrid(
+        self, query: str, source: str, course_id: str,
+        exam_id: str | None = None, embedding_settings: dict | None = None,
+        limit: int = 30,
+    ) -> dict:
+        if not embedding_settings:
+            return {"hits": []}
+        query_vector = embed_texts([query], embedding_settings)[0]
+        rank_limit = max(60, limit)
+        semantic, documents = self.store.search(
+            course_id, source, exam_id, query_vector, embedding_settings, limit=rank_limit,
         )
+        if not documents:
+            return {"hits": []}
+        return {
+            "hits": self._rank_documents(query, semantic, documents, limit)
+        }
 
-    def _escape_filter_value(self, value: str) -> str:
-        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+    def _rank_documents(
+        self, query: str, semantic: list[dict],
+        documents: list[dict], limit: int,
+    ) -> list[dict]:
+        lexical = self._lexical_rank(
+            query, documents, limit=max(60, limit),
+        )
+        fused = {}
+        by_id = {row["id"]: row for row in documents}
+        for weight, ranked in ((0.7, semantic), (0.3, lexical)):
+            for rank, row in enumerate(ranked, start=1):
+                document_id = row["id"]
+                fused[document_id] = fused.get(document_id, 0.0) + weight / (60 + rank)
+        ordered = sorted(fused, key=lambda document_id: fused[document_id], reverse=True)
+        semantic_scores = {row["id"]: row["_semantic_score"] for row in semantic}
+        return [
+            {
+                **by_id[document_id],
+                "rank_score": fused[document_id],
+                "semantic_score": semantic_scores.get(document_id),
+            }
+            for document_id in ordered[:limit]
+        ]
 
-    def _course_index_name(self, course_id: str) -> str:
-        course_id = str(course_id or "").strip()
-        if not course_id:
-            raise ValueError("course_id is required")
-        safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
-        return f"course_{safe_course_id}"
+    @staticmethod
+    def _terms(text: str) -> list[str]:
+        import jieba
 
-    def _build_filter(self, source: str, exam_id: str | None = None) -> str:
-        filters = [f'source = "{self._escape_filter_value(source)}"']
-        if exam_id and str(exam_id).strip():
-            filters.append(f'exam_id = "{self._escape_filter_value(str(exam_id).strip())}"')
-        return " AND ".join(filters)
+        return [
+            term.lower() for term in jieba.lcut(text)
+            if term.strip() and any(char.isalnum() for char in term)
+        ]
+
+    def _lexical_rank(self, query: str, documents: list[dict], limit: int) -> list[dict]:
+        terms = set(self._terms(query))
+        if not terms:
+            return []
+        tokenized = [Counter(self._terms(str(row.get("content") or ""))) for row in documents]
+        doc_count = len(documents)
+        avg_length = sum(sum(counts.values()) for counts in tokenized) / max(doc_count, 1)
+        frequency = {
+            term: sum(term in counts for counts in tokenized) for term in terms
+        }
+        ranked = []
+        for row, counts in zip(documents, tokenized):
+            length = sum(counts.values())
+            score = 0.0
+            for term in terms:
+                tf = counts.get(term, 0)
+                if not tf:
+                    continue
+                idf = math.log(1 + (doc_count - frequency[term] + 0.5) / (frequency[term] + 0.5))
+                score += idf * (tf * 2.2) / (
+                    tf + 1.2 * (0.25 + 0.75 * length / max(avg_length, 1))
+                )
+            if score > 0:
+                ranked.append((score, row))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [row for _, row in ranked[:limit]]
 
     def _count_tokens(self, text: str) -> int:
         if not text:
@@ -353,13 +453,23 @@ class SearchTool(BaseTool):
 
 
 class InsertTool(BaseTool):
-    """Insert parsed document chunks into Meilisearch."""
+    """Insert parsed document chunks into a local FAISS store."""
 
-    def __init__(self, name: str, token: str):
+    def __init__(
+        self,
+        name: str,
+        mineru_settings: dict | None = None,
+        embedding_settings: dict | None = None,
+        embedding_model_id: str | None = None,
+    ):
         super().__init__(name)
-        self.description = "将文档插入到索引中"
-        self.client = Client("http://localhost:7700")
-        self.fileParser = FileParserTool(token, "file_parser")
+        self.description = "Insert parsed document chunks into FAISS"
+        self.store = FaissDocumentStore()
+        self.timeout_seconds = 300
+        self.mineru_settings = dict(mineru_settings or {})
+        self.embedding_settings = dict(embedding_settings or {})
+        self.embedding_model_id = str(embedding_model_id or "").strip()
+        self.fileParser = FileParserTool(self.mineru_settings, "file_parser")
 
     async def _run(
         self,
@@ -381,6 +491,10 @@ class InsertTool(BaseTool):
                 chunk_mode=chunk_mode,
                 chunk_ai_model_settings=chunk_ai_model_settings,
             )
+            if isinstance(chunksList, dict) and chunksList.get("ok") is False:
+                raise RuntimeError(
+                    str(chunksList.get("error_message") or "file parsing failed")
+                )
         else:
             chunksList = data
 
@@ -390,52 +504,14 @@ class InsertTool(BaseTool):
         if not chunksList:
             return "没有可插入的文档。"
 
-        index = self.client.index(self._course_index_name(course_id))
-
-        settings = {
-            "embedders": {
-                "default": {
-                    "source": "rest",
-                    "url": "https://open.bigmodel.cn/api/paas/v4/embeddings",
-                    "dimensions": 2048,
-                    "documentTemplate": "{{doc.content}}",
-                    "request": {
-                        "model": "embedding-3",
-                        "input": ["{{text}}"],
-                    },
-                    "response": {
-                        "data": [
-                            {
-                                "embedding": "{{embedding}}",
-                            }
-                        ]
-                    },
-                    "headers": {
-                        "Authorization": f"Bearer {get_settings().model_api_key}",
-                    },
-                }
-            },
-            "filterableAttributes": ["source", "course_id", "exam_id", "upload_batch_id"],
-            "sortableAttributes": ["chunk_order"],
-        }
-
-        task = index.update_settings(settings)
-        self.client.wait_for_task(task.task_uid)
-        if reload:
-            self._delete_existing_documents(index, source, exam_id)
-        print(chunksList)
-        print(len(chunksList))
-        if chunksList:
-            print(len(chunksList[0]))
-        inserted_count = 0
-        chunk_order = 0
+        embedding = self._resolve_embedding_settings()
+        if not self.embedding_model_id:
+            raise ValueError("EMBEDDING_MODEL_ID_REQUIRED")
+        documents = []
         for chunks in chunksList:
-            documents = []
             for chunk in chunks:
                 if not self.is_meaningful_text(chunk):
                     continue
-
-                chunk_order += 1
                 documents.append(
                     {
                         "id": str(uuid.uuid4()),
@@ -443,43 +519,61 @@ class InsertTool(BaseTool):
                         "course_id": course_id,
                         "exam_id": exam_id,
                         "upload_batch_id": upload_batch_id,
-                        "chunk_order": chunk_order,
+                        "chunk_order": len(documents) + 1,
                         "content": chunk,
                     }
                 )
+        if not documents:
+            raise ValueError("NO_DOCUMENTS_INSERTED")
+        vectors = await asyncio.to_thread(
+            embed_texts, [row["content"] for row in documents], embedding,
+        )
+        model = {
+            "model_id": self.embedding_model_id,
+            "model_name": embedding["model_name"],
+            "model_url": embedding["model_url"],
+            "dimensions": embedding["dimensions"],
+            "embedding_max_bytes": embedding["embedding_max_bytes"],
+        }
+        await asyncio.to_thread(
+            self.store.insert, course_id, source, exam_id, documents, vectors, model, reload,
+        )
+        inserted_count = len(documents)
+        return f"\u6210\u529f\u63d2\u5165 {inserted_count} \u6761\u6587\u6863"
 
-            if not documents:
-                continue
-
-            task = index.add_documents(documents, primary_key="id")
-            self.client.wait_for_task(task.task_uid)
-            inserted_count += len(documents)
-            
-        print(f"成功插入 {inserted_count} 条文档")
-        return f"成功插入 {inserted_count} 条文档"
+    def _resolve_embedding_settings(self) -> dict:
+        settings = dict(self.embedding_settings)
+        for key in ("model_name", "model_url", "model_api_key"):
+            if not str(settings.get(key) or "").strip():
+                raise ValueError(f"EMBEDDING_{key.upper()}_NOT_CONFIGURED")
+            settings[key] = str(settings[key]).strip()
+        try:
+            default_dimensions = 1024 if settings["model_name"] == "embedding-2" else 2048
+            dimensions = int(settings.get("dimensions") or default_dimensions)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("EMBEDDING_DIMENSIONS_INVALID") from exc
+        if dimensions <= 0:
+            raise ValueError("EMBEDDING_DIMENSIONS_INVALID")
+        settings["dimensions"] = dimensions
+        try:
+            max_bytes = int(settings.get("embedding_max_bytes") or 400)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("EMBEDDING_MAX_BYTES_INVALID") from exc
+        if max_bytes <= 0:
+            raise ValueError("EMBEDDING_MAX_BYTES_INVALID")
+        settings["embedding_max_bytes"] = max_bytes
+        return settings
 
     def get_description(self) -> str:
         return self.description
-
-    def _course_index_name(self, course_id: str | None) -> str:
-        course_id = str(course_id or "").strip()
-        if not course_id:
-            raise ValueError("course_id is required")
-        safe_course_id = re.sub(r"[^A-Za-z0-9_-]", "_", course_id)
-        return f"course_{safe_course_id}"
 
     def delete_documents_by_batch(
         self,
         course_id: str | None,
         upload_batch_id: str | None,
     ) -> None:
-        if not upload_batch_id or not str(upload_batch_id).strip():
-            return
-        index = self.client.index(self._course_index_name(course_id))
-        self._delete_documents_by_filter(
-            index,
-            f'upload_batch_id = "{self._escape_filter_value(str(upload_batch_id).strip())}"',
-        )
+        if upload_batch_id and str(upload_batch_id).strip():
+            self.store.delete_by_batch(course_id, str(upload_batch_id).strip())
 
     def delete_course_documents_by_source(
         self,
@@ -489,17 +583,7 @@ class InsertTool(BaseTool):
         source = str(source or "").strip()
         if not source:
             raise ValueError("source is required")
-        course_id_value = str(course_id or "").strip()
-        if not course_id_value:
-            raise ValueError("course_id is required")
-        index = self.client.index(self._course_index_name(course_id_value))
-        self._delete_documents_by_filter(
-            index,
-            (
-                f'source = "{self._escape_filter_value(source)}" '
-                f'AND course_id = "{self._escape_filter_value(course_id_value)}"'
-            ),
-        )
+        self.store.delete_by_source(course_id, source)
 
     def delete_existing_documents_except_batch(
         self,
@@ -508,73 +592,12 @@ class InsertTool(BaseTool):
         exam_id: str | None,
         upload_batch_id: str | None,
     ) -> None:
-        filter_expr = self._existing_documents_filter(source, exam_id)
-        index = self.client.index(self._course_index_name(course_id))
-        excluded_batch_id = str(upload_batch_id or "").strip()
-        self._delete_documents_by_filter(
-            index,
-            filter_expr,
-            exclude_upload_batch_id=excluded_batch_id or None,
+        if not str(exam_id or "").strip():
+            raise ValueError("exam_id is required")
+        self.store.delete_existing_except_batch(
+            course_id, source, str(exam_id).strip(),
+            str(upload_batch_id or "").strip() or None,
         )
-
-    def _delete_existing_documents(self, index, source: str, exam_id: str | None) -> None:
-        self._delete_documents_by_filter(index, self._existing_documents_filter(source, exam_id))
-
-    def _existing_documents_filter(self, source: str, exam_id: str | None) -> str:
-        if not source or not str(source).strip():
-            raise ValueError("source is required when reload is true")
-        if not exam_id or not str(exam_id).strip():
-            raise ValueError("exam_id is required when reload is true")
-        return (
-            f'source = "{self._escape_filter_value(source)}" '
-            f'AND exam_id = "{self._escape_filter_value(str(exam_id).strip())}"'
-        )
-
-    def _delete_documents_by_filter(
-        self,
-        index,
-        filter_expr: str,
-        exclude_upload_batch_id: str | None = None,
-    ) -> None:
-        document_ids = []
-        offset = 0
-        limit = 1000
-
-        while True:
-            results = index.search(
-                "",
-                {
-                    "filter": filter_expr,
-                    "limit": limit,
-                    "offset": offset,
-                    "attributesToRetrieve": ["id", "upload_batch_id"],
-                },
-            )
-            hits = results.get("hits", [])
-            document_ids.extend(
-                hit["id"]
-                for hit in hits
-                if hit.get("id")
-                and (
-                    exclude_upload_batch_id is None
-                    or str(hit.get("upload_batch_id") or "") != exclude_upload_batch_id
-                )
-            )
-
-            if not hits or len(hits) < limit:
-                break
-
-            offset += limit
-            total_hits = results.get("estimatedTotalHits")
-            if total_hits is not None and offset >= total_hits:
-                break
-
-        for start in range(0, len(document_ids), limit):
-            task = index.delete_documents(document_ids[start:start + limit])
-            self.client.wait_for_task(task.task_uid)
-
-    def _escape_filter_value(self, value: str) -> str:
-        return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
     def is_meaningful_text(self, text: str) -> bool:
         if not text or not text.strip():

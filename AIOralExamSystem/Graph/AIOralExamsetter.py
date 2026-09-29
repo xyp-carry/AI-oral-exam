@@ -1,9 +1,8 @@
-import asyncio
 import json
 import re
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypedDict
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -11,15 +10,18 @@ from pydantic import BaseModel, Field
 from AIOralExamSystem.Agent.General_Agent import GeneralAgent
 from AIOralExamSystem.Agent.FileReader import (
     DEFAULT_REPORT_NAME,
-    REPORT_TEMPLATE_NAME,
     TEMPLATE_DIR,
     ReviewerAgent,
     FileReadGraphState,
     FileRunnerAgent,
 )
-from AIOralExamSystem.Agent.QuestionSetter import QuestionSetterAgent
+from AIOralExamSystem.Exam.report_storage import (
+    REPORT_WORK_ROOT,
+    resolve_report_work_dir,
+)
 from AIOralExamSystem.Tool.files.folder_tool import FolderStatsTool
 from AIOralExamSystem.Tool.git.git_tool import GitHistoryTool
+from AIOralExamSystem.Graph.template_content_loader import materialize_template_modules
 
 
 class CoreModuleDocumentRef(BaseModel):
@@ -29,16 +31,44 @@ class CoreModuleDocumentRef(BaseModel):
 
 
 class CoreModuleVariableInput(BaseModel):
-    target_field: str = Field("module_table", description="target template field, fixed to module_table")
     module_name: str = Field(..., description="completed core module name")
     module_function: str = Field(..., description="main function of the module")
-    completion_quality: str = Field(..., description="completion quality assessment")
+    completion_quality: str = Field("", description="completion quality or implementation quality")
     development_process: str = Field(..., description="development process and completion details")
     authenticity: str = Field(..., description="authenticity assessment: real, suspicious, or abnormal")
     document_refs: list[CoreModuleDocumentRef] = Field(
         default_factory=list,
         description="documents, code, or Git evidence related to this module",
     )
+
+
+class CoreModuleDocumentAppendInput(BaseModel):
+    module_name: str = Field(..., description="existing core module name")
+    document_refs: list[CoreModuleDocumentRef] = Field(
+        default_factory=list,
+        description="documents, code, or Git evidence to append to this module",
+    )
+
+class AModeQuestionSetInput(BaseModel):
+    questions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="A-mode prepared oral-exam questions using Question, standard_answer, question_blocks, and code_fragments.",
+    )
+
+
+
+class AIOralExamsetterGraphState(FileReadGraphState, total=False):
+    """State channels used only by the oral-exam report setter graph."""
+
+    database_template_modules: list[dict[str, Any]] | None
+    template_module_metadata: dict[str, dict[str, Any]]
+    current_template_prompt: str
+    current_template_provides_questions: bool
+    current_template_module_key: str
+    current_template_module_configured: bool
+    needs_core_question_tool: bool
+    core_module_records: dict[str, dict[str, Any]]
+    questions: list[dict[str, Any]]
 
 
 class AIOralExamsetter:
@@ -53,6 +83,7 @@ class AIOralExamsetter:
         mineru_api_key: str | None = None,
         chunk_ai_model_settings: dict | None = None,
         extra_tools: list | None = None,
+        tool_event_callback: Callable[[str], None] | None = None,
     ):
         self.model_settings = dict(model_settings or {})
         self.thinking = thinking
@@ -61,9 +92,10 @@ class AIOralExamsetter:
         self.mineru_api_key = mineru_api_key
         self.chunk_ai_model_settings = chunk_ai_model_settings or self.model_settings
         self.extra_tools = list(extra_tools or [])
+        self.tool_event_callback = tool_event_callback
         self.graph = self.build_graph()
 
-    def latest_execution_result(self, state: FileReadGraphState) -> dict | None:
+    def latest_execution_result(self, state: AIOralExamsetterGraphState) -> dict | None:
         done_plan = state.get("done_plan") or []
         if not done_plan:
             return None
@@ -82,286 +114,212 @@ class AIOralExamsetter:
 
     def build_core_module_outerprompt(self) -> str:
         return """
-
-## 闂傚倷绀侀幖顐ょ矓閸洍鈧箓宕奸姀銏㈠闂佽鍨奸悘娑㈡偄閻撳海浼嬮梺鎯ф禋閸嬪嫭绂掗幘顔解拺闁告稑锕﹂幊鍕煥閺囨ê鐏茬€规洘濞婇幃婊兾熼懖鈺冩毌婵＄偑鍊栭崝鎴﹀垂閸︻厽鏆滈柣妯肩帛閸嬧剝绻涢崱妤冪妞ゅ繆鏅犻弻?
-- 闂佽崵鍠愮划搴㈡櫠濡ゅ懎绠板瀣捣缁€濠冧繆椤栨艾鎮戦柛蹇旂矋閵囧嫰寮埀顒勵敄濞嗘挸瑙﹂柛銉戔偓濡插牓鏌熺紒銏犵仩濞存粎鍋撶换娑㈠箣閻愬瓨鍎庢繛瀛樼矤娴滎亝淇婇弶鎴悑濠㈣泛顑呴崜顔碱渻閵堝棙鈷掗柛妯犲洤鍚归柟鐑橆殕閸婄敻鏌ｉ悢鍝勵暭婵犫偓娴煎瓨鐓曢柕濠忕畱閸濇椽鏌熼姘殻鐎规洜鍠栭、妤呭磼濮樺吋顥撻梻鍌氼煬閸嬪嫬煤閵堝鐤い鏍ㄧ箓閺嗙偤姊绘担渚綊闁告洖鐏氶悾宄扳攽閿涘嫬浠滈柛濠傛健瀵偄顓奸崶锔藉媰闂佷紮绲介惉濂告偩鏉堛劋绻嗛柣鎰典簻閳ь剚绋戦悾鐑芥偨閸涘﹤浠у┑鐐村灟閸ㄥ湱娑甸埀顒勬煟鎼粹剝璐″┑顔煎槻閳绘捇宕奸弴鐔哄幗?fillCoreModuleVariable闂?
-- 闂備浇宕垫慨鎾敄閸涙潙鐤ù鍏兼綑閺?fillCoreModuleVariable 闂傚倷绀侀幉锟犲箰閸濄儳鐭欓柛鏇ㄥ幗椤洘绻濋棃娑冲姛闁汇倐鍋撻梻浣告啞缁嬫帡鎮鹃鍫濈劦妞ゆ巻鍋撶紒缁樏悾宄拔旈崨顓㈠敹濠电姴锕ら崯鐘诲几韫囨稒鈷?infoSearch闂傚倷绶氬褍螞閺冨倹瀚婚柣鐘垫對dFile 闂?gitHistoryReader 闂傚倷鑳堕幊鎾绘倶濮樿泛纾块柟鎯版閺勩儳鈧厜鍋撻柍褜鍓熼獮蹇涙偐鐠囧弬銊╁嫉椤忓懐鐟归柍褜鍓欓悾椋庣矙鐠囩偓妫冨畷姗€鍩￠崘锕€浠滈梻鍌欒兌椤牏鎹㈤幇鐗堝仾闁搞儺鍓氶崕濠傤熆閼搁潧濮囩紒鐘插级閵囧嫰寮崶銉㈠亾閳ь剟鏌?
-- 濠电姵顔栭崳顖滃緤閻ｅ本宕查悗锝庡枟閻撳倹绻濇繝鍌滃闁告劏鍋撶紓鍌欑椤戝牆鈻旈弴鐔剁箚闁搞儯鍔嬬换鍡樸亜閺嶃劊浠滈柛瀣崌閹煎綊顢曢～顓熸▕闂傚倷绀侀幉锟犮€冮崱妞曞搫顭ㄩ崨顏勪壕婵鍘ч獮姗€鏌熸總澶婁喊鐎规洘锕㈤、鏃堝川椤旂瓔鍚傛繝鐢靛仦閸ㄥ爼骞愰幘顔肩；闁规儳顕粻?fillCoreModuleVariable闂傚倷鐒︾€笛呯矙閹寸偟闄勯柡鍐ㄥ€荤粻鏂款熆鐠虹儤婀伴柛鐔锋惈闇夐柨婵嗘处閸も偓闁诡垳鍠愮换婵嬪閿濆懐鍘梺娲诲弾閸ｏ綁寮荤仦绛嬬叆闁稿繐澧介崰鏍垂妤ｅ啯鎯炴い鎰垫線濞ｎ噣姊绘担鍛婂暈闁煎綊绠栭幃褔宕卞☉娆忔闂佺粯姊婚崢褏绮婚敐澶嬬厵闂侇叏缂氱花鑺ャ亜韫囨岸鍝虹紒缁樼洴瀹曠増骞婇柛濠冾殔閳绘捇宕奸弴鐔哄幗濡炪値鍋掗崜娆愪繆閹间焦鐓?
-- fillCoreModuleVariable 婵犵數鍋炲娆撳触鐎ｎ偆鈹嶉柧蹇撴贡閻棝鎮楅敐搴″閻庢艾顭烽弻銊モ攽閸℃ê鐝旂紓鍌氱У閻楃娀寮?module_table 闂傚倷绀侀幉锟犳偡閿曞倹鏅濋柕蹇嬪€曢梻顖涚箾瀹割喕绨奸柡鍜佸墯缁绘盯骞嬮悜鍡樼暭缂備礁顑嗛崹鐢稿煡婢舵劕绠荤€规洖娉﹂妷锔轰簻闁冲搫顑囬悾鐢告煙椤栨艾顏柍褜鍓氱粙鎺楁晪婵犮垼娉涚粔褰掑蓟?rewriteDocument 婵犵數濞€濞佳囁囨禒瀣；闁告洦鍨伴悿?module_table闂?
-- document_refs 闂傚倸顭崑鍕洪妶澶婄疇婵せ鍋撳┑锛勵棎缁犳盯骞欓崘銊︻吙闂備礁鎼ú銊︽叏閻㈢姹查煫鍥ㄦ惄濞撳鏌曢崼婵囧櫤閻犳劏鍓濈换娑㈢叓椤撶偛绁悗瑙勬礃閿曘垹鐣烽妸鈺婃晬婵炴垶顭囬崝顖炴⒑鐠囨煡顎楁繝鈧柆宥呯；婵炴垯鍨洪崑銈夋煏婵炵偓娅呴柟鐟扮埣閺屾洘绻涜鐎氼噣寮抽悩缁樷拺闁告繂瀚埀顒傤焾鐓ら柨鏇炲€歌繚闂佺鐬奸崑娑滅箽濠电偠鎻徊浠嬪床閺屻儱鏋侀柍鍝勬噺閻撶喐銇勯弮鍥у惞闁告柨绉归弻锛勨偓锝庝簻閺嗙偟绱掗崒娑樻诞闁硅櫕绮撳Λ鍐ㄢ槈濮橆偆鐜?Git 闂備浇宕垫慨鏉懨洪敐澶嬪€块柨鏇楀亾闁伙絽鐏氱粭鐔煎焵椤掑嫬鏋佺€广儱娲ｅ▽顏堟煠濞村娅囬柟鎻掔秺濮婃椽鎮℃惔锝忕礊闂佸搫鎷嬮崑鍡椢ｉ幇閭︽晜闁割偆鍠撻崝鐢告⒑缂佹﹩鐒炬繛鍜冪秮閹垽宕ㄩ妤€浜鹃柛顭戝亝缁舵煡鎮楀鐓庡⒋妤犵偛绻橀幃褔宕奸姀銏″殞婵犵數濞€濞佳兠洪妶鍥╃焾闁挎洖鍊归悡?
-- 婵犵數濮烽。浠嬪焵椤掆偓閸熷潡鍩€椤掆偓缂嶅﹪骞冨Ο璇茬窞濠电偑鍨婚崰鏍垂妤ｅ啯鎯炴い鎰垫線濞ｎ噣姊绘担鍛婃儓闁绘妫濊棟妞ゆ洍鍋撶€规洦鍓熼、妤呭礋椤掆偓閸撶儤绻涙潏鍓у埌闁硅姤绮撳鑸电鐎ｎ偆鍘藉┑鐘诧工閻楁粓寮抽幒鏃傜＜闁圭粯甯掗埛鏃傜磼鏉堛劍宕岀€规洦鍋婂畷鐔碱敇閻旂儤袙闂傚倷绀侀幖顐﹀磹缁嬫５娲晝閸屾銉╂煕鐏炲墽銆掗柣鐔活潐缁绘繈妫冨☉娆愭倷缂備椒绶ょ粻鎾诲蓟閵娿儮妲堟俊顖氱仢椤忣參鎮峰鍕凡鐎殿喖澧庣划瀣箳濡も偓鍞梺闈涳紡閸涱亝鏅梻鍌欑劍濡炲灝顭囬崸妤€绀夐悗锝庡枛閼歌銇勯幒鎴濐仾闁稿孩锚闇夐柨婵嗘处濞呮洟鏌ｉ弬鎸庡櫧闁逞屽墮閻忔艾顭垮Ο灏栧亾濮橆剚鎲告俊鍙夊姇閳规垹鈧綆鍓欑粊锕傛煟閻樿崵绱版繛鍜冪到閳?authenticity 闂傚倷绀侀幖顐ょ矓閺夋嚚娲晲閸ャ劌顏搁梺缁樻⒒閸樠囨倶閾忣偆绡€濠电姴鍊搁弳鐔兼煙閻ｅ苯鈻堥柡宀嬬秮婵″爼宕卞Δ鍐ф喚闂備線鈧偛鑻晶顖滅磼閸濆嫭鍋ラ柛鈹惧亾?
-- 婵犵數濮烽。浠嬪焵椤掆偓閸熷潡鍩€椤掆偓缂嶅﹪骞冨Ο璇茬窞闁归偊鍓涢惈鍕⒑闂堟盯鐛滅紒杈ㄦ礀椤繑銈ｉ崘鈺冨幐闂佸壊鍋呯换宥呂ｈぐ鎺撶厸閻庯綆浜滈弳娆愩亜閳轰降鍋㈤柡浣瑰姍瀹曟﹢鏁愰崨顒€顥氬┑鐐舵彧缁蹭粙宕查弻銉ユ瀬闁冲搫鎳忛悡鐔搞亜閺冨洤鍚圭紒娑樼箳缁辨帗娼忛妸褏鐣虹紓浣割儏閿曨亪骞冮姀銈呬紶闁靛鑵归幐鍕⒒?Git 闂備浇宕垫慨鏉懨洪敐澶嬪€块柨鏇楀亾闁伙絽鐏氱粭鐔煎焵椤掑嫬鏋佺€广儱娲ｅ▽顏堟煠濞村娅囬柟鎻掔秺閺岋綁鎮㈤崨濠勶紱闂佺粯甯梽鍕┍婵犲洤浼犻柕澶堝灩娴滈箖鏌ｉ悢鍛婄凡闁哄棙鐟х槐鎾愁吋閸滀礁鍓遍梺鐟板槻閹冲酣鈥﹂妸鈺佺闁靛鍎查濂告⒑鐠囧弶鎹ｉ柟铏崌瀵敻顢楅崟顐㈢€┑顔筋焾濞夋盯宕橀埀顒傜磽娴ｅ壊鍎撴繛澶嬫礃娣囧﹪宕堕妸銈囩畾濡炪倖鐗楅妵娑㈠磻閹剧粯鎯炴い鎰垫線濞ｎ噣姊?
+## Core module evidence recording rules
+- These tools only record core module facts and evidence into the current run state. They do not edit template files, search placeholders, or write markdown tables.
+- listCoreModules: show the records already collected in this run, including module count, names, evidence counts, and evidence references.
+- fillCoreModule: create or update one core module record with its function, quality, development process, authenticity, and evidence references.
+- addCoreModuleDocument: append documents, code, or Git evidence to an existing core module record.
+- fillAQuestions: record A-mode prepared oral-exam questions when the current template module is responsible for question output.
+- A-mode questions must use this shape: {"dimension": "...", "Question": "...", "standard_answer": "...", "question_blocks": [...], "code_fragments": [...]}.
+- When you find a new core module, call fillCoreModule. When you find additional evidence for an existing record, call addCoreModuleDocument.
+- Do not create duplicate records for the same module name. If evidence is insufficient, continue searching first; if it still cannot be confirmed, mark authenticity as suspicious.
+- If there are more than 3 core modules, keep the 3 most important records.
 """
-
-    def sanitize_markdown_table_cell(self, value: Any) -> str:
-        text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
-        text = " ".join(text.split())
-        return text.replace("|", "\\|")
-
-    def format_core_module_refs(self, document_refs: list[CoreModuleDocumentRef]) -> str:
-        parts = []
-        for ref in document_refs or []:
-            file_path = self.sanitize_markdown_table_cell(ref.file_path)
-            summary = self.sanitize_markdown_table_cell(ref.quote_or_summary)
-            reason = self.sanitize_markdown_table_cell(ref.reason)
-            detail = f"{file_path}: {summary}" if summary else file_path
-            if reason:
-                detail += f" ({reason})"
-            if detail:
-                parts.append(detail)
-        return "; ".join(parts)
-
-    def build_core_module_table_row(self, data: CoreModuleVariableInput) -> str:
-        authenticity = str(data.authenticity or "").strip()
-        if authenticity not in {"real", "suspicious", "abnormal"}:
-            authenticity = "suspicious"
-        refs_text = self.format_core_module_refs(data.document_refs)
-        process = self.sanitize_markdown_table_cell(data.development_process)
-        if refs_text:
-            process = f"{process}; evidence: {refs_text}" if process else f"evidence: {refs_text}"
-        return (
-            "| "
-            + " | ".join(
-                [
-                    self.sanitize_markdown_table_cell(data.module_name),
-                    self.sanitize_markdown_table_cell(data.module_function),
-                    self.sanitize_markdown_table_cell(data.completion_quality),
-                    process,
-                    self.sanitize_markdown_table_cell(authenticity),
-                ]
-            )
-            + " |"
-        )
-
-    def fill_core_module_table_row(self, file_path: str, data: CoreModuleVariableInput) -> dict:
-        target_field = str(data.target_field or "module_table").strip()
-        if target_field != "module_table":
-            return {
-                "ok": False,
-                "flag": "CORE_MODULE_FIELD_UNSUPPORTED",
-                "message": "fillCoreModuleVariable currently supports only module_table.",
-            }
-
-        path = Path(file_path)
-        try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = path.read_text(encoding="utf-8", errors="replace")
-
-        row = self.build_core_module_table_row(data)
-        module_name = self.sanitize_markdown_table_cell(data.module_name)
-        if re.search(rf"^\|\s*{re.escape(module_name)}\s*\|", content, re.MULTILINE):
-            return {
-                "ok": True,
-                "flag": "CORE_MODULE_ALREADY_FILLED",
-                "module_name": data.module_name,
-                "message": "Core module already exists; skipped duplicate row.",
-            }
-
-        placeholder_pattern = re.compile(r"^\[FIELD:module_table\b[^\r\n]*\]\r?\n?", re.MULTILINE)
-        if placeholder_pattern.search(content):
-            new_content = placeholder_pattern.sub(row + "\n", content, count=1)
-        else:
-            lines = content.splitlines(keepends=True)
-            insert_at = None
-            in_module_table = False
-            for index, line in enumerate(lines):
-                stripped = line.strip()
-                if stripped.startswith("|") and ("濡€虫健閸氬秶袨" in stripped or "module" in stripped.lower()):
-                    in_module_table = True
-                    insert_at = index + 1
-                    continue
-                if in_module_table:
-                    if stripped.startswith("|"):
-                        insert_at = index + 1
-                        continue
-                    break
-            if insert_at is None:
-                return {
-                    "ok": False,
-                    "flag": "CORE_MODULE_TABLE_NOT_FOUND",
-                    "module_name": data.module_name,
-                    "message": "module_table placeholder or module table was not found.",
-                }
-            lines.insert(insert_at, row + "\n")
-            new_content = "".join(lines)
-
-        path.write_text(new_content, encoding="utf-8")
-        return {
-            "ok": True,
-            "flag": "CORE_MODULE_FILLED",
-            "target_field": "module_table",
-            "module_name": data.module_name,
-            "document_ref_count": len(data.document_refs or []),
-        }
 
     def compact_report_text(self, value: Any) -> str:
         text = str(value or "").replace("\r", " ").replace("\n", " ").strip()
         return " ".join(text.split())
 
-    def unique_core_module_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        unique_records: dict[str, dict[str, Any]] = {}
-        for record in records or []:
+    def core_module_record_key(self, module_name: Any) -> str:
+        return self.compact_report_text(module_name)
+
+    def normalize_core_module_record_map(self, records: Any) -> dict[str, dict[str, Any]]:
+        normalized: dict[str, dict[str, Any]] = {}
+        if isinstance(records, dict):
+            iterable = records.items()
+        else:
+            iterable = []
+            if isinstance(records, list):
+                iterable = (("", record) for record in records)
+
+        for raw_key, record in iterable:
             if not isinstance(record, dict):
                 continue
             module = record.get("module")
             if not isinstance(module, dict):
                 continue
-            module_name = self.compact_report_text(module.get("module_name"))
-            key = module_name or json.dumps(module, ensure_ascii=False, sort_keys=True)
-            unique_records[key] = record
-        return list(unique_records.values())
+            key = self.core_module_record_key(raw_key) or self.core_module_record_key(module.get("module_name"))
+            if not key:
+                continue
+            normalized[key] = record
+        return normalized
 
-    def format_expected_answer_points(self, question_item: Any) -> str:
-        if not isinstance(question_item, dict):
-            return ""
-        points = question_item.get("expected_answer_points")
-        if not isinstance(points, list):
-            return ""
-        cleaned_points = [
-            self.compact_report_text(point)
-            for point in points
-            if self.compact_report_text(point)
-        ]
-        return "; ".join(cleaned_points)
-
-    def format_question_item_line(self, question_item: Any, fallback: str = "not generated") -> str:
-        if isinstance(question_item, str):
-            question = self.compact_report_text(question_item)
-            return question or fallback
-        if not isinstance(question_item, dict):
-            return fallback
-        question = self.compact_report_text(question_item.get("question")) or fallback
-        answer = self.compact_report_text(
-            question_item.get("Answer") or question_item.get("answer")
-        )
-        if not answer:
-            answer = self.format_expected_answer_points(question_item)
-        return f"{question} Answer: {answer}" if answer else question
-
-    def format_core_question_sets_markdown(self, question_sets: list[dict[str, Any]]) -> str:
-        sections = ["## Oral Exam Questions"]
-        level_titles = {
-            "easy": "Easy question",
-            "medium": "Medium question",
-            "hard": "Hard question",
-        }
-        for index, item in enumerate(question_sets, start=1):
-            module = item.get("module") if isinstance(item, dict) else {}
-            question_set = item.get("question_set") if isinstance(item, dict) else {}
-            module = module if isinstance(module, dict) else {}
-            question_set = question_set if isinstance(question_set, dict) else {}
-            module_name = (
-                self.compact_report_text(question_set.get("module_name"))
-                or self.compact_report_text(module.get("module_name"))
-                or f"Core module {index}"
-            )
-            sections.append(f"### {index}. {module_name}")
-            if not question_set.get("ok", True):
-                error_message = self.compact_report_text(question_set.get("error_message"))
-                sections.append(
-                    f"- Generation status: {self.compact_report_text(question_set.get('flag')) or 'QUESTION_SET_FAILED'}"
-                    + (f", {error_message}" if error_message else "")
-                )
+    def merge_core_module_record_maps(self, existing_records: Any, new_records: Any) -> dict[str, dict[str, Any]]:
+        merged = self.normalize_core_module_record_map(existing_records)
+        for key, record in self.normalize_core_module_record_map(new_records).items():
+            if key not in merged:
+                merged[key] = record
                 continue
 
-            implementation_question = question_set.get("implementation_question")
-            sections.append(
-                f"- Implementation check: {self.format_question_item_line(implementation_question)}"
-            )
-
-            knowledge_point = question_set.get("key_knowledge_point")
-            if isinstance(knowledge_point, dict):
-                knowledge_name = self.compact_report_text(knowledge_point.get("name"))
-                knowledge_reason = self.compact_report_text(knowledge_point.get("reason"))
-                if knowledge_name or knowledge_reason:
-                    sections.append(
-                        f"- Key knowledge point: {knowledge_name}"
-                        + (f" ({knowledge_reason})" if knowledge_reason else "")
-                    )
-
-            leveled_questions = question_set.get("leveled_questions")
-            leveled_questions = leveled_questions if isinstance(leveled_questions, dict) else {}
-            for level, title in level_titles.items():
-                questions = leveled_questions.get(level)
-                questions = questions if isinstance(questions, list) else []
-                for question_index, question_item in enumerate(questions, start=1):
-                    sections.append(
-                        f"- {title} {question_index}: {self.format_question_item_line(question_item)}"
-                    )
-
-            evidence = question_set.get("evidence")
-            evidence = evidence if isinstance(evidence, list) else []
-            evidence_lines = []
-            for evidence_item in evidence:
-                if not isinstance(evidence_item, dict):
+            existing_module = merged[key].setdefault("module", {})
+            module_data = record.get("module") or {}
+            for module_key, value in module_data.items():
+                if module_key == "document_refs":
                     continue
-                file_path = self.compact_report_text(evidence_item.get("file_path"))
-                line_number = evidence_item.get("line_number")
-                reason = self.compact_report_text(evidence_item.get("reason"))
-                if file_path:
-                    line_text = f"{file_path}:{line_number}" if line_number else file_path
-                    evidence_lines.append(line_text + (f" ({reason})" if reason else ""))
-            if evidence_lines:
-                sections.append(f"- Evidence: {'; '.join(evidence_lines)}")
+                if self.compact_report_text(value):
+                    existing_module[module_key] = value
+            existing_module["document_refs"] = self.merge_core_module_document_refs(
+                existing_module.get("document_refs") or [],
+                module_data.get("document_refs") or [],
+            )
+            merged[key]["tool_result"] = record.get("tool_result") or merged[key].get("tool_result") or {}
+        return merged
 
-        return "\n".join(sections).strip()
+    def dump_core_module_model(self, value: Any) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        if hasattr(value, "dict"):
+            return value.dict()
+        return dict(value) if isinstance(value, dict) else {}
 
-    def append_core_question_sets_to_document(
+    def normalize_core_module_document_refs(self, refs: list[Any]) -> list[dict[str, Any]]:
+        normalized = []
+        for ref in refs or []:
+            data = self.dump_core_module_model(ref)
+            file_path = self.compact_report_text(data.get("file_path"))
+            quote_or_summary = self.compact_report_text(data.get("quote_or_summary"))
+            reason = self.compact_report_text(data.get("reason"))
+            if not file_path and not quote_or_summary and not reason:
+                continue
+            normalized.append(
+                {
+                    "file_path": file_path,
+                    "quote_or_summary": quote_or_summary,
+                    "reason": reason,
+                }
+            )
+        return normalized
+
+    def merge_core_module_document_refs(self, existing_refs: list[Any], new_refs: list[Any]) -> list[dict[str, Any]]:
+        merged = []
+        seen = set()
+        for ref in self.normalize_core_module_document_refs(existing_refs) + self.normalize_core_module_document_refs(new_refs):
+            key = (
+                self.compact_report_text(ref.get("file_path")),
+                self.compact_report_text(ref.get("quote_or_summary")),
+                self.compact_report_text(ref.get("reason")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(ref)
+        return merged
+
+    def core_module_state_snapshot(self, records: Any) -> dict[str, Any]:
+        record_map = self.normalize_core_module_record_map(records)
+        return {"record_count": len(record_map), "keys": list(record_map.keys())}
+
+    def normalize_a_mode_question_item(self, question: Any) -> dict[str, Any]:
+        if not isinstance(question, dict):
+            return {}
+        question_content = self.compact_report_text(question.get("Question") or question.get("question"))
+        if not question_content:
+            return {}
+        try:
+            score = float(question.get("score", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            score = 1.0
+        return {
+            "dimension": self.compact_report_text(
+                question.get("dimension")
+                or question.get("question_dimension")
+                or question.get("aspect")
+            ),
+            "Question": question_content,
+            "standard_answer": self.compact_report_text(
+                question.get("standard_answer")
+                or question.get("Answer")
+                or question.get("answer")
+                or question.get("reference_answer")
+            ),
+            "question_blocks": question.get("question_blocks") if isinstance(question.get("question_blocks"), list) else [],
+            "code_fragments": question.get("code_fragments") if isinstance(question.get("code_fragments"), list) else [],
+            "score": score,
+        }
+
+    def normalize_a_mode_question_list(self, questions: Any) -> list[dict[str, Any]]:
+        if isinstance(questions, dict):
+            questions = questions.get("questions") or questions.get("items") or []
+        if not isinstance(questions, list):
+            return []
+        normalized = []
+        seen = set()
+        for question in questions:
+            item = self.normalize_a_mode_question_item(question)
+            if not item:
+                continue
+            key = (item.get("dimension"), item.get("Question"))
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(item)
+        return normalized
+
+    def merge_a_mode_question_lists(self, existing_questions: Any, new_questions: Any) -> list[dict[str, Any]]:
+        return self.normalize_a_mode_question_list(
+            self.normalize_a_mode_question_list(existing_questions)
+            + self.normalize_a_mode_question_list(new_questions)
+        )
+
+    def upsert_current_core_module_record(
         self,
-        file_path: str,
-        content: str,
-        question_sets: list[dict[str, Any]],
-    ) -> str:
-        section = self.format_core_question_sets_markdown(question_sets)
-        marker_index = content.find("--ps--")
-        if marker_index >= 0:
-            updated_content = (
-                content[:marker_index].rstrip()
-                + "\n\n"
-                + section
-                + "\n\n"
-                + content[marker_index:].lstrip()
-            )
-        else:
-            updated_content = content.rstrip() + "\n\n" + section + "\n"
-        Path(file_path).write_text(updated_content, encoding="utf-8")
-        return updated_content
+        records: dict[str, dict[str, Any]],
+        payload: CoreModuleVariableInput,
+        tool_result: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        module_data = self.dump_core_module_model(payload)
+        module_data["document_refs"] = self.normalize_core_module_document_refs(
+            module_data.get("document_refs") or []
+        )
+        key = self.core_module_record_key(module_data.get("module_name"))
+        if not key:
+            raise ValueError("core module record key is empty")
 
-    async def generate_core_question_sets(
+        if key not in records:
+            record = {"module": module_data, "tool_result": tool_result}
+            records[key] = record
+            return record, True
+
+        existing = records[key]
+        existing_module = existing.setdefault("module", {})
+        for module_key, value in module_data.items():
+            if module_key == "document_refs":
+                continue
+            if self.compact_report_text(value):
+                existing_module[module_key] = value
+        existing_module["document_refs"] = self.merge_core_module_document_refs(
+            existing_module.get("document_refs") or [],
+            module_data.get("document_refs") or [],
+        )
+        existing["tool_result"] = tool_result
+        return existing, False
+
+    def append_current_core_module_documents(
         self,
-        state: FileReadGraphState,
-        core_module_records: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        records = self.unique_core_module_records(core_module_records)
-        document_scope = str(state.get("folder_path") or "/root/AI-Oral-exam")
-
-        async def generate_one(record: dict[str, Any]) -> dict[str, Any]:
-            module = record.get("module") if isinstance(record, dict) else {}
-            module = module if isinstance(module, dict) else {}
-            module_name = self.compact_report_text(module.get("module_name"))
-            document_refs = module.get("document_refs")
-
-            question_setter = QuestionSetterAgent(
-                self.model_settings,
-                document_scope=document_scope,
-                thinking=self.thinking,
-                response_format=True,
-                temperature=0,
-                show_tool_io=True,
-            )
-            question_set = await question_setter.execute(
-                module_name=module_name,
-                module_content=module,
-                document_refs=document_refs if isinstance(document_refs, list) else [],
-            )
-            return {
-                "module": module,
-                "tool_result": record.get("tool_result") if isinstance(record, dict) else {},
-                "question_set": question_set,
-            }
-
-        return list(await asyncio.gather(*(generate_one(record) for record in records)))
+        records: dict[str, dict[str, Any]],
+        module_name: str,
+        document_refs: list[Any],
+    ) -> dict[str, Any] | None:
+        key = self.core_module_record_key(module_name)
+        if not key or key not in records:
+            return None
+        record = records[key]
+        module = record.setdefault("module", {})
+        module["document_refs"] = self.merge_core_module_document_refs(
+            module.get("document_refs") or [],
+            document_refs or [],
+        )
+        return record
 
     def sanitize_output_state(self, state: dict) -> dict:
         if not isinstance(state, dict):
@@ -380,6 +338,8 @@ class AIOralExamsetter:
                     or state.get("merged_report_path")
                     or ""
                 ),
+                "core_module_records": final_answer.get("core_module_records") or state.get("core_module_records") or {},
+                "questions": final_answer.get("questions") or state.get("questions") or [],
             }
         return {
             "ok": state.get("status") != "failed",
@@ -389,12 +349,14 @@ class AIOralExamsetter:
             "answer": "",
             "report_path": str(state.get("report_path") or ""),
             "merged_report_path": str(state.get("merged_report_path") or ""),
+            "core_module_records": state.get("core_module_records") or {},
+            "questions": state.get("questions") or [],
         }
 
     def build_graph(self):
         from langgraph.graph import END, StateGraph
 
-        graph = StateGraph(FileReadGraphState)
+        graph = StateGraph(AIOralExamsetterGraphState)
         graph.add_node('prepare_templates', self.prepare_templates_node)
         graph.add_node('load_template', self.load_next_template_node)
         graph.add_node('detect_core_question_tool', self.detect_core_question_tool_node)
@@ -421,29 +383,6 @@ class AIOralExamsetter:
         graph.add_edge('merge_templates', 'finalize')
         graph.add_edge('finalize', END)
         return graph.compile()
-
-    def prepare_report_template(self, folder_path: str, report_name: str = DEFAULT_REPORT_NAME) -> str:
-        template_path = TEMPLATE_DIR / REPORT_TEMPLATE_NAME
-        if not template_path.is_file():
-            return ""
-        root_path = Path("/root/AI-Oral-exam").resolve()
-        raw_folder = Path(str(folder_path or root_path)).expanduser()
-        if not raw_folder.is_absolute():
-            raw_folder = root_path / raw_folder
-        try:
-            target_folder = raw_folder.resolve()
-            target_folder.relative_to(root_path)
-        except (OSError, ValueError):
-            return ""
-        if not target_folder.is_dir():
-            return ""
-        output_name = Path(str(report_name or DEFAULT_REPORT_NAME)).name or DEFAULT_REPORT_NAME
-        output_path = target_folder / output_name
-        try:
-            shutil.copyfile(template_path, output_path)
-        except OSError:
-            return ""
-        return str(output_path)
 
     def resolve_project_folder(self, folder_path: str) -> Path:
         root_path = Path("/root/AI-Oral-exam").resolve(strict=False)
@@ -475,18 +414,52 @@ class AIOralExamsetter:
         course_id: str | None,
         exam_id: str | None,
     ) -> Path:
-        def safe_component(value: str | None, fallback: str) -> str:
-            component = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
-            component = component.strip(" .")
-            return component if component and component not in {".", ".."} else fallback
+        return resolve_report_work_dir(course_id, exam_id)
 
-        return (
-            Path("/root/AI-Oral-exam/.report_work")
-            / safe_component(course_id, "unknown_course")
-            / safe_component(exam_id, "unknown_exam")
-        )
+    async def prepare_templates_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
+        database_modules = state.get("database_template_modules")
+        if database_modules is not None:
+            work_dir = self.resolve_template_work_dir(
+                state.get("course_id"),
+                state.get("exam_id"),
+            )
+            work_dir.mkdir(parents=True, exist_ok=True)
+            materialized = materialize_template_modules(work_dir, list(database_modules))
+            working_files = list(materialized.get("working_files") or [])
+            if not working_files:
+                state["status"] = "failed"
+                state["error"] = {
+                    "flag": "REPORT_TEMPLATE_MODULES_NOT_FOUND",
+                    "error_message": "No database template modules were provided.",
+                }
+                return state
+            report_name = Path(
+                str(state.get("report_path") or DEFAULT_REPORT_NAME)
+            ).name or DEFAULT_REPORT_NAME
+            state.update(
+                {
+                    "report_path": str(work_dir / report_name),
+                    "template_source_dir": str(materialized.get("source_dir") or ""),
+                    "template_work_dir": str(work_dir),
+                    "source_template_files": list(materialized.get("source_files") or []),
+                    "template_files": working_files,
+                    "template_module_metadata": dict(materialized.get("metadata") or {}),
+                    "template_index": 0,
+                    "chapter_history": [],
+                    "current_template_file": "",
+                    "current_source_template_file": "",
+                    "current_template_name": "",
+                    "current_template_content": "",
+                    "current_template_prompt": "",
+                    "current_template_provides_questions": False,
+                    "current_template_module_configured": False,
+                    "needs_core_question_tool": False,
+                    "questions": [],
+                    "status": "templates_prepared",
+                }
+            )
+            return state
 
-    async def prepare_templates_node(self, state: FileReadGraphState) -> FileReadGraphState:
         source_dir = Path(str(state.get("template_source_dir") or self.report_template_source_dir())).expanduser()
         if not source_dir.is_absolute():
             source_dir = Path("/root/AI-Oral-exam") / source_dir
@@ -556,7 +529,7 @@ class AIOralExamsetter:
         state["status"] = "templates_prepared"
         return state
 
-    async def detect_core_question_tool_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def detect_core_question_tool_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         content = str(state.get("current_template_content") or "")
         if not content:
             current_file = str(state.get("current_template_file") or state.get("file_path") or "").strip()
@@ -571,6 +544,11 @@ class AIOralExamsetter:
         state["needs_core_question_tool"] = False
         if not content.strip():
             return state
+        if state.get("current_template_module_configured"):
+            state["needs_core_question_tool"] = bool(
+                state.get("current_template_provides_questions")
+            )
+            return state
 
         agent = GeneralAgent(
             self.model_settings,
@@ -580,12 +558,12 @@ class AIOralExamsetter:
         )
         response = await agent.execute(
             system_prompt=(
-                "Decide whether this report template needs core module oral-exam question generation. "
+                "Decide whether this report template needs core module table collection. "
                 "Return only a JSON object."
             ),
             user_prompt=(
-                "If the template contains core task/module/function content that can be used "
-                "to generate follow-up oral-exam questions, return "
+                "If the template contains a core task/module/function table that should be filled "
+                "with completed module evidence, return "
                 "{\"needs_core_question_tool\": true}; otherwise return "
                 "{\"needs_core_question_tool\": false}.\n\n"
                 f"Template content:\n{content}"
@@ -603,10 +581,11 @@ class AIOralExamsetter:
                 data = json.loads(match.group(0)) if match else {}
             except json.JSONDecodeError:
                 data = {}
-        state["needs_core_question_tool"] = bool(data.get("needs_core_question_tool")) if isinstance(data, dict) else False
+        detected = bool(data.get("needs_core_question_tool")) if isinstance(data, dict) else False
+        state["needs_core_question_tool"] = detected
         return state
 
-    async def load_next_template_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def load_next_template_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         template_files = list(state.get("template_files") or [])
         template_index = int(state.get("template_index") or 0)
         if template_index >= len(template_files):
@@ -631,18 +610,25 @@ class AIOralExamsetter:
             }
             return state
 
+        template_metadata = dict(
+            (state.get("template_module_metadata") or {}).get(str(current_file)) or {}
+        )
         state["file_path"] = str(current_file)
         state["current_template_file"] = str(current_file)
         state["current_source_template_file"] = current_source_file
         state["current_template_name"] = current_file.name
         state["current_template_content"] = content
+        state["current_template_prompt"] = str(template_metadata.get("template_prompt") or "")
+        state["current_template_provides_questions"] = bool(template_metadata.get("provides_questions"))
+        state["current_template_module_key"] = str(template_metadata.get("module_key") or "")
+        state["current_template_module_configured"] = bool(template_metadata)
         state["needs_core_question_tool"] = False
         state["chapter_done_plan_start"] = len(state.get("done_plan") or [])
         state["plan"] = []
         state["status"] = "planning"
         return state
 
-    def prepare_runner_step(self, state: FileReadGraphState, step: dict[str, Any]) -> dict[str, Any]:
+    def prepare_runner_step(self, state: AIOralExamsetterGraphState, step: dict[str, Any]) -> dict[str, Any]:
         current_file = str(state.get("current_template_file") or state.get("file_path") or "")
         current_name = str(state.get("current_template_name") or "")
         prepared = dict(step or {})
@@ -654,7 +640,7 @@ class AIOralExamsetter:
             prepared.setdefault("current_template_name", current_name)
         return prepared
 
-    def summarize_chapter_result(self, state: FileReadGraphState, chapter_results: list[dict[str, Any]], content: str) -> str:
+    def summarize_chapter_result(self, state: AIOralExamsetterGraphState, chapter_results: list[dict[str, Any]], content: str) -> str:
         summary_parts = []
         for item in chapter_results:
             if not isinstance(item, dict):
@@ -667,7 +653,7 @@ class AIOralExamsetter:
             summary = "Chapter completed; updated content length: " + str(len(content))
         return summary[:2000]
 
-    async def save_chapter_history_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def save_chapter_history_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         current_file = Path(str(state.get("current_template_file") or state.get("file_path") or "")).expanduser()
         content = ""
         if current_file:
@@ -699,12 +685,12 @@ class AIOralExamsetter:
         state["status"] = "chapter_done"
         return state
 
-    def route_after_prepare_templates(self, state: FileReadGraphState) -> str:
+    def route_after_prepare_templates(self, state: AIOralExamsetterGraphState) -> str:
         if state.get("status") == "failed":
             return "finalize"
         return "load_template" if state.get("template_files") else "finalize"
 
-    def route_after_runner(self, state: FileReadGraphState) -> str:
+    def route_after_runner(self, state: AIOralExamsetterGraphState) -> str:
         if state.get('status') == 'failed':
             return 'finalize'
         template_index = int(state.get('template_index') or 0)
@@ -795,7 +781,7 @@ class AIOralExamsetter:
             "git_commit_count": str(len(history)),
         }
 
-    async def run_process_mode_function(self, state: FileReadGraphState) -> None:
+    async def run_process_mode_function(self, state: AIOralExamsetterGraphState) -> None:
         current_file = Path(str(state.get("current_template_file") or state.get("file_path") or "")).expanduser()
         if not current_file.is_file():
             return
@@ -834,7 +820,7 @@ class AIOralExamsetter:
         if updated_content != content:
             current_file.write_text(updated_content, encoding="utf-8")
 
-    async def merge_templates_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def merge_templates_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         template_files = [
             Path(str(path)).expanduser()
             for path in state.get("template_files") or []
@@ -856,7 +842,7 @@ class AIOralExamsetter:
             }
             return state
 
-        work_root = Path("/root/AI-Oral-exam/.report_work").resolve(strict=False)
+        work_root = REPORT_WORK_ROOT
         work_dir = Path(work_dir_raw).expanduser().resolve(strict=False)
         try:
             work_dir.relative_to(work_root)
@@ -919,9 +905,10 @@ class AIOralExamsetter:
         report_name: str = DEFAULT_REPORT_NAME,
         template_name: str = "",
         max_iterations: int = 10,
+        template_modules: list[dict[str, Any]] | None = None,
     ) -> dict:
         report_path = self.resolve_report_output_path(folder_path, report_name)
-        initial_state: FileReadGraphState = {
+        initial_state: AIOralExamsetterGraphState = {
             "user_requirement": str(user_requirement or "").strip(),
             "file_path": str(file_path or "").strip(),
             "user_name": str(user_name or "").strip(),
@@ -943,12 +930,20 @@ class AIOralExamsetter:
             "current_source_template_file": "",
             "current_template_name": "",
             "current_template_content": "",
+            "database_template_modules": list(template_modules) if template_modules is not None else None,
+            "template_module_metadata": {},
+            "current_template_prompt": "",
+            "current_template_provides_questions": False,
+            "current_template_module_key": "",
+            "current_template_module_configured": False,
             "chapter_history": [],
             "chapter_done_plan_start": 0,
             "merged_report_path": "",
             "finish_reason": "",
             "plan": [],
             "done_plan": [],
+            "core_module_records": {},
+            "questions": [],
             "status": "planning",
         }
         try:
@@ -967,7 +962,7 @@ class AIOralExamsetter:
     def graph_recursion_limit(self, max_iterations: int) -> int:
         return max(80, int(max_iterations or 1) * 10 + 30)
 
-    def read_target_document_content(self, state: FileReadGraphState, limit: int = 30000) -> str:
+    def read_target_document_content(self, state: AIOralExamsetterGraphState, limit: int = 30000) -> str:
         file_path = str(state.get("current_template_file") or state.get("file_path") or "").strip()
         if not file_path:
             return ""
@@ -993,7 +988,7 @@ class AIOralExamsetter:
         max_chars = max(0, int(limit or 0))
         return content[:max_chars] if max_chars else content
 
-    async def plan_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def plan_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         reviewer = self.new_reviewer(state)
         original_path = str(state.get("current_source_template_file") or "")
         generated_path = str(state.get("current_template_file") or state.get("file_path") or "")
@@ -1017,7 +1012,7 @@ class AIOralExamsetter:
             state["error"] = result
         return state
 
-    async def run_with_runner_agent(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def run_with_runner_agent(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         current_file = str(
             state.get("current_template_file") or state.get("file_path") or ""
         ).strip()
@@ -1047,18 +1042,34 @@ class AIOralExamsetter:
             "scope": str(state.get("folder_path") or ""),
             "expected_result": "The current template is completed while preserving valid existing content.",
         }
+        if state.get("needs_core_question_tool"):
+            current_step["direction"] += (
+                " If this template module provides oral-exam questions, call fillAQuestions "
+                "with A-mode question objects before finishing."
+            )
 
-        core_module_records = []
+        core_module_records: dict[str, dict[str, Any]] = {}
+        a_mode_questions: list[dict[str, Any]] = []
+
+        @tool("listCoreModules", description="Show current in-run core module record count, names, and related evidence.")
+        async def listCoreModules() -> str:
+            result = {
+                "ok": True,
+                "flag": "CORE_MODULE_STATE",
+                **self.core_module_state_snapshot(core_module_records),
+            }
+            print(f"listCoreModules: {result}")
+            return json.dumps(result, ensure_ascii=False)
 
         @tool(
             args_schema=CoreModuleVariableInput,
             description=(
-                "Report and fill one completed core module into module_table. "
-                "Call this once for each confirmed core module, with evidence references."
+                "Record one confirmed core module and its evidence references. "
+                "Call this once for each confirmed core module record. "
+                "The return value includes the current record count and evidence state."
             ),
         )
-        async def fillCoreModuleVariable(
-            target_field: str = "module_table",
+        async def fillCoreModule(
             module_name: str = "",
             module_function: str = "",
             completion_quality: str = "",
@@ -1066,39 +1077,98 @@ class AIOralExamsetter:
             authenticity: str = "suspicious",
             document_refs: list[CoreModuleDocumentRef] | None = None,
         ) -> str:
+            print(f"fillCoreModule: {module_name}, {module_function}, {completion_quality}, {development_process}, {authenticity}, {document_refs}")
+            authenticity_value = str(authenticity or "").strip()
+            if authenticity_value not in {"real", "suspicious", "abnormal"}:
+                authenticity_value = "suspicious"
             payload = CoreModuleVariableInput(
-                target_field=target_field,
                 module_name=module_name,
                 module_function=module_function,
                 completion_quality=completion_quality,
                 development_process=development_process,
-                authenticity=authenticity,
+                authenticity=authenticity_value,
                 document_refs=document_refs or [],
             )
-            try:
-                result = self.fill_core_module_table_row(current_file, payload)
-            except OSError as exc:
+            result = {
+                "ok": True,
+                "flag": "CORE_MODULE_RECORD_READY",
+                "module_name": module_name,
+                "document_ref_count": len(document_refs or []),
+            }
+            if not self.core_module_record_key(module_name):
                 result = {
                     "ok": False,
-                    "flag": "CORE_MODULE_FILL_FAILED",
-                    "module_name": module_name,
-                    "error_message": str(exc),
+                    "flag": "CORE_MODULE_RECORD_KEY_EMPTY",
+                    "message": "module_name is required before recording a core module.",
+                    **self.core_module_state_snapshot(core_module_records),
                 }
-            if result.get("ok"):
-                core_module_records.append(
-                    {
-                        "module": payload.dict(),
-                        "tool_result": result,
-                    }
-                )
+                return json.dumps(result, ensure_ascii=False)
+            _, created = self.upsert_current_core_module_record(
+                core_module_records,
+                payload,
+                result,
+            )
+            result = {
+                **result,
+                "flag": "CORE_MODULE_RECORD_CREATED" if created else "CORE_MODULE_RECORD_UPDATED",
+                **self.core_module_state_snapshot(core_module_records),
+            }
+            return json.dumps(result, ensure_ascii=False)
+
+        @tool(
+            args_schema=CoreModuleDocumentAppendInput,
+            description=(
+                "Append documents, code, or Git evidence to an existing core module record. "
+                "Use listCoreModules first if you are unsure which records exist."
+            ),
+        )
+        async def addCoreModuleDocument(
+            module_name: str = "",
+            document_refs: list[CoreModuleDocumentRef] | None = None,
+        ) -> str:
+            print(f"addCoreModuleDocument: {module_name}, {document_refs}")
+            record = self.append_current_core_module_documents(
+                core_module_records,
+                module_name,
+                document_refs or [],
+            )
+            if record is None:
+                result = {
+                    "ok": False,
+                    "flag": "CORE_MODULE_RECORD_NOT_FOUND",
+                    "module_name": module_name,
+                    "message": "Call fillCoreModule before adding documents to this record.",
+                    **self.core_module_state_snapshot(core_module_records),
+                }
+                return json.dumps(result, ensure_ascii=False)
+            result = {
+                "ok": True,
+                "flag": "CORE_MODULE_RECORD_DOCUMENT_ADDED",
+                "module_name": module_name,
+                **self.core_module_state_snapshot(core_module_records),
+            }
+            return json.dumps(result, ensure_ascii=False)
+
+        @tool(
+            "fillAQuestions",
+            args_schema=AModeQuestionSetInput,
+            description="Record A-mode prepared oral-exam questions produced by the A setter.",
+        )
+        async def fillAQuestions(questions: list[dict[str, Any]] | None = None) -> str:
+            normalized = self.normalize_a_mode_question_list(questions or [])
+            a_mode_questions[:] = normalized
+            result = {
+                "ok": True,
+                "flag": "A_MODE_QUESTIONS_RECORDED",
+                "question_count": len(a_mode_questions),
+            }
             return json.dumps(result, ensure_ascii=False)
 
         runner_extra_tools = list(self.extra_tools)
         runner_outerprompt = ""
         if state.get("needs_core_question_tool"):
-            runner_extra_tools.append(fillCoreModuleVariable)
+            runner_extra_tools.extend([listCoreModules, fillCoreModule, addCoreModuleDocument, fillAQuestions])
             runner_outerprompt = self.build_core_module_outerprompt()
-
         runner = FileRunnerAgent(
             self.model_settings,
             thinking=self.thinking,
@@ -1110,7 +1180,8 @@ class AIOralExamsetter:
             outerprompt=runner_outerprompt,
             allowed_scope_root=state.get("folder_path"),
             extra_allowed_roots=[state.get("template_work_dir", "")],
-            show_tool_io=True,
+            show_tool_io=False,
+            tool_event_callback=self.tool_event_callback,
         )
         reviewer = self.new_reviewer(state)
         source_file = str(state.get("current_source_template_file") or "").strip()
@@ -1135,7 +1206,6 @@ class AIOralExamsetter:
         review_result = {}
         max_attempts = 2
         for attempt in range(max_attempts):
-            core_module_records = []
             runner_result = await runner.execute(current_step)
             runner_summary = str(runner_result or "").strip()
             if runner_summary:
@@ -1197,28 +1267,27 @@ class AIOralExamsetter:
             }
             return state
 
-        if core_module_records and state.get("needs_core_question_tool"):
-            try:
-                question_sets = await self.generate_core_question_sets(state, core_module_records)
-                if question_sets:
-                    final_content = self.append_core_question_sets_to_document(
-                        current_file,
-                        final_content,
-                        question_sets,
-                    )
-                    state["core_question_sets"] = question_sets
-                    runner_summaries.append(
-                        f"Generated oral exam questions for {len(question_sets)} core modules."
-                    )
-            except Exception as exc:
-                state["status"] = "failed"
-                state["error"] = {
-                    "flag": "CORE_QUESTION_GENERATION_FAILED",
-                    "error_class": exc.__class__.__name__,
-                    "error_message": str(exc),
-                    "template_file": current_file,
-                }
-                return state
+        if core_module_records:
+            for record in core_module_records.values():
+                if not isinstance(record, dict):
+                    continue
+                record["template_module_key"] = str(state.get("current_template_module_key") or "")
+                record["provides_questions"] = bool(state.get("current_template_provides_questions"))
+            state["core_module_records"] = self.merge_core_module_record_maps(
+                state.get("core_module_records") or {},
+                core_module_records,
+            )
+            runner_summaries.append(
+                f"Collected {len(core_module_records)} core module records."
+            )
+        if a_mode_questions:
+            state["questions"] = self.merge_a_mode_question_lists(
+                state.get("questions") or [],
+                a_mode_questions,
+            )
+            runner_summaries.append(
+                f"Collected {len(a_mode_questions)} A-mode questions."
+            )
         marker_index = final_content.find("--ps--")
         if marker_index >= 0:
             try:
@@ -1246,6 +1315,8 @@ class AIOralExamsetter:
                 "summary": "\n".join(runner_summaries).strip(),
                 "review_summary": str(review_result.get("reason") or "review passed").strip(),
                 "needs_core_question_tool": bool(state.get("needs_core_question_tool")),
+                "core_module_record_count": len(core_module_records),
+                "a_mode_question_count": len(a_mode_questions),
             }
         )
         state["plan"] = []
@@ -1254,7 +1325,7 @@ class AIOralExamsetter:
         state["status"] = "chapter_done"
         return await self.save_chapter_history_node(state)
 
-    def build_runner_state(self, state: FileReadGraphState, current_step: dict[str, Any]) -> FileReadGraphState:
+    def build_runner_state(self, state: AIOralExamsetterGraphState, current_step: dict[str, Any]) -> dict[str, Any]:
         """Build the minimal state passed to FileRunnerAgent."""
         return {
             "user_requirement": state.get("user_requirement", ""),
@@ -1263,14 +1334,14 @@ class AIOralExamsetter:
             "file_path": state.get("file_path"),
         }
 
-    async def finalize_node(self, state: FileReadGraphState) -> FileReadGraphState:
+    async def finalize_node(self, state: AIOralExamsetterGraphState) -> AIOralExamsetterGraphState:
         final_answer = self.build_final_answer(state)
         previous_status = str(state.get("status") or "")
         state["final_answer"] = final_answer
         state["status"] = "failed" if previous_status == "failed" else "done"
         return state
 
-    def route_after_plan(self, state: FileReadGraphState) -> str:
+    def route_after_plan(self, state: AIOralExamsetterGraphState) -> str:
         if state.get("status") == "failed":
             return "finalize"
         return 'runner' if state.get('plan') else 'merge_templates'
@@ -1286,7 +1357,7 @@ class AIOralExamsetter:
             return []
         return [step for step in steps if isinstance(step, dict)]
 
-    def build_final_answer(self, state: FileReadGraphState) -> dict:
+    def build_final_answer(self, state: AIOralExamsetterGraphState) -> dict:
         summaries = []
         existing_final = state.get("final_answer") if isinstance(state.get("final_answer"), dict) else {}
         if existing_final.get("answer"):
@@ -1311,14 +1382,21 @@ class AIOralExamsetter:
             "finish_reason": str(state.get("finish_reason") or "").strip(),
             "report_path": str(state.get("report_path") or ""),
             "merged_report_path": str(state.get("merged_report_path") or ""),
+            "core_module_records": state.get("core_module_records") or {},
+            "questions": state.get("questions") or [],
         }
 
-    def new_reviewer(self, state: FileReadGraphState | None = None) -> ReviewerAgent:
+    def new_reviewer(self, state: AIOralExamsetterGraphState | None = None) -> ReviewerAgent:
         return ReviewerAgent(
             self.model_settings,
             thinking=self.thinking,
             response_format=self.response_format,
             temperature=self.temperature
         )
+
+
+
+
+
 
 

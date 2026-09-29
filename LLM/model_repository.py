@@ -1,11 +1,13 @@
-import asyncio
+﻿import asyncio
 import json
 import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from .config import MODEL_STATUS_ACTIVE, MODEL_TABLE_NAME
+from .model_token_limits import get_model_token_limits
 from .schema import create_llm_tables
+from .config import MODEL_TYPE_DEFAULT, MODEL_TYPES
 
 
 async def create_user_model(
@@ -18,6 +20,7 @@ async def create_user_model(
     provider_model_key: Optional[str] = None,
     params: Optional[Dict[str, object]] = None,
     last_test_result: Optional[Dict[str, object]] = None,
+    model_type: str = MODEL_TYPE_DEFAULT,
 ) -> Dict[str, object]:
     return await asyncio.to_thread(
         _create_user_model_sync,
@@ -30,11 +33,21 @@ async def create_user_model(
         provider_model_key,
         params,
         last_test_result,
+        model_type,
     )
 
 
-async def list_user_models(owner_user_id: str, include_api_key: bool = False) -> List[Dict[str, object]]:
-    return await asyncio.to_thread(_list_user_models_sync, owner_user_id, include_api_key)
+async def list_user_models(
+    owner_user_id: str,
+    include_api_key: bool = False,
+    model_type: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    return await asyncio.to_thread(
+        _list_user_models_sync,
+        owner_user_id,
+        include_api_key,
+        model_type,
+    )
 
 
 async def get_user_model(
@@ -64,17 +77,22 @@ def _create_user_model_sync(
     provider_model_key: Optional[str],
     params: Optional[Dict[str, object]],
     last_test_result: Optional[Dict[str, object]],
+    model_type: str,
 ) -> Dict[str, object]:
     connect, ensure_database = _load_database_helpers()
     ensure_database()
     owner_user_id = _normalize_required_text(owner_user_id, "OWNER_USER_ID_REQUIRED")
     model_name = _normalize_required_text(model_name, "MODEL_NAME_REQUIRED")
     model_api_key = _normalize_required_text(model_api_key, "MODEL_API_KEY_REQUIRED")
+    model_type = _normalize_model_type(model_type)
     provider = _normalize_optional_text(provider)
     base_url = _normalize_optional_text(base_url)
     display_name = _normalize_optional_text(display_name)
     provider_model_key = _normalize_optional_text(provider_model_key)
-    params_json = _json_dumps(params or {})
+    normalized_params = dict(params or {})
+    for key, value in get_model_token_limits(model_name).items():
+        normalized_params.setdefault(key, value)
+    params_json = _json_dumps(normalized_params)
     last_test_result_json = _json_dumps(last_test_result or {})
     model_id = str(uuid.uuid4())
     now = _now()
@@ -88,6 +106,7 @@ def _create_user_model_sync(
                     model_id,
                     owner_user_id,
                     model_name,
+                    model_type,
                     model_api_key,
                     provider,
                     provider_model_key,
@@ -98,12 +117,13 @@ def _create_user_model_sync(
                     status,
                     created_at,
                     updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     model_id,
                     owner_user_id,
                     model_name,
+                    model_type,
                     model_api_key,
                     provider,
                     provider_model_key,
@@ -125,10 +145,19 @@ def _create_user_model_sync(
         connection.close()
 
 
-def _list_user_models_sync(owner_user_id: str, include_api_key: bool = False) -> List[Dict[str, object]]:
+def _list_user_models_sync(
+    owner_user_id: str,
+    include_api_key: bool = False,
+    model_type: Optional[str] = None,
+) -> List[Dict[str, object]]:
     connect, ensure_database = _load_database_helpers()
     ensure_database()
     owner_user_id = _normalize_required_text(owner_user_id, "OWNER_USER_ID_REQUIRED")
+    normalized_model_type = _normalize_model_type(model_type) if model_type is not None else None
+    model_type_filter = "AND model_type = %s" if normalized_model_type else ""
+    query_params = [owner_user_id, MODEL_STATUS_ACTIVE]
+    if normalized_model_type:
+        query_params.append(normalized_model_type)
     connection = connect(use_database=True)
     try:
         with connection.cursor() as cursor:
@@ -139,6 +168,7 @@ def _list_user_models_sync(owner_user_id: str, include_api_key: bool = False) ->
                     model_id,
                     owner_user_id,
                     model_name,
+                    model_type,
                     model_api_key,
                     provider,
                     provider_model_key,
@@ -152,9 +182,10 @@ def _list_user_models_sync(owner_user_id: str, include_api_key: bool = False) ->
                 FROM {MODEL_TABLE_NAME}
                 WHERE owner_user_id = %s
                   AND status = %s
+                  {model_type_filter}
                 ORDER BY created_at DESC
                 """,
-                (owner_user_id, MODEL_STATUS_ACTIVE),
+                tuple(query_params),
             )
             return [model_row_to_dict(row, include_api_key) for row in cursor.fetchall()]
     finally:
@@ -185,6 +216,7 @@ def _get_user_model_sync(
                     model_id,
                     owner_user_id,
                     model_name,
+                    model_type,
                     model_api_key,
                     provider,
                     provider_model_key,
@@ -226,6 +258,7 @@ def _delete_user_model_sync(model_id: str, owner_user_id: str) -> bool:
                   AND owner_user_id = %s
                   AND status = %s
                 LIMIT 1
+                FOR UPDATE
                 """,
                 (model_id, owner_user_id, MODEL_STATUS_ACTIVE),
             )
@@ -289,7 +322,7 @@ def model_row_to_dict(row, include_api_key: bool) -> Dict[str, object]:
             "created_at",
             "updated_at",
         )
-    else:
+    elif len(row) == 13:
         fields = (
             "model_id",
             "owner_user_id",
@@ -305,7 +338,25 @@ def model_row_to_dict(row, include_api_key: bool) -> Dict[str, object]:
             "created_at",
             "updated_at",
         )
+    else:
+        fields = (
+            "model_id",
+            "owner_user_id",
+            "model_name",
+            "model_type",
+            "model_api_key",
+            "provider",
+            "provider_model_key",
+            "base_url",
+            "display_name",
+            "params_json",
+            "last_test_result_json",
+            "status",
+            "created_at",
+            "updated_at",
+        )
     result = dict(zip(fields, row))
+    result.setdefault("model_type", MODEL_TYPE_DEFAULT)
     if "params_json" in result:
         result["params"] = _json_loads(result.pop("params_json"), {})
     if "last_test_result_json" in result:
@@ -317,6 +368,13 @@ def model_row_to_dict(row, include_api_key: bool) -> Dict[str, object]:
         if value is not None:
             result[key] = value.strftime("%Y-%m-%d %H:%M:%S")
     return result
+
+
+def _normalize_model_type(value) -> str:
+    model_type = (_normalize_optional_text(value) or MODEL_TYPE_DEFAULT).lower()
+    if model_type not in MODEL_TYPES:
+        raise ValueError("MODEL_TYPE_INVALID")
+    return model_type
 
 
 def _normalize_required_text(value, error_code: str) -> str:

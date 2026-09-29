@@ -1,7 +1,7 @@
-import json
+﻿import json
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -33,7 +33,7 @@ class QuestionSetterReadInput(BaseModel):
 
 
 class QuestionSetterAgent(BaseAgent):
-    """根据模块内容和文档证据生成用于口试核验的分级问题。"""
+    """根据模块内容和文档证据生成用于口试核验的问题。"""
 
     def __init__(
         self,
@@ -43,6 +43,7 @@ class QuestionSetterAgent(BaseAgent):
         response_format: bool = True,
         temperature: float = 0,
         show_tool_io: bool = False,
+        tool_event_callback: Callable[[str], None] | None = None,
     ):
         self.document_scope = self.resolve_document_scope(document_scope)
         super().__init__(
@@ -52,6 +53,7 @@ class QuestionSetterAgent(BaseAgent):
             response_format=response_format,
             temperature=temperature,
             show_tool_io=show_tool_io,
+            tool_event_callback=tool_event_callback,
         )
         self.system_prompt = self.build_system_prompt()
 
@@ -72,23 +74,19 @@ class QuestionSetterAgent(BaseAgent):
     def build_system_prompt(self) -> str:
         return """
 ## 角色
-你是口试出题者，负责根据项目模块内容和相关文档证据生成问题，用来判断模块是否由学生本人实现，并围绕最重要知识点进行分级追问。
+你是口试出题者，负责根据项目模块内容和相关文档证据生成问题，用来判断模块是否由学生本人实现，并考察学生对核心实现和关键知识点的理解。
 
 ## 可用工具
 - docInfoSearch：只能在系统绑定的文档范围内搜索相关材料。
 - docReadFile：只能读取系统绑定文档范围内的文件或行区间。
 
 ## 工作要求
-1. 必须围绕输入模块生成问题，不要泛泛问概念。
+1. 必须围绕输入模块生成问题，题目贴合模块的具体实现和证据材料。
 2. 如果输入的模块内容或文档引用不足，先用 docInfoSearch/docReadFile 补充证据。
-3. 生成 1 个 implementation_question，用于判断学生是否亲自实现该模块。
-4. implementation_question 应关注关键流程、设计取舍、边界处理、调试细节或具体实现路径。
-5. 找出该模块中最重要的 1 个知识点，并说明理由。
-6. 围绕该知识点分别生成 easy、medium、hard 三个等级的问题，每个等级恰好 2 个。
-7. 每个问题只问一个核心点，不要连问，不要把多个问题合并成一句。
-8. 问题应能在口试中直接提问，避免在 question 字段泄露标准答案。
-9. 每个问题必须给出参考答案，参考答案用于教师阅卷或口试追问参考。
-10. 所有问题对象必须统一使用 {"question": "...", "Answer": "..."}，Answer 必须是字符串，不要使用数组。
+3. 为输入模块生成恰好 1 个口试问题，问题应优先围绕该模块最能体现本人实现、技术理解或质量边界的核心点。
+4. 每个问题只问一个核心点，题面适合口试中直接提问。
+5. 每个问题必须给出参考答案，参考答案用于教师阅卷或口试追问参考。
+6. 问题对象使用 {"aspect": "...", "question": "...", "Answer": "...", "source": [...]}。aspect 可从 implementation_authenticity、technical_understanding、quality_and_extension 中选择最适合的一项；source 是证据引用列表，格式为 [{"file_path": "...", "start_line": 1, "end_line": 10}]；没有可用证据时使用空列表。
 
 ## 输出
 只返回 JSON 对象：
@@ -96,33 +94,14 @@ class QuestionSetterAgent(BaseAgent):
   "ok": true,
   "flag": "QUESTION_SET_GENERATED",
   "module_name": "模块名称",
-  "implementation_question": {
-    "question": "用于判断是否本人实现的问题",
-    "Answer": "参考答案"
-  },
-  "key_knowledge_point": {
-    "name": "最重要知识点",
-    "reason": "选择理由"
-  },
-  "leveled_questions": {
-    "easy": [
-      {"question": "简单问题1", "Answer": "参考答案1"},
-      {"question": "简单问题2", "Answer": "参考答案2"}
-    ],
-    "medium": [
-      {"question": "一般问题1", "Answer": "参考答案1"},
-      {"question": "一般问题2", "Answer": "参考答案2"}
-    ],
-    "hard": [
-      {"question": "困难问题1", "Answer": "参考答案1"},
-      {"question": "困难问题2", "Answer": "参考答案2"}
-    ]
-  },
-  "evidence": [
+  "questions": [
     {
-      "file_path": "证据文件路径",
-      "line_number": 1,
-      "reason": "该证据支撑的问题或知识点"
+      "aspect": "implementation_authenticity",
+      "question": "围绕该核心模块最关键实现点的口试问题",
+      "Answer": "reference answer",
+      "source": [
+        {"file_path": "path/to/evidence.py", "start_line": 1, "end_line": 10}
+      ]
     }
   ],
   "missing_information": []
@@ -203,9 +182,7 @@ class QuestionSetterAgent(BaseAgent):
                 "ok": False,
                 "flag": "QUESTION_SET_FAILED",
                 "module_name": str(module_name or "").strip(),
-                "implementation_question": {},
-                "key_knowledge_point": {},
-                "leveled_questions": {"easy": [], "medium": [], "hard": []},
+                "questions": [],
                 "evidence": [],
                 "missing_information": [],
                 "error_class": exc.__class__.__name__,
@@ -273,21 +250,39 @@ class QuestionSetterAgent(BaseAgent):
         return data
 
     def normalize_question_set(self, data: dict, module_name: str) -> dict:
-        levels = data.get("leveled_questions") if isinstance(data.get("leveled_questions"), dict) else {}
+        questions = data.get("questions")
+        if not isinstance(questions, list):
+            questions = data.get("aspect_questions")
         return {
             "ok": bool(data.get("ok", True)),
             "flag": str(data.get("flag") or "QUESTION_SET_GENERATED"),
             "module_name": str(data.get("module_name") or module_name or "").strip(),
-            "implementation_question": self.normalize_question_item(data.get("implementation_question")),
-            "key_knowledge_point": self.normalize_knowledge_point(data.get("key_knowledge_point")),
-            "leveled_questions": {
-                "easy": self.normalize_question_list(levels.get("easy"), limit=2),
-                "medium": self.normalize_question_list(levels.get("medium"), limit=2),
-                "hard": self.normalize_question_list(levels.get("hard"), limit=2),
-            },
+            "questions": self.normalize_aspect_question_list(questions, limit=1),
             "evidence": self.normalize_evidence(data.get("evidence")),
             "missing_information": self.normalize_text_list(data.get("missing_information")),
         }
+
+    def normalize_aspect_question_list(self, value: Any, limit: int) -> list[dict]:
+        if not isinstance(value, list):
+            return []
+        questions = []
+        for item in value[:limit]:
+            question = self.normalize_aspect_question_item(item)
+            if question.get("question"):
+                questions.append(question)
+        return questions
+
+    def normalize_aspect_question_item(self, value: Any) -> dict:
+        item = self.normalize_question_item(value)
+        if isinstance(value, dict):
+            aspect = str(value.get("aspect") or value.get("dimension") or "").strip()
+            source_value = value.get("source")
+        else:
+            aspect = ""
+            source_value = []
+        item["aspect"] = aspect
+        item["source"] = self.normalize_question_sources(source_value)
+        return item
 
     def normalize_question_item(self, value: Any) -> dict:
         if isinstance(value, str):
@@ -316,6 +311,66 @@ class QuestionSetterAgent(BaseAgent):
             "question": str(value.get("question") or "").strip(),
             "Answer": str(answer or "").strip(),
         }
+
+    def normalize_implementation_question(self, value: Any) -> dict:
+        item = self.normalize_question_item(value)
+        source_value = value.get("source") if isinstance(value, dict) else []
+        item["source"] = self.normalize_question_sources(source_value)
+        return item
+
+    def normalize_question_sources(self, value: Any) -> list[dict]:
+        if isinstance(value, dict):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+
+        sources = []
+        seen = set()
+        for item in value:
+            source = self.normalize_question_source(item)
+            if not source:
+                continue
+            key = (source["file_path"], source["start_line"], source["end_line"])
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(source)
+        return sources
+
+    def normalize_question_source(self, value: Any) -> dict | None:
+        if not isinstance(value, dict):
+            return None
+
+        file_path = str(value.get("file_path") or value.get("path") or "").strip()
+        start_line = self.normalize_line_number(
+            value.get("start_line")
+            or value.get("line_start")
+            or value.get("line_number")
+            or value.get("line")
+        )
+        end_line = self.normalize_line_number(
+            value.get("end_line")
+            or value.get("line_end")
+            or value.get("line_number")
+            or value.get("line")
+        )
+        if start_line is not None and end_line is None:
+            end_line = start_line
+        if end_line is not None and start_line is None:
+            start_line = end_line
+        if start_line is not None and end_line is not None and end_line < start_line:
+            start_line, end_line = end_line, start_line
+        if not file_path and start_line is None and end_line is None:
+            return None
+
+        return {"file_path": file_path, "start_line": start_line, "end_line": end_line}
+
+    def normalize_line_number(self, value: Any) -> int | None:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
 
     def normalize_question_list(self, value: Any, limit: int) -> list[dict]:
         if not isinstance(value, list):

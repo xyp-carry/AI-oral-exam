@@ -8,6 +8,10 @@ from LLM.model_repository import ensure_models_exist, model_row_to_dict
 
 from .connection import connect, ensure_database
 from .schema import ensure_tables
+from .exam_item_repository import ensure_exam_item_editable
+
+
+MODEL_INPUT_TOKEN_BUDGET_RATIO = 0.75
 
 
 async def upsert_exam_judge_config(
@@ -21,6 +25,9 @@ async def upsert_exam_judge_config(
     setter_model_id: Optional[str] = None,
     main_judger_model_id: Optional[str] = None,
     report_judger_model_id: Optional[str] = None,
+    mineru_model_id: Optional[str] = None,
+    embedding_model_id: Optional[str] = None,
+    clear_optional_roles: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     return await asyncio.to_thread(
         _upsert_exam_judge_config_sync,
@@ -34,6 +41,9 @@ async def upsert_exam_judge_config(
         setter_model_id,
         main_judger_model_id,
         report_judger_model_id,
+        mineru_model_id,
+        embedding_model_id,
+        clear_optional_roles,
     )
 
 
@@ -49,6 +59,32 @@ async def upsert_exam_report_model_config(
         created_by,
         report_judger_model_id,
         model_settings,
+    )
+
+
+async def upsert_exam_optional_agent_models(
+    exam_item_id: str,
+    created_by: str,
+    model_ids_by_role: Dict[str, Optional[str]],
+) -> Dict[str, object]:
+    return await asyncio.to_thread(
+        _upsert_exam_optional_agent_models_sync,
+        exam_item_id,
+        created_by,
+        model_ids_by_role,
+    )
+
+
+async def upsert_exam_rag_model_config(
+    exam_item_id: str,
+    created_by: str,
+    mineru_model_id: str,
+    embedding_model_id: str,
+) -> Dict[str, object]:
+    return await upsert_exam_optional_agent_models(
+        exam_item_id,
+        created_by,
+        {"mineru": mineru_model_id, "embedding": embedding_model_id},
     )
 
 
@@ -85,6 +121,9 @@ def _upsert_exam_judge_config_sync(
     setter_model_id: Optional[str],
     main_judger_model_id: Optional[str],
     report_judger_model_id: Optional[str],
+    mineru_model_id: Optional[str],
+    embedding_model_id: Optional[str],
+    clear_optional_roles: Optional[List[str]],
 ) -> Dict[str, object]:
     ensure_database()
     exam_item_id = _normalize_required_text(exam_item_id, "EXAM_ITEM_ID_REQUIRED")
@@ -96,6 +135,15 @@ def _upsert_exam_judge_config_sync(
     setter_model_id = _normalize_optional_text(setter_model_id)
     main_judger_model_id = _normalize_optional_text(main_judger_model_id)
     report_judger_model_id = _normalize_optional_text(report_judger_model_id)
+    mineru_model_id = _normalize_optional_text(mineru_model_id)
+    embedding_model_id = _normalize_optional_text(embedding_model_id)
+    clear_optional_roles = list(clear_optional_roles or [])
+    if set(clear_optional_roles) - {"mineru", "embedding"}:
+        raise ValueError("AGENT_ROLE_INVALID")
+    if ("mineru" in clear_optional_roles and mineru_model_id) or (
+        "embedding" in clear_optional_roles and embedding_model_id
+    ):
+        raise ValueError("AGENT_ROLE_INVALID")
     model_settings_by_agent = model_settings_by_agent or {}
     config_id = str(uuid.uuid4())
     now = _now()
@@ -112,6 +160,8 @@ def _upsert_exam_judge_config_sync(
                     + ([setter_model_id] if setter_model_id else [])
                     + ([main_judger_model_id] if main_judger_model_id else [])
                     + ([report_judger_model_id] if report_judger_model_id else [])
+                    + ([mineru_model_id] if mineru_model_id else [])
+                    + ([embedding_model_id] if embedding_model_id else [])
                 ),
                 created_by,
             )
@@ -163,6 +213,11 @@ def _upsert_exam_judge_config_sync(
             roles_to_replace = ["scorer", "adjudicator", "setter", "main_judger"]
             if report_judger_model_id:
                 roles_to_replace.append("report_judger")
+            if mineru_model_id:
+                roles_to_replace.append("mineru")
+            if embedding_model_id:
+                roles_to_replace.append("embedding")
+            roles_to_replace.extend(clear_optional_roles)
             cursor.execute(
                 f"""
                 DELETE FROM exam_judge_config_agents
@@ -219,6 +274,26 @@ def _upsert_exam_judge_config_sync(
                     0,
                     report_judger_model_id,
                     model_settings_by_agent.get("report_judger"),
+                    now,
+                )
+            if mineru_model_id:
+                _insert_config_agent(
+                    cursor,
+                    active_config_id,
+                    "mineru",
+                    0,
+                    mineru_model_id,
+                    model_settings_by_agent.get("mineru"),
+                    now,
+                )
+            if embedding_model_id:
+                _insert_config_agent(
+                    cursor,
+                    active_config_id,
+                    "embedding",
+                    0,
+                    embedding_model_id,
+                    model_settings_by_agent.get("embedding"),
                     now,
                 )
         connection.commit()
@@ -314,6 +389,92 @@ def _upsert_exam_report_model_config_sync(
         connection.close()
 
 
+def _upsert_exam_optional_agent_models_sync(
+    exam_item_id: str,
+    created_by: str,
+    model_ids_by_role: Dict[str, Optional[str]],
+) -> Dict[str, object]:
+    if not model_ids_by_role or set(model_ids_by_role) - {"mineru", "embedding"}:
+        raise ValueError("AGENT_ROLE_INVALID")
+    ensure_database()
+    exam_item_id = _normalize_required_text(exam_item_id, "EXAM_ITEM_ID_REQUIRED")
+    created_by = _normalize_required_text(created_by, "CREATED_BY_REQUIRED")
+    normalized_models = {
+        role: _normalize_required_text(model_id, "MODEL_ID_REQUIRED")
+        if model_id is not None else None
+        for role, model_id in model_ids_by_role.items()
+    }
+    model_ids = [model_id for model_id in normalized_models.values() if model_id]
+    now = _now()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            _ensure_exam_item_exists(cursor, exam_item_id)
+            if model_ids:
+                ensure_models_exist(cursor, model_ids, created_by)
+            cursor.execute(
+                """
+                SELECT config_id
+                FROM exam_judge_configs
+                WHERE exam_item_id = %s
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (exam_item_id,),
+            )
+            existing_config = cursor.fetchone()
+            if not existing_config and not model_ids:
+                connection.commit()
+                return {}
+            if model_ids:
+                config_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO exam_judge_configs (
+                        config_id, exam_item_id, flow_type, judge_count,
+                        adjudicator_enabled, fail_policy, status, created_by,
+                        created_at, updated_at
+                    ) VALUES (%s, %s, 'single', 0, 0, 'majority', 'active', %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        status = 'active',
+                        updated_at = VALUES(updated_at)
+                    """,
+                    (config_id, exam_item_id, created_by, now, now),
+                )
+                cursor.execute(
+                    "SELECT config_id FROM exam_judge_configs WHERE exam_item_id = %s",
+                    (exam_item_id,),
+                )
+                active_config_id = cursor.fetchone()[0]
+            else:
+                active_config_id = existing_config[0]
+                cursor.execute(
+                    "UPDATE exam_judge_configs SET updated_at = %s WHERE config_id = %s",
+                    (now, active_config_id),
+                )
+
+            for role, model_id in normalized_models.items():
+                cursor.execute(
+                    """
+                    DELETE FROM exam_judge_config_agents
+                    WHERE config_id = %s AND agent_role = %s
+                    """,
+                    (active_config_id, role),
+                )
+                if model_id:
+                    _insert_config_agent(
+                        cursor, active_config_id, role, 0, model_id, None, now,
+                    )
+        connection.commit()
+        return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def _get_exam_judge_config_by_exam_item_sync(
     exam_item_id: str,
     include_api_key: bool = True,
@@ -394,6 +555,7 @@ def _fetch_exam_judge_config_by_exam_item(
             m.model_id,
             m.owner_user_id,
             m.model_name,
+            m.model_type,
             m.model_api_key,
             m.provider,
             m.provider_model_key,
@@ -419,6 +581,8 @@ def _fetch_exam_judge_config_by_exam_item(
     setter = None
     main_judger = None
     report_judger = None
+    mineru = None
+    embedding = None
     for row in cursor.fetchall():
         agent = _agent_row_to_dict(row, include_api_key)
         agent_role = agent["agent_role"]
@@ -430,6 +594,10 @@ def _fetch_exam_judge_config_by_exam_item(
             main_judger = agent
         elif agent_role == "report_judger":
             report_judger = agent
+        elif agent_role == "mineru":
+            mineru = agent
+        elif agent_role == "embedding":
+            embedding = agent
         elif agent_role == "scorer":
             scorers.append(agent)
     config["scorers"] = scorers
@@ -437,6 +605,8 @@ def _fetch_exam_judge_config_by_exam_item(
     config["setter"] = setter
     config["main_judger"] = main_judger
     config["report_judger"] = report_judger
+    config["mineru"] = mineru
+    config["embedding"] = embedding
     return config
 
 
@@ -476,11 +646,12 @@ def _insert_config_agent(
 
 def _ensure_exam_item_exists(cursor, exam_item_id: str) -> None:
     cursor.execute(
-        "SELECT 1 FROM course_exam_items WHERE exam_item_id = %s AND status = 'active' LIMIT 1",
+        "SELECT 1 FROM course_exam_items WHERE exam_item_id = %s AND status = 'active' LIMIT 1 FOR UPDATE",
         (exam_item_id,),
     )
     if cursor.fetchone() is None:
         raise ValueError("EXAM_ITEM_NOT_FOUND")
+    ensure_exam_item_editable(cursor, exam_item_id)
 
 
 def _config_row_to_dict(row) -> Dict[str, object]:
@@ -513,6 +684,7 @@ def _agent_row_to_dict(row, include_api_key: bool) -> Dict[str, object]:
         model_id,
         owner_user_id,
         model_name,
+        model_type,
         model_api_key,
         provider,
         provider_model_key,
@@ -529,6 +701,7 @@ def _agent_row_to_dict(row, include_api_key: bool) -> Dict[str, object]:
             model_id,
             owner_user_id,
             model_name,
+            model_type,
             model_api_key,
             provider,
             provider_model_key,
@@ -566,7 +739,7 @@ def build_agent_model_settings(
     if isinstance(runtime_model_settings, dict):
         model_settings = dict(default_model_settings or {})
         model_settings.update(runtime_model_settings)
-        return model_settings
+        return _apply_token_budget_settings(model_settings)
 
     model = agent_config.get("model") or {}
     model_settings = dict(default_model_settings or {})
@@ -580,7 +753,31 @@ def build_agent_model_settings(
         model_settings["model_url"] = model["base_url"]
     if model.get("model_url"):
         model_settings["model_url"] = model["model_url"]
+    return _apply_token_budget_settings(model_settings)
+
+
+def _apply_token_budget_settings(model_settings: Dict[str, object]) -> Dict[str, object]:
+    max_context_tokens = _to_positive_int(model_settings.get("max_context_tokens"))
+    if not max_context_tokens:
+        return model_settings
+
+    safe_max_input_tokens = int(max_context_tokens * MODEL_INPUT_TOKEN_BUDGET_RATIO)
+    configured_max_input_tokens = _to_positive_int(model_settings.get("max_input_tokens"))
+    model_settings["max_context_tokens"] = max_context_tokens
+    model_settings["max_input_tokens"] = (
+        min(configured_max_input_tokens, safe_max_input_tokens)
+        if configured_max_input_tokens
+        else safe_max_input_tokens
+    )
     return model_settings
+
+
+def _to_positive_int(value) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def _normalize_model_ids(model_ids: List[str]) -> List[str]:

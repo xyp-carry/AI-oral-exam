@@ -1,6 +1,5 @@
 import asyncio
 import json
-import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -18,6 +17,7 @@ from .serializers import exam_item_row_to_dict
 
 async def create_exam_item(
     course_id: str,
+    exam_item_id: str,
     exam_item_name: str,
     created_by: str,
     dimension_scores: Dict[str, float],
@@ -33,6 +33,7 @@ async def create_exam_item(
     return await asyncio.to_thread(
         _create_exam_item_sync,
         course_id,
+        exam_item_id,
         exam_item_name,
         created_by,
         dimension_scores,
@@ -47,6 +48,10 @@ async def create_exam_item(
     )
 
 
+async def exam_item_id_exists(exam_item_id: str) -> bool:
+    return await asyncio.to_thread(_exam_item_id_exists_sync, exam_item_id)
+
+
 async def list_exam_items_by_course(course_id: str) -> List[Dict[str, object]]:
     return await asyncio.to_thread(_list_exam_items_by_course_sync, course_id)
 
@@ -55,8 +60,20 @@ async def get_exam_item_by_id(exam_item_id: str) -> Optional[Dict[str, object]]:
     return await asyncio.to_thread(_get_exam_item_by_id_sync, exam_item_id)
 
 
+async def get_exam_item_for_edit(
+    course_id: str, exam_item_id: str
+) -> Optional[Dict[str, object]]:
+    return await asyncio.to_thread(_get_exam_item_for_edit_sync, course_id, exam_item_id)
+
+
 async def get_exam_item_course_document_sources(course_id: str, exam_item_id: str) -> List[str]:
     return await asyncio.to_thread(_get_exam_item_course_document_sources_sync, course_id, exam_item_id)
+
+
+async def course_document_source_is_referenced(course_id: str, document_name: str) -> bool:
+    return await asyncio.to_thread(
+        _course_document_source_is_referenced_sync, course_id, document_name,
+    )
 
 
 async def add_exam_item_course_document_source(
@@ -141,6 +158,7 @@ async def delete_exam_item(course_id: str, exam_item_id: str) -> bool:
 
 def _create_exam_item_sync(
     course_id: str,
+    exam_item_id: str,
     exam_item_name: str,
     created_by: str,
     dimension_scores: Dict[str, float],
@@ -154,10 +172,10 @@ def _create_exam_item_sync(
     report_judge_rule: Optional[str],
 ) -> Dict[str, object]:
     ensure_database()
-    exam_item_id = str(uuid.uuid4())
+    exam_item_id = _normalize_exam_item_id(exam_item_id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     exam_item_name = _normalize_exam_item_name(exam_item_name)
-    dimension_scores = _normalize_dimension_scores(dimension_scores)
+    dimension_scores = _normalize_dimension_scores(dimension_scores, allow_empty=item_type == "C")
     dimension_names = list(dimension_scores.keys())
     total_score = float(sum(dimension_scores.values()))
     report_config = _normalize_report_analysis_config(
@@ -191,13 +209,15 @@ def _create_exam_item_sync(
                     enable_report_analysis,
                     report_total_score,
                     report_judge_rule,
+                    exam_available_valid_times,
                     exam_available_from,
                     exam_available_until,
                     status,
+                    version,
                     created_by,
                     created_at,
                     updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, 0, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, 0, %s, %s, %s, %s, %s, %s, %s, %s, 'active', 1, %s, %s, %s)
                 """,
                 (
                     exam_item_id,
@@ -213,6 +233,7 @@ def _create_exam_item_sync(
                     1 if report_config["enable_report_analysis"] else 0,
                     report_config["report_total_score"],
                     report_config["report_judge_rule"],
+                    valid_times,
                     exam_available_from,
                     exam_available_until,
                     created_by,
@@ -220,15 +241,9 @@ def _create_exam_item_sync(
                     now,
                 ),
             )
-        create_pending_exam_sessions_for_exam_item(
-            connection,
-            course_id,
-            exam_item_id,
-            exam_item_name=exam_item_name,
-            need_code_repository=need_code_repository,
-            use_preset_questions=use_preset_questions,
-            dimension_scores=dimension_scores,
-            total_score=total_score,
+        pending_session_count = create_pending_exam_sessions_for_exam_item(
+            connection, course_id, exam_item_id, exam_item_name,
+            need_code_repository, use_preset_questions, dimension_scores, total_score,
         )
         with connection.cursor() as cursor:
             cursor.execute(
@@ -246,11 +261,48 @@ def _create_exam_item_sync(
                 (exam_item_id,),
             )
             created_item = exam_item_row_to_dict(cursor.fetchone())
+            created_item["version"] = 1
+            created_item["pending_session_count"] = pending_session_count
+            created_item["exam_available_valid_times"] = valid_times
         connection.commit()
         return created_item
-    except Exception:
+    except Exception as error:
         connection.rollback()
+        if _is_duplicate_key_error(error):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM course_exam_items WHERE exam_item_id = %s LIMIT 1",
+                    (exam_item_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise ValueError("EXAM_ITEM_ID_EXISTS") from error
+                cursor.execute(
+                    """
+                    SELECT 1 FROM course_exam_items
+                    WHERE course_id = %s AND exam_item_name = %s AND status = 'active'
+                    LIMIT 1
+                    """,
+                    (course_id, exam_item_name),
+                )
+                if cursor.fetchone() is not None:
+                    raise ValueError("EXAM_ITEM_NAME_EXISTS") from error
         raise
+    finally:
+        connection.close()
+
+
+def _exam_item_id_exists_sync(exam_item_id: str) -> bool:
+    ensure_database()
+    exam_item_id = _normalize_exam_item_id(exam_item_id)
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM course_exam_items WHERE exam_item_id = %s LIMIT 1",
+                (exam_item_id,),
+            )
+            return cursor.fetchone() is not None
     finally:
         connection.close()
 
@@ -342,6 +394,67 @@ def _get_exam_item_by_id_sync(exam_item_id: str) -> Optional[Dict[str, object]]:
         connection.close()
 
 
+def _get_exam_item_for_edit_sync(
+    course_id: str, exam_item_id: str
+) -> Optional[Dict[str, object]]:
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    exam_item_id, course_id, exam_item_name, description, item_type,
+                    dimension_names_json, dimension_scores_json, total_score,
+                    participant_count, attempt_count, need_code_repository,
+                    use_preset_questions, enable_report_analysis, report_total_score,
+                    report_judge_rule, course_document_sources_json,
+                    exam_available_from, exam_available_until, status,
+                    created_by, created_at, updated_at, version,
+                    exam_available_valid_times
+                FROM course_exam_items
+                WHERE course_id = %s AND exam_item_id = %s AND status = 'active'
+                LIMIT 1
+                """,
+                (course_id, exam_item_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            item = exam_item_row_to_dict(row[:22])
+            item["version"] = int(row[22])
+            item["exam_available_valid_times"] = int(row[23])
+            return item
+    finally:
+        connection.close()
+
+
+def _course_document_source_is_referenced_sync(course_id: str, document_name: str) -> bool:
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT 1 FROM course_exam_items
+                WHERE course_id = %s AND status = 'active'
+                  AND JSON_CONTAINS(
+                      COALESCE(course_document_sources_json, JSON_ARRAY()),
+                      JSON_QUOTE(%s)
+                  )
+                LIMIT 1
+                """,
+                (course_id, document_name),
+            )
+            if cursor.fetchone() is not None:
+                return True
+            return False
+    finally:
+        connection.close()
+
+
 def _get_exam_item_course_document_sources_sync(course_id: str, exam_item_id: str) -> List[str]:
     ensure_database()
     connection = connect(use_database=True)
@@ -366,6 +479,7 @@ def _add_exam_item_course_document_source_sync(
         ensure_tables(connection)
         with connection.cursor() as cursor:
             sources = _select_course_document_sources(cursor, course_id, exam_item_id, lock=True)
+            ensure_exam_item_editable(cursor, exam_item_id)
             if document_name in sources:
                 raise ValueError("COURSE_DOCUMENT_SOURCE_EXISTS")
             sources.append(document_name)
@@ -404,6 +518,7 @@ def _remove_exam_item_course_document_source_sync(
         ensure_tables(connection)
         with connection.cursor() as cursor:
             sources = _select_course_document_sources(cursor, course_id, exam_item_id, lock=True)
+            ensure_exam_item_editable(cursor, exam_item_id)
             if document_name not in sources:
                 raise ValueError("COURSE_DOCUMENT_SOURCE_NOT_FOUND")
             sources = [source for source in sources if source != document_name]
@@ -539,6 +654,18 @@ def _reset_exam_item_availability_sync(
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                SELECT 1 FROM course_exam_items
+                WHERE exam_item_id = %s AND status = 'active'
+                FOR UPDATE
+                """,
+                (exam_item_id,),
+            )
+            if cursor.fetchone() is None:
+                connection.rollback()
+                return None
+            ensure_exam_item_editable(cursor, exam_item_id)
+            cursor.execute(
+                """
                 UPDATE course_exam_items
                 SET exam_available_from = %s,
                     exam_available_until = %s,
@@ -598,6 +725,23 @@ def _update_exam_item_sync(
         values = []
         updated_exam_item_name = None
         with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT status, item_type
+                FROM course_exam_items
+                WHERE course_id = %s
+                  AND exam_item_id = %s
+                  AND status = 'active'
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (course_id, exam_item_id),
+            )
+            state_row = cursor.fetchone()
+            if state_row is None:
+                return False
+            ensure_exam_item_editable(cursor, exam_item_id)
+            effective_item_type = item_type if item_type is not None else state_row[1]
             if exam_item_name is not None:
                 exam_item_name = _normalize_exam_item_name(exam_item_name)
                 _raise_if_exam_item_name_exists(cursor, course_id, exam_item_name, exclude_exam_item_id=exam_item_id)
@@ -650,24 +794,19 @@ def _update_exam_item_sync(
                     report_config["report_judge_rule"],
                 ])
             if exam_available_valid_times is not None:
-                try:
-                    valid_times = int(exam_available_valid_times)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("EXAM_AVAILABLE_VALID_TIMES_INVALID") from exc
-                if valid_times != 0:
-                    valid_times = _normalize_exam_available_valid_times(valid_times)
-                    set_clauses.extend([
-                        "exam_available_from = %s",
-                        "exam_available_until = %s",
-                    ])
-                    values.extend([
-                        now,
-                        (datetime.now() + timedelta(seconds=valid_times)).strftime("%Y-%m-%d %H:%M:%S"),
-                    ])
+                valid_times = _normalize_exam_available_valid_times(exam_available_valid_times)
+                set_clauses.append("exam_available_valid_times = %s")
+                values.append(valid_times)
+                set_clauses.extend(["exam_available_from = %s", "exam_available_until = %s"])
+                values.extend([
+                    now, (datetime.now() + timedelta(seconds=valid_times)).strftime("%Y-%m-%d %H:%M:%S"),
+                ])
             updated_dimension_scores = None
             updated_total_score = 0.0
             if dimension_scores is not None:
-                dimension_scores = _normalize_dimension_scores(dimension_scores)
+                dimension_scores = _normalize_dimension_scores(
+                    dimension_scores, allow_empty=effective_item_type == "C",
+                )
                 dimension_names = list(dimension_scores.keys())
                 updated_dimension_scores = dimension_scores
                 updated_total_score = float(sum(dimension_scores.values()))
@@ -683,7 +822,7 @@ def _update_exam_item_sync(
                 ])
             if not set_clauses:
                 return True
-            set_clauses.append("updated_at = %s")
+            set_clauses.extend(["version = version + 1", "updated_at = %s"])
             values.append(now)
             values.extend([course_id, exam_item_id])
             cursor.execute(
@@ -757,6 +896,18 @@ def _delete_exam_item_sync(course_id: str, exam_item_id: str) -> bool:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                SELECT 1 FROM course_exam_items
+                WHERE course_id = %s AND exam_item_id = %s AND status = 'active'
+                FOR UPDATE
+                """,
+                (course_id, exam_item_id),
+            )
+            if cursor.fetchone() is None:
+                connection.rollback()
+                return False
+            ensure_exam_item_editable(cursor, exam_item_id)
+            cursor.execute(
+                """
                 UPDATE course_exam_items
                 SET status = 'deleted',
                     updated_at = %s
@@ -776,6 +927,18 @@ def _delete_exam_item_sync(course_id: str, exam_item_id: str) -> bool:
         connection.close()
 
 
+def _normalize_exam_item_id(exam_item_id: str) -> str:
+    if not isinstance(exam_item_id, str) or len(exam_item_id) != 32:
+        raise ValueError("EXAM_ITEM_ID_INVALID")
+    if any(char not in "0123456789abcdef" for char in exam_item_id):
+        raise ValueError("EXAM_ITEM_ID_INVALID")
+    return exam_item_id
+
+
+def _is_duplicate_key_error(error: Exception) -> bool:
+    return bool(error.args and error.args[0] == 1062)
+
+
 def _normalize_exam_item_name(exam_item_name: str) -> str:
     exam_item_name = (exam_item_name or "").strip()
     if not exam_item_name:
@@ -783,8 +946,12 @@ def _normalize_exam_item_name(exam_item_name: str) -> str:
     return exam_item_name
 
 
-def _normalize_dimension_scores(dimension_scores: Dict[str, float]) -> Dict[str, float]:
+def _normalize_dimension_scores(
+    dimension_scores: Optional[Dict[str, float]], allow_empty: bool = False,
+) -> Dict[str, float]:
     if not dimension_scores:
+        if allow_empty:
+            return {}
         raise ValueError("EXAM_ITEM_DIMENSIONS_REQUIRED")
     normalized: Dict[str, float] = {}
     for name, score in dimension_scores.items():
@@ -939,6 +1106,24 @@ def _raise_if_exam_item_name_exists(
         )
     if cursor.fetchone() is not None:
         raise ValueError("EXAM_ITEM_NAME_EXISTS")
+
+
+def ensure_exam_item_editable(cursor, exam_item_id: str) -> None:
+    cursor.execute(
+        """
+        SELECT 1 FROM exam_sessions
+        WHERE exam_item_id = %s
+          AND (
+              (exam_completed = 0 AND exam_active_token IS NOT NULL
+               AND exam_active_until > NOW() - INTERVAL 10 MINUTE)
+              OR (repository_url IS NOT NULL AND TRIM(repository_url) <> '')
+          )
+        LIMIT 1
+        """,
+        (exam_item_id,),
+    )
+    if cursor.fetchone() is not None:
+        raise ValueError("EXAM_IN_PROGRESS")
 
 
 def _to_json(value) -> str:

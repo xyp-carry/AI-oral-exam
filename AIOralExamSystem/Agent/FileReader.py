@@ -1,9 +1,8 @@
 import json
 import re
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional, TypedDict
+from typing import Any, Callable, Literal, Optional, TypedDict
 
 from AIOralExamSystem.Agent.base_Agent import BaseAgent
 from AIOralExamSystem.Tool.git.git_tool import (
@@ -24,7 +23,6 @@ from pydantic import BaseModel, Field
 
 FilePlanAction = Literal["read_indexed_chunks", "info_search", "file_read", "folder_tree"]
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "template"
-REPORT_TEMPLATE_NAME = "report_demo.md"
 DEFAULT_REPORT_NAME = "report.md"
 TOOL_CALL_INPUT_LOG_PATH = Path("/root/AI-Oral-exam/tool_call_inputs.jsonl")
 
@@ -69,8 +67,6 @@ class FileReadGraphState(TypedDict, total=False):
     status: str
     error: dict[str, Any] | None
     review_result: dict[str, Any] | None
-    needs_core_question_tool: bool
-    core_question_sets: list[dict[str, Any]]
     file_not_found_replanned: bool
     file_not_found_followup_pending: bool
 
@@ -246,6 +242,7 @@ class FileRunnerAgent(BaseAgent):
         extra_allowed_roots: list[str] | None = None,
         template_path: str | None = None,
         show_tool_io: bool = False,
+        tool_event_callback: Callable[[str], None] | None = None,
     ):
         self.model_settings = dict(model_settings or {})
         self.thinking = thinking
@@ -269,6 +266,7 @@ class FileRunnerAgent(BaseAgent):
             False,
             temperature,
             show_tool_io=show_tool_io,
+            tool_event_callback=tool_event_callback,
         )
         self.system_prompt = self.build_system_prompt()
 
@@ -481,7 +479,6 @@ class FileRunnerAgent(BaseAgent):
                 return json.dumps(file_resolution, ensure_ascii=False)
             file_read_tool = FileReadTool("runner_document_read_tool")
             return await file_read_tool.execute(
-                scope_path=str(self.allowed_scope_root),
                 file_path=file_resolution["resolved_path"],
                 start_line=None,
                 end_line=None,
@@ -787,6 +784,9 @@ class FileRunnerAgent(BaseAgent):
 
     def get_response_format(self):
         return None
+
+
+
 
 
 

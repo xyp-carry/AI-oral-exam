@@ -46,7 +46,7 @@ from AIOralExamSystem.Exam.Examdata import (
     update_exam_session_use_preset_questions as update_exam_session_use_preset_questions_record,
     update_preset_question as update_preset_question_record,
 )
-from AIOralExamSystem.Exam.Judger import DocJudgerAgent, MainJudgerAgent
+from AIOralExamSystem.Exam.Judger import  MainJudgerAgent
 from AIOralExamSystem.Exam.OutputSetting import build_final_review_output
 from AIOralExamSystem.Exam.PanelJudgeFlow import PanelJudgeFlow
 from AIOralExamSystem.Exam.examObject import CandidateExamState, Question, QuestionGenerationPlan
@@ -450,6 +450,7 @@ class QAserver:
                 raise PermissionError("只有课程主负责老师可以创建考试项")
             created_item = await create_exam_item_record(
                 course_id=course_id,
+                exam_item_id=exam_item_id,
                 exam_item_name=exam_item_name,
                 created_by=user_id,
                 dimension_scores=dimension_scores,
@@ -593,98 +594,6 @@ class QAserver:
             preset_question_id=preset_question_id,
         )
 
-    @classmethod
-    async def score_report_and_prepare_questions(
-        cls,
-        current_user: dict,
-        course_id: str,
-        exam_item_id: str,
-        target_user_id: Optional[str] = None,
-        exam_id: Optional[str] = None,
-        report_total_score: Optional[float] = None,
-        report_judge_rule: Optional[str] = None,
-        prepare_questions: bool = True,
-    ) -> Dict[str, object]:
-        requester_id = cls.get_user_id(current_user)
-        if not requester_id:
-            raise PermissionError("当前用户缺少 user_id")
-
-        role = cls.get_user_role(current_user)
-        if role in cls.TEACHER_ROLES or role in cls.ADMIN_ROLES:
-            if role not in cls.ADMIN_ROLES and not await is_teacher_of_course(requester_id, course_id):
-                raise PermissionError("无权评价该课程报告")
-            user_id = str(target_user_id or "").strip()
-            if not user_id:
-                raise ValueError("user_id is required")
-            if not await is_student_in_course(user_id, course_id):
-                raise PermissionError("目标用户不属于该课程")
-        else:
-            user_id = requester_id
-            if target_user_id and str(target_user_id) != requester_id:
-                raise PermissionError("无权评价其他用户报告")
-            if not await is_student_in_course(user_id, course_id):
-                raise PermissionError("无权评价该课程报告")
-
-        exam_item = await get_exam_item_by_id(exam_item_id)
-        if not exam_item or str(exam_item.get("course_id")) != str(course_id):
-            raise ValueError("EXAM_ITEM_NOT_FOUND")
-        report_total_score = cls._normalize_report_total_score(report_total_score)
-        report_judge_rule = str(report_judge_rule or "").strip()
-        if not report_judge_rule:
-            raise ValueError("REPORT_JUDGE_RULE_REQUIRED")
-
-        judge_config = await get_exam_judge_config_by_exam_item(exam_item_id)
-        if not judge_config:
-            raise ValueError(cls.MISSING_MODEL_CONFIG_ERROR)
-        report_judger_settings = cls.require_report_judger_settings(judge_config)
-        doc_judger = DocJudgerAgent(
-            report_judger_settings,
-            report_source=user_id,
-            course_id=course_id,
-            exam_id=exam_id,
-            teacher_document_sources=exam_item.get("course_document_sources") or [],
-            report_judge_rule=report_judge_rule,
-        )
-        response = await doc_judger.execute(history=[{
-            "role": "user",
-            "content": json.dumps({
-                "task": "score_report",
-                "course_id": course_id,
-                "exam_item_id": exam_item_id,
-                "user_id": user_id,
-                "exam_id": exam_id,
-                "report_total_score": report_total_score,
-            }, ensure_ascii=False),
-        }])
-        report_result = cls.parse_agent_json_response(response)
-        report_score = cls._clamp_report_score(
-            report_result.get("report_score"),
-            report_total_score,
-        )
-        saved_score = await create_report_score_record(
-            course_id=course_id,
-            exam_item_id=exam_item_id,
-            user_id=user_id,
-            exam_id=exam_id,
-            report_score=report_score,
-            report_total_score=report_total_score,
-            report_result=report_result,
-        )
-
-        prepared_question_count = 0
-        if prepare_questions:
-            prepared_question_count = await cls.prepare_report_questions(
-                target_user_id=user_id,
-                course_id=course_id,
-                exam_item_id=exam_item_id,
-                exam_id=exam_id,
-                exam_item=exam_item,
-                judge_config=judge_config,
-                report_score=saved_score,
-            )
-
-        saved_score["prepared_question_count"] = prepared_question_count
-        return saved_score
 
     @classmethod
     async def prepare_report_questions(
@@ -1185,7 +1094,7 @@ class QAserver:
                 final_review=final_review,
             )
         except Exception:
-            logger.exception("保存考试数据到 MySQL 失败")
+            logger.error("保存考试数据到 MySQL 失败")
         await self.stop_request_loop()
         return [
             self._text_event("AI评审开始评估"),

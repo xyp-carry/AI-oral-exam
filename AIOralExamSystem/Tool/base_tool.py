@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from abc import abstractmethod
 from asyncio import iscoroutinefunction
 from typing import Any, Optional
@@ -8,6 +9,7 @@ from AIOralExamSystem.utils.monitor import GlobalMonitor
 
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 60
+logger = logging.getLogger(__name__)
 
 
 class BaseTool(BaseObject):
@@ -37,30 +39,41 @@ class BaseTool(BaseObject):
         await self.event_signal.wait()
 
     async def execute(self, *args, **kwargs) -> Any:
-        await self.start_heartbeat()
-        await self.request_approval()
-
+        heartbeat_started = False
+        approval_requested = False
         try:
-            result = await asyncio.wait_for(
+            await self.start_heartbeat()
+            heartbeat_started = True
+            await self.request_approval()
+            approval_requested = True
+            return await asyncio.wait_for(
                 self._execute_run(*args, **kwargs),
                 timeout=self.timeout_seconds,
             )
-            
-            return result
         except asyncio.TimeoutError:
             return self._build_timeout_response()
+        except Exception as exc:
+            return self._build_execution_error_response(exc)
         finally:
-            await self.stop_heartbeat()
-            await self._monitor._queue.put(
-                "reqObj",
-                (
-                    {"id": self.id, "name": self.name},
-                    self.rule,
-                    self.event_signal,
-                    self.queue,
-                    "stop",
-                ),
-            )
+            if heartbeat_started:
+                try:
+                    await self.stop_heartbeat()
+                except Exception as exc:
+                    logger.warning("Failed to stop tool heartbeat for %s: %s", self.name, exc)
+            if approval_requested and hasattr(self, "event_signal"):
+                try:
+                    await self._monitor._queue.put(
+                        "reqObj",
+                        (
+                            {"id": self.id, "name": self.name},
+                            self.rule,
+                            self.event_signal,
+                            self.queue,
+                            "stop",
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to notify tool stop for %s: %s", self.name, exc)
 
     async def _execute_run(self, *args, **kwargs) -> Any:
         run_method = self._run
@@ -70,12 +83,27 @@ class BaseTool(BaseObject):
         return await asyncio.to_thread(run_method, *args, **kwargs)
 
     def _build_timeout_response(self) -> dict:
+        message = f"tool execution timed out after {self.timeout_seconds} seconds"
         return {
             "ok": False,
+            "flag": "TOOL_EXECUTION_TIMEOUT",
             "error_type": "timeout",
             "tool": self.name,
             "timeout_seconds": self.timeout_seconds,
-            "error_message": f"tool execution timed out after {self.timeout_seconds} seconds",
+            "message": message,
+            "error_message": message,
+        }
+
+    def _build_execution_error_response(self, exc: Exception) -> dict:
+        message = f"{exc.__class__.__name__}: {exc}"
+        return {
+            "ok": False,
+            "flag": "TOOL_EXECUTION_FAILED",
+            "error_type": "execution_error",
+            "tool": self.name,
+            "exception_type": exc.__class__.__name__,
+            "message": message,
+            "error_message": message,
         }
 
     @abstractmethod

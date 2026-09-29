@@ -1,93 +1,167 @@
-from pipecat.processors.frame_processor import FrameCallback, FrameDirection, FrameProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.frames.frames import (
     Frame,
     InputAudioRawFrame,
-    UserStartedSpeakingFrame,
-    UserStoppedSpeakingFrame,
-    LLMTextFrame,
     InputTransportMessageFrame,
-    TranscriptionFrame,
     LLMContextFrame
     )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from loguru import logger
-import datetime
-import os
-from OralService.model import SenseVoiceSmall
-from funasr.utils.postprocess_utils import rich_transcription_postprocess
-from OralService.BaseService import save_audio_file
+from stt.local_stt import LocalStreamingSTTService
 
-import requests
-import json
-import subprocess
-from typing import List, Dict
-from AIOralExamSystem.Agent.Textfix import TextfixAgent
-from config import get_settings
-
-model_dir = "iic/SenseVoiceSmall"
-m, STTkwargs = SenseVoiceSmall.from_pretrained(model=model_dir, device="cuda:0")
-m.eval()
-
-
+from typing import List, Dict, Optional
 
 
 class MetricsFrameLogger(FrameProcessor):
     """Get User audio and transform text"""
 
-    def __init__(self, current_user: Dict, history: List[Dict[str, str]] = []):
+    def __init__(
+        self,
+        current_user: Dict,
+        history: Optional[List[Dict[str, str]]] = None,
+        vad_chunk_ms: int = 200,
+    ):
         super().__init__()
         self.initialize()
         self.Framelist = []
-        self.history: List[Dict[str, str]] = history
+        self.current_user = current_user or {}
+        self.exam_type = str(self.current_user.get("exam_type") or "").strip().upper()
+        self.requires_mic_window = self.exam_type == "C"
+        self.history: List[Dict[str, str]] = history if history is not None else []
+        self.streaming_stt = LocalStreamingSTTService(
+            vad_chunk_ms=vad_chunk_ms,
+            transcribe_on_speech_end=True,
+            save_audio_segments=self.requires_mic_window,
+        )
 
-        # self.Textfixer = TextfixAgent(model_settings={"model_name": settings.deepseek_model,"model_url":settings.deepseek_url,"model_api_key":settings.deepseek_api_key}, source=current_user['uuid'])
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, InputTransportMessageFrame):
-            if frame.message.get('message', False):
-                if frame.message['message'] == 'mic_on':
-                    self.start_record = True
-                    logger.info(f"User start Speak")
-                
-                elif frame.message['message'] == 'mic_off' and self.start_record:
-                    self.start_record = False
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"recordings1/{timestamp}.wav"
-                    os.makedirs("recordings1", exist_ok=True)
-                    audio = bytearray().join(self.bufferlist)
-                    await save_audio_file(audio, filename, self.sample_rate, self.num_channels)
-                    res = m.inference(
-                    data_in=filename,
-                    language="auto", # "zh", "en", "yue", "ja", "ko", "nospeech"
-                    use_itn=False,
-                    ban_emo_unk=False,
-                    output_timestamp=True,
-                    **STTkwargs,
-                )
-                    text = rich_transcription_postprocess(res[0][0]["text"])
-                    
-                    self.initialize()
-                    logger.info(f"User stop Speak")
-                    framenew = LLMContextFrame(context=LLMContext(messages = [{'role':'user','content':text}]))
+            handled = await self.handle_transport_message(frame, direction)
+            if handled:
+                return
 
-                    # await self.push_frame(frame, direction)
-                    await self.push_frame(framenew)
-            elif frame.message['type'] == 'user-text':
-                userInput = LLMContextFrame(context=LLMContext(messages = [{'role':'user','content':frame.message['data']['text']}]))
-                await self.push_frame(userInput, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            if not self.should_process_audio():
+                return
 
-        if self.start_record and isinstance(frame, InputAudioRawFrame):
-            self.bufferlist.append(frame.audio)
+            events = await self.streaming_stt.feed_audio(
+                frame.audio,
+                frame.sample_rate,
+                frame.num_channels,
+            )
+            await self.push_streaming_events(events, direction)
             self.sample_rate = frame.sample_rate
             self.num_channels = frame.num_channels
+            return
 
-        else:
-            await self.push_frame(frame, direction)
-    
+        await self.push_frame(frame, direction)
+
+    def should_process_audio(self) -> bool:
+        if self.start_record:
+            return True
+        if self.requires_mic_window:
+            return False
+        return not self.manual_control_seen
+
+    async def handle_transport_message(
+        self,
+        frame: InputTransportMessageFrame,
+        direction: FrameDirection,
+    ) -> bool:
+        message = frame.message or {}
+        signal = message.get("message")
+
+        if signal == "mic_on":
+            self.manual_control_seen = True
+            self.start_record = True
+            self.bufferlist = []
+            self.sample_rate = None
+            self.num_channels = None
+            self.speech_seen = False
+            self.answer_text_seen = False
+            self.streaming_stt.reset()
+            return True
+
+        if signal == "mic_off":
+            if not self.start_record:
+                return True
+            self.manual_control_seen = True
+
+            self.start_record = False
+            events = await self.streaming_stt.flush()
+            self.reset_manual_recording()
+            await self.push_streaming_events(events, direction)
+            return True
+
+        if message.get("type") == "user-text":
+            data = message.get("data") if isinstance(message.get("data"), dict) else {}
+            text = str(data.get("text") or message.get("text") or "")
+            logger.info(f"User text: {text}")
+            await self.push_user_text(text, direction)
+            return True
+
+        return False
+
+    async def push_streaming_events(
+        self,
+        events: List[Dict],
+        direction: FrameDirection,
+    ) -> None:
+        for event in events:
+            event_type = event.get("type")
+            if event_type in {"speech_start", "speech_active", "speech_end"}:
+                if event_type in {"speech_start", "speech_active"}:
+                    self.speech_seen = True
+                if self.requires_mic_window:
+                    await self.push_frame(
+                        InputTransportMessageFrame(
+                            message={
+                                "type": event_type,
+                                "data": {
+                                    "speech_seen": self.speech_seen,
+                                },
+                            }
+                        ),
+                        direction,
+                    )
+                continue
+            if event_type == "audio_saved":
+                path = str(event.get("path") or "")
+                if path:
+                    print(f"FunASR audio saved: {path}", flush=True)
+                continue
+            if event_type == "text":
+                text = str(event.get("text") or "")
+                if text.strip():
+                    self.answer_text_seen = True
+                    print(f"FunASR STT text: {text}", flush=True)
+                await self.push_user_text(text, direction)
+
+    async def push_user_text(self, text: str, direction: FrameDirection) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+
+        self.history.append({"role": "user", "content": text})
+        user_input = LLMContextFrame(
+            context=LLMContext(messages=[{"role": "user", "content": text}])
+        )
+        await self.push_frame(user_input, direction)
+
+    def reset_manual_recording(self) -> None:
+        self.start_record = False
+        self.bufferlist = []
+        self.sample_rate = None
+        self.num_channels = None
+
     def initialize(self):
         self.start_record = False
+        self.manual_control_seen = False
+        self.speech_seen = False
+        self.answer_text_seen = False
         self.bufferlist = []
         self.sample_rate = None
         self.num_channels = None

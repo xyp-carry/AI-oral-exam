@@ -196,7 +196,8 @@ def _update_exam_session_repository_url_sync(
             cursor.execute(
                 """
                 UPDATE exam_sessions
-                SET repository_url = %s
+                SET repository_url = %s,
+                    repository_updated_at = NOW(6)
                 WHERE user_id = %s
                   AND course_id = %s
                   AND exam_id = %s
@@ -362,6 +363,7 @@ def update_exam_sessions_need_code_repository(
             SET need_code_repository = %s
             WHERE course_id = %s
               AND exam_item_id = %s
+              AND exam_completed = 0
             """,
             (1 if need_code_repository else 0, course_id, exam_item_id),
         )
@@ -403,6 +405,7 @@ def update_exam_sessions_exam_item_name(
             SET exam_item_name = %s
             WHERE course_id = %s
               AND exam_item_id = %s
+              AND exam_completed = 0
             """,
             (exam_item_name, course_id, exam_item_id),
         )
@@ -532,8 +535,10 @@ def _exam_session_row_to_dict(row) -> Dict[str, object]:
         "dimension_scores_json",
         "exam_dimension_scores_json",
         "repository_url",
+        "repository_updated_at",
         "need_code_repository",
         "use_preset_questions",
+        "exam_type",
         "enable_report_analysis",
         "report_total_score",
         "report_judge_rule",
@@ -585,8 +590,10 @@ def _list_exam_sessions_by_course_and_user_sync(
                     s.dimension_scores_json,
                     s.exam_dimension_scores_json,
                     s.repository_url,
+                    s.repository_updated_at,
                     s.need_code_repository,
                     s.use_preset_questions,
+                    i.item_type AS exam_type,
                     i.enable_report_analysis,
                     i.report_total_score,
                     i.report_judge_rule,
@@ -629,8 +636,10 @@ def _get_exam_session_by_exam_id_sync(exam_id: str) -> Optional[Dict[str, object
                     s.dimension_scores_json,
                     s.exam_dimension_scores_json,
                     s.repository_url,
+                    s.repository_updated_at,
                     s.need_code_repository,
                     s.use_preset_questions,
+                    i.item_type AS exam_type,
                     i.enable_report_analysis,
                     i.report_total_score,
                     i.report_judge_rule,

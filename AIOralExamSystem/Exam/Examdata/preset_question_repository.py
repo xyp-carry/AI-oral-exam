@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .connection import connect, ensure_database
 from .schema import ensure_tables
+from .exam_item_repository import ensure_exam_item_editable
 from .serializers import preset_question_row_to_dict, to_json
 
 
@@ -25,6 +26,7 @@ async def create_preset_question(
     score: float = 1.0,
     sort_order: Optional[int] = None,
     user_id: Optional[str] = None,
+    validate_dimension: bool = True,
 ) -> Dict[str, object]:
     return await asyncio.to_thread(
         _create_preset_question_sync,
@@ -39,6 +41,7 @@ async def create_preset_question(
         score,
         sort_order,
         user_id,
+        validate_dimension,
     )
 
 
@@ -49,6 +52,19 @@ async def list_preset_questions_by_exam_item(
 ) -> List[Dict[str, object]]:
     return await asyncio.to_thread(
         _list_preset_questions_by_exam_item_sync,
+        course_id,
+        exam_item_id,
+        user_id,
+    )
+
+
+async def list_user_preset_questions_by_exam_item(
+    course_id: str,
+    exam_item_id: str,
+    user_id: str,
+) -> List[Dict[str, object]]:
+    return await asyncio.to_thread(
+        _list_user_preset_questions_by_exam_item_sync,
         course_id,
         exam_item_id,
         user_id,
@@ -75,6 +91,19 @@ async def deactivate_ai_preset_questions_by_exam_item_and_user(
 ) -> int:
     return await asyncio.to_thread(
         _deactivate_ai_preset_questions_by_exam_item_and_user_sync,
+        course_id,
+        exam_item_id,
+        user_id,
+    )
+
+
+async def delete_preset_questions_by_exam_item_and_user(
+    course_id: str,
+    exam_item_id: str,
+    user_id: str,
+) -> int:
+    return await asyncio.to_thread(
+        _delete_preset_questions_by_exam_item_and_user_sync,
         course_id,
         exam_item_id,
         user_id,
@@ -133,6 +162,7 @@ def _create_preset_question_sync(
     score: float,
     sort_order: Optional[int],
     user_id: Optional[str],
+    validate_dimension: bool,
 ) -> Dict[str, object]:
     ensure_database()
     connection = connect(use_database=True)
@@ -141,10 +171,18 @@ def _create_preset_question_sync(
     try:
         ensure_tables(connection)
         with connection.cursor() as cursor:
+            if user_id is None:
+                _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
+                ensure_exam_item_editable(cursor, exam_item_id)
             question_dimension = _normalize_question_dimension(question_dimension)
-            _raise_if_dimension_invalid(cursor, course_id, exam_item_id, question_dimension)
+            if validate_dimension:
+                _raise_if_dimension_invalid(cursor, course_id, exam_item_id, question_dimension)
             question_content = _normalize_question_content(question_content)
-            parsed_question_blocks, parsed_code_fragments = _parse_question_markdown(question_content)
+            if question_blocks is None and code_fragments is None:
+                parsed_question_blocks, parsed_code_fragments = _parse_question_markdown(question_content)
+            else:
+                parsed_question_blocks = question_blocks or []
+                parsed_code_fragments = code_fragments or []
             score = _normalize_score(score)
             if sort_order is None:
                 sort_order = _next_sort_order(cursor, exam_item_id)
@@ -228,17 +266,68 @@ def _list_preset_questions_by_exam_item_sync(
                   ON q.exam_item_id = i.exam_item_id
                 WHERE i.course_id = %s
                   AND q.exam_item_id = %s
-                  AND q.created_by <> %s
                   AND (q.user_id IS NULL OR q.user_id = %s)
                   AND q.status = 'active'
                   AND i.status = 'active'
                 ORDER BY q.sort_order ASC, q.created_at ASC
                 """,
-                (course_id, exam_item_id, AI_CREATED_BY, _normalize_optional_user_id(user_id)),
+                (course_id, exam_item_id, _normalize_optional_user_id(user_id)),
             )
             return [preset_question_row_to_dict(row) for row in cursor.fetchall()]
     finally:
         connection.close()
+
+
+def _list_user_preset_questions_by_exam_item_sync(
+    course_id: str,
+    exam_item_id: str,
+    user_id: str,
+) -> List[Dict[str, object]]:
+    user_id = _normalize_user_id(user_id)
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
+            cursor.execute(
+                """
+                SELECT
+                    q.preset_question_id,
+                    q.exam_item_id,
+                    q.user_id,
+                    q.question_dimension,
+                    q.question_content,
+                    q.standard_answer,
+                    q.question_blocks_json,
+                    q.code_fragments_json,
+                    q.score,
+                    q.sort_order,
+                    q.status,
+                    q.created_by,
+                    q.created_at,
+                    q.updated_at
+                FROM exam_preset_questions q
+                JOIN course_exam_items i
+                  ON q.exam_item_id = i.exam_item_id
+                WHERE i.course_id = %s
+                  AND q.exam_item_id = %s
+                  AND q.user_id = %s
+                  AND q.status = 'active'
+                  AND i.status = 'active'
+                ORDER BY q.question_dimension ASC, q.sort_order ASC, q.created_at ASC
+                """,
+                (course_id, exam_item_id, user_id),
+            )
+            questions = []
+            for row in cursor.fetchall():
+                question = preset_question_row_to_dict(row)
+                question["user_id"] = user_id
+                questions.append(question)
+            return questions
+    finally:
+        connection.close()
+
 
 
 def _list_ai_preset_questions_by_exam_item_and_user_sync(
@@ -311,11 +400,45 @@ def _deactivate_ai_preset_questions_by_exam_item_and_user_sync(
                 WHERE i.course_id = %s
                   AND q.exam_item_id = %s
                   AND q.user_id = %s
-                  AND q.created_by = %s
                   AND q.status = 'active'
                   AND i.status = 'active'
                 """,
-                (now, course_id, exam_item_id, user_id, AI_CREATED_BY),
+                (now, course_id, exam_item_id, user_id),
+            )
+            count = cursor.rowcount
+        connection.commit()
+        return count
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _delete_preset_questions_by_exam_item_and_user_sync(
+    course_id: str,
+    exam_item_id: str,
+    user_id: str,
+) -> int:
+    user_id = _normalize_user_id(user_id)
+    ensure_database()
+    connection = connect(use_database=True)
+    try:
+        ensure_tables(connection)
+        with connection.cursor() as cursor:
+            _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
+            cursor.execute(
+                """
+                DELETE q
+                FROM exam_preset_questions q
+                JOIN course_exam_items i
+                  ON q.exam_item_id = i.exam_item_id
+                WHERE i.course_id = %s
+                  AND q.exam_item_id = %s
+                  AND q.user_id = %s
+                  AND i.status = 'active'
+                """,
+                (course_id, exam_item_id, user_id),
             )
             count = cursor.rowcount
         connection.commit()
@@ -346,6 +469,7 @@ def _update_preset_question_sync(
         ensure_tables(connection)
         with connection.cursor() as cursor:
             _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
+            ensure_exam_item_editable(cursor, exam_item_id)
             if not _preset_question_exists(cursor, course_id, exam_item_id, preset_question_id):
                 return None
 
@@ -358,13 +482,20 @@ def _update_preset_question_sync(
                 values.append(question_dimension)
             if question_content is not None:
                 question_content = _normalize_question_content(question_content)
-                parsed_question_blocks, parsed_code_fragments = _parse_question_markdown(question_content)
                 set_clauses.append("question_content = %s")
                 values.append(question_content)
+                if question_blocks is None and code_fragments is None:
+                    parsed_question_blocks, parsed_code_fragments = _parse_question_markdown(question_content)
+                    set_clauses.append("question_blocks_json = %s")
+                    values.append(to_json(parsed_question_blocks))
+                    set_clauses.append("code_fragments_json = %s")
+                    values.append(to_json(parsed_code_fragments))
+            if question_blocks is not None:
                 set_clauses.append("question_blocks_json = %s")
-                values.append(to_json(parsed_question_blocks))
+                values.append(to_json(question_blocks))
+            if code_fragments is not None:
                 set_clauses.append("code_fragments_json = %s")
-                values.append(to_json(parsed_code_fragments))
+                values.append(to_json(code_fragments))
             if standard_answer is not None:
                 set_clauses.append("standard_answer = %s")
                 values.append(standard_answer)
@@ -411,6 +542,7 @@ def _delete_preset_question_sync(
         ensure_tables(connection)
         with connection.cursor() as cursor:
             _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
+            ensure_exam_item_editable(cursor, exam_item_id)
             cursor.execute(
                 """
                 UPDATE exam_preset_questions
@@ -506,6 +638,7 @@ def _get_exam_item_dimension_names(cursor, course_id: str, exam_item_id: str) ->
           AND exam_item_id = %s
           AND status = 'active'
         LIMIT 1
+        FOR UPDATE
         """,
         (course_id, exam_item_id),
     )

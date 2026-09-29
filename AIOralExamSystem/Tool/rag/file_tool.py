@@ -7,14 +7,21 @@ import asyncio
 from pathlib import Path
 from AIOralExamSystem.Agent.Directorysearcher import Directorysearcher
 from AIOralExamSystem.Tool.files.minerUTool import MinerUFileTool
-from config import get_settings
 
 class FileParserTool(BaseTool):
     """文件解析工具"""
-    def __init__(self, token: str, name: str):
+    def __init__(self, mineru_settings: dict, name: str):
         super().__init__(name)
         self.description = "Parse file content"
-        self.mineru_tool = MinerUFileTool(token)
+        token = str(mineru_settings.get("model_api_key") or "").strip()
+        if mineru_settings and not token:
+            raise ValueError("MINERU_TOKEN_NOT_CONFIGURED")
+        self.mineru_enabled = bool(token)
+        self.mineru_tool = MinerUFileTool(
+            token,
+            api_url=str(mineru_settings.get("model_url") or "").strip() or None,
+            model_version=str(mineru_settings.get("model_name") or "").strip() or "vlm",
+        )
 
     async def _run(
         self,
@@ -83,6 +90,8 @@ class FileParserTool(BaseTool):
         chunk_mode: str = "traditional",
         chunk_ai_model_settings: dict | None = None,
     ):
+        if not self.mineru_enabled:
+            raise ValueError("MINERU_MODEL_NOT_CONFIGURED")
         work_root = self._resolve_work_root(work_dir)
         md_files = self.mineru_tool.parse_to_markdown_files(file_paths, work_root)
         return [
@@ -139,15 +148,9 @@ class FileParserTool(BaseTool):
             }
 
     def _resolve_toc_model_settings(self, ai_model_settings: dict | None = None) -> dict:
-        if ai_model_settings:
-            model_settings = dict(ai_model_settings)
-        else:
-            settings = get_settings()
-            model_settings = {
-                "model_name": settings.model_name,
-                "model_url": settings.model_url,
-                "model_api_key": settings.model_api_key,
-            }
+        if not ai_model_settings:
+            raise ValueError("AI_TOC_MODEL_NOT_CONFIGURED")
+        model_settings = dict(ai_model_settings)
         if model_settings.get("base_url") and not model_settings.get("model_url"):
             model_settings["model_url"] = model_settings["base_url"]
         for key in ("model_name", "model_url", "model_api_key"):

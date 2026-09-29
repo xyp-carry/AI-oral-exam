@@ -6,7 +6,6 @@ from typing import Any
 
 from AIOralExamSystem.Agent.FileReader import (
     DEFAULT_REPORT_NAME,
-    REPORT_TEMPLATE_NAME,
     TEMPLATE_DIR,
     ReviewerAgent,
     FileReadGraphState,
@@ -111,29 +110,6 @@ class AIanalysier:
         graph.add_edge('merge_templates', 'finalize')
         graph.add_edge('finalize', END)
         return graph.compile()
-
-    def prepare_report_template(self, folder_path: str, report_name: str = DEFAULT_REPORT_NAME) -> str:
-        template_path = TEMPLATE_DIR / REPORT_TEMPLATE_NAME
-        if not template_path.is_file():
-            return ""
-        root_path = Path("/root/AI-Oral-exam").resolve()
-        raw_folder = Path(str(folder_path or root_path)).expanduser()
-        if not raw_folder.is_absolute():
-            raw_folder = root_path / raw_folder
-        try:
-            target_folder = raw_folder.resolve()
-            target_folder.relative_to(root_path)
-        except (OSError, ValueError):
-            return ""
-        if not target_folder.is_dir():
-            return ""
-        output_name = Path(str(report_name or DEFAULT_REPORT_NAME)).name or DEFAULT_REPORT_NAME
-        output_path = target_folder / output_name
-        try:
-            shutil.copyfile(template_path, output_path)
-        except OSError:
-            return ""
-        return str(output_path)
 
     def resolve_project_folder(self, folder_path: str) -> Path:
         root_path = Path("/root/AI-Oral-exam").resolve(strict=False)
