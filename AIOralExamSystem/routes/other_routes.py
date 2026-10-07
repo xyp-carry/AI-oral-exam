@@ -1124,6 +1124,7 @@ def register_other_routes(app, args):
                 "success": True,
                 "message": "upload success",
                 "repository_url": repository_address,
+                "url_type": result.get("url_type"),
                 "repository_root": str(final_root),
                 "requested_branch": result.get("requested_branch") or git_branch,
                 "resolved_branch": result.get("branch"),

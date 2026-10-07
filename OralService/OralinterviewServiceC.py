@@ -28,6 +28,7 @@ from AIOralExamSystem.Graph.ExamC import ExamCFlow
 from AIOralExamSystem.message.session import ExamMessageSession
 from AIOralExamSystem.Exam.CFinalReview import CFinalReviewService
 from AIOralExamSystem.Exam.Examdata.final_review_repository import get_final_review
+from AIOralExamSystem.Exam.Examdata.c_question_repository import save_c_exam_questions
 
 import time
 
@@ -463,7 +464,7 @@ class InterviewServiceC(FrameProcessor):
     async def handle_exam_event(self, event: Dict[str, Any]) -> None:
         event_type = self._event_type(event)
         if event_type == "final_review":
-            self.publish_final_review(event)
+            await self.publish_final_review(event)
             return
         if event_type in {"finished", "closed"}:
             if self.terminal_sent:
@@ -495,11 +496,14 @@ class InterviewServiceC(FrameProcessor):
             if self.exam_output_task is not asyncio.current_task():
                 self._cancel(self.exam_output_task)
 
-    def publish_final_review(self, event):
+    async def publish_final_review(self, event):
         if self.final_review_ready:
             return
         if self.final_review_task is not None and not self.final_review_task.done():
             return
+        await save_c_exam_questions(
+            self.exam_id, self.exam_user_id, event["review"]
+        )
         self.pending_final_review = event
         self.cancel_answer_idle_timer()
         self._cancel(self.followup_poll_task)
@@ -590,6 +594,7 @@ class InterviewServiceC(FrameProcessor):
 
     async def speak_question(self, question: Mapping[str, Any]) -> None:
         speech_content = self.render_question_speech(question)
+        print(f"Rendering question speech: {speech_content}")
         if speech_content:
             await self.push_frame(TTSSpeakFrame(speech_content), FrameDirection.DOWNSTREAM)
         await self.stream_question_display(question)

@@ -905,7 +905,7 @@ def _delete_exam_item_sync(course_id: str, exam_item_id: str) -> bool:
             if cursor.fetchone() is None:
                 connection.rollback()
                 return False
-            ensure_exam_item_editable(cursor, exam_item_id)
+            ensure_exam_item_deletable(cursor, exam_item_id)
             cursor.execute(
                 """
                 UPDATE course_exam_items
@@ -1108,6 +1108,22 @@ def _raise_if_exam_item_name_exists(
         raise ValueError("EXAM_ITEM_NAME_EXISTS")
 
 
+def ensure_exam_item_deletable(cursor, exam_item_id: str) -> None:
+    cursor.execute(
+        """
+        SELECT 1 FROM exam_sessions
+        WHERE exam_item_id = %s
+          AND exam_completed = 0
+          AND exam_active_token IS NOT NULL
+          AND exam_active_until > NOW()
+        LIMIT 1
+        """,
+        (exam_item_id,),
+    )
+    if cursor.fetchone() is not None:
+        raise ValueError("EXAM_IN_PROGRESS")
+
+
 def ensure_exam_item_editable(cursor, exam_item_id: str) -> None:
     cursor.execute(
         """
@@ -1115,7 +1131,7 @@ def ensure_exam_item_editable(cursor, exam_item_id: str) -> None:
         WHERE exam_item_id = %s
           AND (
               (exam_completed = 0 AND exam_active_token IS NOT NULL
-               AND exam_active_until > NOW() - INTERVAL 10 MINUTE)
+               AND exam_active_until > NOW())
               OR (repository_url IS NOT NULL AND TRIM(repository_url) <> '')
           )
         LIMIT 1

@@ -51,7 +51,6 @@ from AIOralExamSystem.Graph.template_content_loader import (
 )
 from AIOralExamSystem.Tool.rag.data_tool import InsertTool, SearchTool
 from Authentication.auth import get_current_user
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 
 
 class CourseCreateRequest(BaseModel):
@@ -123,6 +122,7 @@ class ExamAgentBindingRequest(BaseModel):
     report_judger_model_id: str | None = None
     mineru_model_id: str | None = None
     embedding_model_id: str | None = None
+    tts_model_id: str | None = None
     version: int | None = None
 
 
@@ -278,15 +278,15 @@ def has_report_model_config(req) -> bool:
     return getattr(req, "report_judger_model_id", None) is not None
 
 
-def has_rag_model_config(req) -> bool:
-    return bool(req.model_fields_set & {"mineru_model_id", "embedding_model_id"})
+def has_optional_model_config(req) -> bool:
+    return bool(req.model_fields_set & {"mineru_model_id", "embedding_model_id", "tts_model_id"})
 
 
 async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> Dict[str, object] | None:
     has_core_config = has_core_exam_model_config(req)
     has_report_config = has_report_model_config(req)
-    has_rag_config = has_rag_model_config(req)
-    if not has_core_config and not has_report_config and not has_rag_config:
+    has_optional_config = has_optional_model_config(req)
+    if not has_core_config and not has_report_config and not has_optional_config:
         return None
     user_id = current_user.get("uuid")
     if not user_id:
@@ -305,6 +305,7 @@ async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> 
         for field, role in (
             ("mineru_model_id", "mineru"),
             ("embedding_model_id", "embedding"),
+            ("tts_model_id", "tts"),
         )
         if field in req.model_fields_set
     }
@@ -326,6 +327,7 @@ async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> 
             report_judger_model_id=req.report_judger_model_id if has_report_config else None,
             mineru_model_id=optional_models.get("mineru"),
             embedding_model_id=optional_models.get("embedding"),
+            tts_model_id=optional_models.get("tts"),
             clear_optional_roles=[
                 role for role, model_id in optional_models.items() if model_id is None
             ],
@@ -337,7 +339,7 @@ async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> 
                 created_by=user_id,
                 report_judger_model_id=req.report_judger_model_id,
             )
-        if has_rag_config:
+        if has_optional_config:
             await upsert_exam_optional_agent_models(exam_item_id, user_id, optional_models)
 
     config = await get_exam_judge_config_by_exam_item(exam_item_id, include_api_key=False)
@@ -408,6 +410,7 @@ async def attach_exam_item_view_configs(items: List[Dict[str, object]]) -> List[
         enriched["report_judger_model_id"] = None
         enriched["mineru_model_id"] = None
         enriched["embedding_model_id"] = None
+        enriched["tts_model_id"] = None
 
         if isinstance(judge_config, dict):
             scorers = judge_config.get("scorers") or []
@@ -421,6 +424,7 @@ async def attach_exam_item_view_configs(items: List[Dict[str, object]]) -> List[
             enriched["report_judger_model_id"] = agent_model_id(judge_config.get("report_judger"))
             enriched["mineru_model_id"] = agent_model_id(judge_config.get("mineru"))
             enriched["embedding_model_id"] = agent_model_id(judge_config.get("embedding"))
+            enriched["tts_model_id"] = agent_model_id(judge_config.get("tts"))
 
         return enriched
 
@@ -955,8 +959,6 @@ def register_exam_routes(app, args):
             if not file_paths:
                 raise ValueError("COURSE_DOCUMENT_FILE_REQUIRED")
 
-            monitor = GlobalMonitor()
-            monitor.start()
             requires_mineru = any(
                 Path(path).suffix.lower() in {".pdf", ".doc", ".docx"}
                 for path in file_paths

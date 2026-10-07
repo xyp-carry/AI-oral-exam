@@ -1070,11 +1070,40 @@ def _refresh_exam_item_stats(connection, exam_item_id: Optional[str]) -> None:
 
 def _insert_exam_questions(connection, exam_id: str, exam_state) -> None:
     records = list(getattr(exam_state, "exam_records", []) or [])
+    questions = {
+        str(record.question.question_id): record.question
+        for record in records
+        if getattr(record, "question", None) is not None
+        and getattr(record.question, "question_id", None)
+    }
+
+    def root_and_depth(question):
+        current = question
+        seen = {str(question.question_id)}
+        depth = 0
+        while True:
+            parent_id = str(getattr(current, "based_on_record_index", "") or "")
+            if not parent_id or parent_id == "-1" or parent_id not in questions:
+                return str(current.question_id), depth
+            if parent_id in seen:
+                return str(question.question_id), 0
+            seen.add(parent_id)
+            current = questions[parent_id]
+            depth += 1
+
     rows = []
+    root_orders = {}
+    followup_counts = {}
     for index, record in enumerate(records, start=1):
         question = getattr(record, "question", None)
         if question is None:
             continue
+        root_id, depth = root_and_depth(question)
+        if root_id not in root_orders:
+            root_orders[root_id] = len(root_orders) + 1
+        if depth:
+            followup_counts[root_id] = followup_counts.get(root_id, 0) + 1
+        parent_id = str(question.based_on_record_index) if depth else None
         rows.append((
             exam_id,
             index,
@@ -1089,6 +1118,14 @@ def _insert_exam_questions(connection, exam_id: str, exam_state) -> None:
             record.evaluation,
             question.standard_answer,
             1 if getattr(question, "is_preset_question", False) else 0,
+            root_id,
+            parent_id,
+            root_orders[root_id],
+            followup_counts.get(root_id, 0) if depth else 0,
+            depth,
+            "followup" if depth else "root",
+            None,
+            None,
         ))
 
     if not rows:
@@ -1096,23 +1133,14 @@ def _insert_exam_questions(connection, exam_id: str, exam_state) -> None:
 
     with connection.cursor() as cursor:
         cursor.executemany(
-            """
-            INSERT INTO exam_questions (
-                exam_id,
-                record_index,
-                question_id,
-                question_content,
-                question_dimension,
-                question_score,
-                based_on_record_index,
-                source_detail,
-                student_answer,
-                correctness_level,
-                evaluation,
-                standard_answer,
-                is_preset_question
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
+            """INSERT INTO exam_questions (
+                exam_id, record_index, question_id, question_content,
+                question_dimension, question_score, based_on_record_index,
+                source_detail, student_answer, correctness_level, evaluation,
+                standard_answer, is_preset_question, root_question_id,
+                parent_question_id, root_order, followup_order, chain_depth,
+                relation, question_evaluation_json, question_evaluation_status
+            ) VALUES (""" + ", ".join(["%s"] * 21) + ")",
             rows,
         )
 
@@ -1255,7 +1283,15 @@ def _get_exam_record_by_exam_id_sync(
                     q.evaluation,
                     q.standard_answer,
                     q.is_preset_question,
-                    q.created_at
+                    q.created_at,
+                    q.root_question_id,
+                    q.parent_question_id,
+                    q.root_order,
+                    q.followup_order,
+                    q.chain_depth,
+                    q.relation,
+                    q.question_evaluation_json,
+                    q.question_evaluation_status
                 FROM exam_questions q
                 JOIN exam_sessions s ON q.exam_id = s.exam_id
                 WHERE q.exam_id = %s
@@ -1316,7 +1352,15 @@ def _get_exam_questions_by_exam_item_sync(
                     q.evaluation,
                     q.standard_answer,
                     q.is_preset_question,
-                    q.created_at
+                    q.created_at,
+                    q.root_question_id,
+                    q.parent_question_id,
+                    q.root_order,
+                    q.followup_order,
+                    q.chain_depth,
+                    q.relation,
+                    q.question_evaluation_json,
+                    q.question_evaluation_status
                 FROM exam_sessions s
                 JOIN exam_questions q ON q.exam_id = s.exam_id
                 {where_sql}

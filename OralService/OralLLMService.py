@@ -13,7 +13,6 @@ import httpx
 import json
 from datetime import datetime
 import websockets
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 from AIOralExamSystem.Agent.Interviewer import InterviewerAgent
 from AIOralExamSystem.Exam.Judger import JudgerAgent, MainJudgerAgent
 from AIOralExamSystem.Exam.examObject import CandidateExamState
@@ -27,7 +26,6 @@ import re
 class LLMService(FrameProcessor):
     def __init__(
         self,
-        monitor: GlobalMonitor,
         current_user: dict,
         history: List[Dict[str, str]] = [],
         exam_state: Optional[CandidateExamState] = None,

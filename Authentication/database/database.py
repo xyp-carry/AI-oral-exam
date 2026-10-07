@@ -12,11 +12,14 @@ from typing import Optional
 from uuid import uuid4
 from Authentication.models import UserInfo
 
+import os
+
+# 默认值用于本机直跑；容器部署时通过 MYSQL_HOST 等环境变量指向 mysql 服务
 MYSQL_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "123456",
+    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", "123456"),
     "database": "ai_oral_exam_user",
     "charset": "utf8mb4",
     "cursorclass": DictCursor,

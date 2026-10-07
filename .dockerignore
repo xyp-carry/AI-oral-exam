@@ -1,0 +1,14 @@
+# 构建后端镜像时不需要的内容
+.git
+docker
+frontend
+node_modules
+**/__pycache__
+**/*.pyc
+.env
+*.pem
+updateFile
+exam_records
+mysql_data
+logs.md
+开发日志.md

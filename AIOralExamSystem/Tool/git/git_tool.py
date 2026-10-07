@@ -18,7 +18,7 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 
 
 class GitRepositoryToolInput(BaseModel):
-    repo_url: Optional[str] = Field(default=None, description="Git repository URL.")
+    repo_url: Optional[str] = Field(default=None, description="Git clone URL or repository webpage URL; the source is detected automatically.")
     user_uuid: str = Field(description="Current user uuid used to scope repository cache.")
     course_id: Optional[str] = Field(default=None, description="Optional course id for exam-scoped repository cache.")
     exam_id: Optional[str] = Field(default=None, description="Optional exam id for exam-scoped repository cache.")
@@ -32,7 +32,7 @@ class GitRepositoryToolInput(BaseModel):
 
 
 GitRepositoryDescription = (
-    "Fetch a git repository URL or extract an uploaded local zip archive for a user. "
+    "Fetch a Git clone URL or repository webpage URL, or extract an uploaded local zip archive for a user. "
     "The repository is stored as-is under Gitrepositorys/{user_uuid}/{repo} or "
     "Gitrepositorys/{user_uuid}/{course_id}/{exam_id}/{git_branch}. "
     "This tool only downloads or extracts the repository and returns repository_root metadata. "
@@ -132,7 +132,19 @@ class GitRepositoryTool(BaseTool):
             accelerator_count=len(accelerator_urls),
         )
 
+        url_type = "archive" if archive_path else None
+        clone_url = None
         try:
+            if not archive_path:
+                url_type, clone_url = self._resolve_repository_url(repo_url)
+                self._append_log(
+                    logs,
+                    "url_resolution",
+                    "success",
+                    "Resolved repository input URL.",
+                    url_type=url_type,
+                    clone_url=clone_url,
+                )
             repo_root = (
                 Path(target_root).expanduser().resolve()
                 if target_root and str(target_root).strip()
@@ -173,7 +185,7 @@ class GitRepositoryTool(BaseTool):
             else:
                 self._append_log(logs, "store_repository", "start", "Cloning repository directly into repository root.")
                 resolved_branch, branch_source = self._clone_repository(
-                    repo_url,
+                    clone_url,
                     repo_root,
                     branch,
                     accelerator_urls,
@@ -185,6 +197,8 @@ class GitRepositoryTool(BaseTool):
             manifest = {
                 "repo_url": repo_url,
                 "source_type": source_type,
+                "url_type": url_type,
+                "clone_url": clone_url,
                 "archive_name": archive_name,
                 "archive_path": archive_path,
                 "safe_repo_name": repo_root.name,
@@ -211,6 +225,7 @@ class GitRepositoryTool(BaseTool):
                 {
                     "repo_url": repo_url,
                     "source_type": source_type,
+                    "url_type": url_type,
                     "requested_branch": branch,
                     "branch": None,
                     "mode": "error",
@@ -259,6 +274,8 @@ class GitRepositoryTool(BaseTool):
         return {
             "repo_url": manifest.get("repo_url"),
             "source_type": manifest.get("source_type") or "git",
+            "url_type": manifest.get("url_type"),
+            "clone_url": manifest.get("clone_url"),
             "archive_name": manifest.get("archive_name"),
             "requested_branch": manifest.get("requested_branch", manifest.get("branch")),
             "branch": manifest.get("branch"),
@@ -599,6 +616,42 @@ class GitRepositoryTool(BaseTool):
             log_item.update(metadata)
         logs.append(log_item)
 
+    def _resolve_repository_url(self, repo_url: str) -> tuple[str, str]:
+        """Classify a clone address or a repository page before fetching it."""
+        repo_url = repo_url.strip()
+        if re.match(r"^[^/@\s]+@[^/:\s]+:.+", repo_url):
+            return "git_clone", repo_url
+
+        parsed = urlparse(repo_url)
+        if parsed.scheme in {"ssh", "git", "file"}:
+            return "git_clone", repo_url
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("repo_url must be a Git clone URL or an HTTP(S) repository page.")
+
+        path = parsed.path.rstrip("/")
+        if not path:
+            raise ValueError("repository URL must include a repository path.")
+        if path.endswith(".git"):
+            return "git_clone", repo_url
+
+        host = parsed.hostname.lower()
+        parts = [part for part in path.split("/") if part]
+        if host in {"github.com", "www.github.com", "gitee.com", "www.gitee.com"}:
+            if len(parts) != 2:
+                raise ValueError("provide the repository root page, such as https://github.com/owner/repo.")
+            return "repository_page", f"{parsed.scheme}://{parsed.netloc}/{parts[0]}/{parts[1]}.git"
+
+        if host == "gitlab.com" or host.endswith(".gitlab.com"):
+            if "/-/" in path:
+                raise ValueError("provide the GitLab project root page, not a file or branch page.")
+            if len(parts) < 2:
+                raise ValueError("provide a GitLab project page, not a group or user page.")
+            return "repository_page", f"{parsed.scheme}://{parsed.netloc}/{'/'.join(parts)}.git"
+
+        # Other Git servers may accept the webpage URL directly. The clone
+        # candidate builder also tries its .git form if that first attempt fails.
+        return "repository_page", self._normalize_repository_page_url(repo_url)
+
     def _normalize_repository_page_url(self, repo_url: str) -> Optional[str]:
         repo_url = repo_url.strip()
         ssh_match = re.match(r"^git@([^:]+):(.+?)(?:\.git)?/?$", repo_url)
@@ -713,6 +766,102 @@ class GitRepositoryTool(BaseTool):
 
 
 
+class GitRemoteBranchesToolInput(BaseModel):
+    repo_url: str = Field(description="Git clone URL or repository webpage URL to inspect.")
+
+
+GitRemoteBranchesDescription = (
+    "List the branch names, branch count, and default branch of a remote Git "
+    "repository without cloning it. Accepts a clone URL or repository webpage URL."
+)
+
+
+class GitRemoteBranchesTool(BaseTool):
+    """Inspect remote branch refs before selecting a branch to clone."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.description = GitRemoteBranchesDescription
+
+    def _run(self, repo_url: str) -> str:
+        helper = GitRepositoryTool("git_remote_branch_url_resolver")
+        try:
+            url_type, clone_url = helper._resolve_repository_url(repo_url)
+        except ValueError as exc:
+            return json.dumps(
+                {"ok": False, "flag": "INVALID_REPOSITORY_URL", "message": str(exc)},
+                ensure_ascii=False,
+            )
+
+        candidates = helper._build_clone_url_candidates(clone_url, [])
+        git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        for candidate in candidates:
+            try:
+                result = subprocess.run(
+                    ["git", "ls-remote", "--heads", candidate],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    env=git_env,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+
+            branches = sorted({
+                line.split("refs/heads/", 1)[1]
+                for line in result.stdout.splitlines()
+                if "\trefs/heads/" in line
+            })
+            default_branch = None
+            try:
+                head = subprocess.run(
+                    ["git", "ls-remote", "--symref", candidate, "HEAD"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    env=git_env,
+                )
+                if head.returncode == 0:
+                    for line in head.stdout.splitlines():
+                        if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD"):
+                            default_branch = line[len("ref: refs/heads/"):-len("\tHEAD")]
+                            break
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+            return json.dumps(
+                {
+                    "ok": True,
+                    "flag": "GIT_REMOTE_BRANCHES_READY",
+                    "url_type": url_type,
+                    "branches": branches,
+                    "branch_count": len(branches),
+                    "default_branch": default_branch,
+                },
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "ok": False,
+                "flag": "GIT_REMOTE_BRANCHES_FAILED",
+                "message": "Cannot read remote branches; check repository access and URL.",
+                "branches": [],
+                "branch_count": None,
+                "default_branch": None,
+            },
+            ensure_ascii=False,
+        )
+
+
 class GitHistoryToolInput(BaseModel):
     repo_path: str = Field(description="Local git repository path.")
     mode: str = Field(default="history", description="history or commit_detail.")
@@ -738,6 +887,7 @@ class GitHistoryTool(BaseTool):
         repo_path: str,
         mode: str = "history",
         commit_hash: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> str:
         with ThreadPoolExecutor(max_workers=1) as executor:
             loop = asyncio.get_event_loop()
@@ -747,6 +897,7 @@ class GitHistoryTool(BaseTool):
                 repo_path,
                 mode,
                 commit_hash,
+                since,
             )
 
     def read_git_history(
@@ -754,6 +905,7 @@ class GitHistoryTool(BaseTool):
         repo_path: str,
         mode: str = "history",
         commit_hash: Optional[str] = None,
+        since: Optional[str] = None,
     ) -> str:
         repo = self._resolve_git_repo_path(repo_path)
         if repo is None:
@@ -772,7 +924,6 @@ class GitHistoryTool(BaseTool):
         mode = str(mode or "history").strip()
         branch = self._run_git(repo, ["git", "branch", "--show-current"])
         status = self._run_git(repo, ["git", "status", "--short"])
-
         if mode == "commit_detail":
             commit_hash = self._require_commit_hash(commit_hash)
             detail = self._read_commit_detail(repo, commit_hash)
@@ -789,7 +940,7 @@ class GitHistoryTool(BaseTool):
                 ensure_ascii=False,
             )
 
-        history = self._read_history(repo)
+        history = self._read_history(repo, since=since)
         return json.dumps(
             {
                 "ok": history["ok"],
@@ -817,17 +968,12 @@ class GitHistoryTool(BaseTool):
             return repo
         return Path(root["stdout"].strip()).resolve()
 
-    def _read_history(self, repo: Path) -> dict:
+    def _read_history(self, repo: Path, since: Optional[str] = None) -> dict:
         pretty = "%H%x1f%h%x1f%ad%x1f%an%x1f%s"
-        result = self._run_git(
-            repo,
-            [
-                "git",
-                "log",
-                "--date=iso-strict",
-                f"--pretty=format:{pretty}",
-            ],
-        )
+        command = ["git", "log", "--date=iso-strict", f"--pretty=format:{pretty}"]
+        if since:
+            command.append(f"--since={since}")
+        result = self._run_git(repo, command)
         commits = []
         if result["ok"]:
             for line in result["stdout"].splitlines():

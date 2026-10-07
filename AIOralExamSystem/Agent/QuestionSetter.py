@@ -1,4 +1,4 @@
-﻿import json
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -111,7 +111,7 @@ class QuestionSetterAgent(BaseAgent):
     def get_tools(self):
         @tool(
             args_schema=QuestionSetterSearchInput,
-            description="在绑定文档范围内搜索模块相关文档。scope_path 由系统固定，调用者不能修改。",
+            description=f"仅在绑定文档范围 {self.document_scope} 内搜索模块相关文档。",
         )
         async def docInfoSearch(
             query: str,
@@ -121,7 +121,7 @@ class QuestionSetterAgent(BaseAgent):
             context_lines: int = 1,
             max_matches: int = 50,
         ) -> str:
-            search_tool = InfoSearchTool("question_setter_info_search")
+            search_tool = InfoSearchTool("question_setter_info_search", allowed_scope=self.document_scope)
             return await search_tool.execute(
                 scope_path=str(self.document_scope),
                 query=query,
@@ -135,7 +135,7 @@ class QuestionSetterAgent(BaseAgent):
 
         @tool(
             args_schema=QuestionSetterReadInput,
-            description="读取绑定文档范围内的文件或行区间。scope_path 由系统固定，调用者不能修改。",
+            description=f"仅在绑定文档范围 {self.document_scope} 内读取文件或行区间。",
         )
         async def docReadFile(
             file_path: str,
@@ -143,7 +143,7 @@ class QuestionSetterAgent(BaseAgent):
             end_line: Optional[int] = None,
             max_bytes: int = 120_000,
         ) -> str:
-            read_tool = FileReadTool("question_setter_file_read")
+            read_tool = FileReadTool("question_setter_file_read", allowed_scope=self.document_scope)
             return await read_tool.execute(
                 scope_path=str(self.document_scope),
                 file_path=file_path,

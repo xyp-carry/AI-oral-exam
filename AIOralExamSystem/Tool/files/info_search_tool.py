@@ -12,14 +12,13 @@ from pydantic import BaseModel, Field
 from AIOralExamSystem.Tool.base_tool import BaseTool
 
 
-PROJECT_ROOT = Path("/root/AI-Oral-exam").resolve()
 MAX_STDOUT_BYTES = 2 * 1024 * 1024
 
 NEXT_ACTIONS = {
     "FILE_NOT_FOUND": ["search_similar_file", "list_parent_folder", "retry_with_relative_path"],
     "PATH_OUTSIDE_SCOPE": ["retry_inside_scope_root", "search_by_filename"],
-    "PATH_OUTSIDE_PROJECT": ["retry_inside_project_root", "search_by_filename"],
-    "SCOPE_NOT_FOUND": ["retry_with_repository_root", "list_available_scope"],
+    "PATH_OUTSIDE_ALLOWED_SCOPE": ["retry_inside_allowed_scope", "search_by_filename"],
+    "SCOPE_NOT_FOUND": ["retry_with_allowed_scope", "list_available_scope"],
     "FILE_DECODE_FAILED": ["search_filename_only", "skip_binary_file"],
     "TIMEOUT": ["narrow_scope_path", "add_file_globs", "reduce_max_matches"],
     "SEARCH_FAILED": ["narrow_scope_path", "retry_plain_query"],
@@ -30,49 +29,80 @@ NON_RECOVERABLE_ERRORS = {"INFO_SEARCH_TOOL_FAILED"}
 
 
 class InfoSearchToolInput(BaseModel):
-    scope_path: str = Field(default=".", description="搜索范围，必须位于 /root/AI-Oral-exam 项目目录内。")
-    query: str = Field(default="", description="要搜索的字段或文本。")
-    shell_command: Optional[str] = Field(
-        default=None,
-        description="可选的只读搜索命令，只允许 rg 或 grep，禁止写入、删除和更新操作。",
-    )
+    query: str = Field(description="要搜索的字段或文本。")
     file_globs: list[str] = Field(default_factory=list, description="可选的文件匹配规则，例如 *.py 或 *.md。")
     case_sensitive: bool = Field(default=False, description="是否区分大小写。")
     regex: bool = Field(default=False, description="是否将 query 作为正则表达式处理。")
     context_lines: int = Field(default=0, description="每个匹配项附带的上下文行数，范围为 0–5。")
     max_matches: int = Field(default=200, description="最多返回的匹配数量，范围为 1–1000。")
+
+
+class ScopedInfoSearchToolInput(InfoSearchToolInput):
+    scope_path: str = Field(default=".", description="搜索范围；只能在工具绑定的允许目录内进一步缩小范围。")
+    query: str = Field(default="", description="要搜索的字段或文本。")
+    shell_command: Optional[str] = Field(
+        default=None,
+        description="可选的只读搜索命令，只允许 rg 或 grep，禁止写入、删除和更新操作。",
+    )
     timeout_seconds: int = Field(default=10, description="搜索命令超时时间，范围为 1–30 秒。")
 
 
 class FileReadToolInput(BaseModel):
-    scope_path: str = Field(default=".", description="读取范围，必须位于 /root/AI-Oral-exam 项目目录内。")
-    file_path: str = Field(default="", description="要读取的文件路径，必须位于 scope_path 和项目目录内。")
+    file_path: str = Field(description="要读取的文件路径，必须位于工具绑定的允许范围内。")
     start_line: Optional[int] = Field(default=None, description="可选的起始行号，从 1 开始。")
     end_line: Optional[int] = Field(default=None, description="可选的结束行号。")
     max_bytes: int = Field(default=200_000, description="最多返回的 UTF-8 字节数，范围为 1KB–1MB。")
 
 
+class ScopedFileReadToolInput(FileReadToolInput):
+    scope_path: str = Field(default=".", description="读取范围；只能在工具绑定的允许目录内进一步缩小范围。")
+    file_path: str = Field(default="", description="要读取的文件路径，必须位于 scope_path 和工具绑定的允许范围内。")
+
+
 InfoSearchDescription = (
-    "在 /root/AI-Oral-exam 项目范围内执行受保护的只读文本搜索。"
-    "仅允许 rg 或 grep 查询命令，禁止 shell 控制符、重定向、命令串联、写入删除操作以及项目范围外的路径。"
-    "使用 scope_path、query 和 file_globs 定位相关材料。"
-    "shell_command 为可选参数，但仍会经过安全校验。"
+    "仅在工程绑定的允许范围 {allowed_scope} 内执行只读文本搜索。"
+    "使用 query 和 file_globs 定位材料。"
+)
+ScopedInfoSearchDescription = (
+    InfoSearchDescription
+    + "scope_path 只能进一步缩小该范围；"
+    + "shell_command 只允许通过安全校验的 rg 或 grep 查询。"
 )
 
 FileReadDescription = (
-    "在 /root/AI-Oral-exam 项目范围内读取文件或指定行区间。"
-    "file_path 必须位于 scope_path 和项目目录内，不执行任何搜索或写入操作。"
+    "仅在工程绑定的允许范围 {allowed_scope} 内读取文件或指定行区间。"
+    "file_path 必须位于绑定范围内，不执行写入操作。"
+)
+ScopedFileReadDescription = (
+    FileReadDescription
+    + "scope_path 只能进一步缩小该范围。"
 )
 
 class _InfoSearchToolBase(BaseTool):
-    """搜索和文件读取工具共用的项目路径、安全校验和结果处理逻辑。"""
+    """搜索和读取工具共用的绑定范围、安全校验和结果处理逻辑。"""
+
+    def __init__(self, name: str, allowed_scope: str | Path):
+        super().__init__(name)
+        scope = Path(allowed_scope).expanduser().resolve(strict=False)
+        if not scope.exists() or not (scope.is_dir() or scope.is_file()):
+            raise ValueError(f"allowed_scope must be an existing file or directory: {scope}")
+        self.allowed_scope = scope
+
+    def _inside_allowed_scope(self, path: Path) -> bool:
+        if self.allowed_scope.is_file():
+            return path == self.allowed_scope
+        try:
+            path.relative_to(self.allowed_scope)
+        except ValueError:
+            return False
+        return True
 
     def _resolve_scope(self, scope_path: str, read_mode: bool = False) -> tuple[Optional[Path], Optional[str]]:
         scope = self._resolve_scope_path(scope_path)
         if scope is None:
             if read_mode:
-                return None, self._json_read_error("PATH_OUTSIDE_PROJECT", scope_path, "scope_path must be inside /root/AI-Oral-exam")
-            return None, self._json_error("PATH_OUTSIDE_PROJECT", scope_path, "scope_path must be inside /root/AI-Oral-exam")
+                return None, self._json_read_error("PATH_OUTSIDE_ALLOWED_SCOPE", scope_path, "scope_path must stay inside the bound allowed_scope")
+            return None, self._json_error("PATH_OUTSIDE_ALLOWED_SCOPE", scope_path, "scope_path must stay inside the bound allowed_scope")
         if not scope.exists():
             if read_mode:
                 return None, self._json_read_error("SCOPE_NOT_FOUND", str(scope), "scope_path does not exist")
@@ -183,7 +213,7 @@ class _InfoSearchToolBase(BaseTool):
             command.extend(["-C", str(context_lines)])
         for glob_pattern in file_globs:
             command.extend(["-g", self._require_safe_glob(glob_pattern)])
-        command.extend([query, str(scope)])
+        command.extend(["-e", query, "--", str(scope)])
         return command
 
     def _build_grep_command(
@@ -198,9 +228,9 @@ class _InfoSearchToolBase(BaseTool):
         max_matches: int,
     ) -> list[str]:
         query = self._require_text(query, "query")
-        command = [executable, "-n", "-I"]
+        command = [executable, "-H", "-n", "-I"]
         if scope.is_dir():
-            command.append("-R")
+            command.append("-r")
         if not case_sensitive:
             command.append("-i")
         if not regex:
@@ -209,7 +239,7 @@ class _InfoSearchToolBase(BaseTool):
             command.extend(["-C", str(context_lines)])
         for glob_pattern in file_globs:
             command.append(f"--include={self._require_safe_glob(glob_pattern)}")
-        command.extend(["-m", str(max_matches), query, str(scope)])
+        command.extend(["-m", str(max_matches), "-e", query, "--", str(scope)])
         return command
 
     def _run_query_command(
@@ -249,7 +279,7 @@ class _InfoSearchToolBase(BaseTool):
             stdout = stdout.encode("utf-8", errors="replace")[:MAX_STDOUT_BYTES].decode("utf-8", errors="replace")
             truncated = True
 
-        matches = self._parse_rg_json(stdout, max_matches) if parser_mode == "rg" else self._parse_plain_matches(stdout, max_matches)
+        matches = self._parse_rg_json(stdout, max_matches, scope) if parser_mode == "rg" else self._parse_plain_matches(stdout, max_matches, scope)
         if len(matches) >= max_matches:
             truncated = True
 
@@ -258,8 +288,9 @@ class _InfoSearchToolBase(BaseTool):
         payload = {
             "ok": ok,
             "mode": "info_search",
+            "allowed_scope": str(self.allowed_scope),
             "scope_path": str(scope),
-            "relative_scope_path": self._relative_to_project(scope),
+            "relative_scope_path": self._relative_to_allowed_scope(scope),
             "query": query,
             "command": command,
             "returncode": completed.returncode,
@@ -284,7 +315,7 @@ class _InfoSearchToolBase(BaseTool):
         base_scope = scope if scope.is_dir() else scope.parent
         path = self._resolve_path_against_scope(file_path, base_scope)
         if path is None:
-            return self._json_read_error("PATH_OUTSIDE_PROJECT", file_path, "file_path escapes project root")
+            return self._json_read_error("PATH_OUTSIDE_ALLOWED_SCOPE", file_path, "file_path escapes the bound allowed_scope")
         if scope.is_dir():
             try:
                 path.relative_to(scope.resolve())
@@ -322,8 +353,9 @@ class _InfoSearchToolBase(BaseTool):
             {
                 "ok": True,
                 "mode": "file_read",
+                "allowed_scope": str(self.allowed_scope),
                 "file_path": str(path),
-                "relative_file_path": self._relative_to_project(path),
+                "relative_file_path": self._relative_to_allowed_scope(path),
                 "start_line": resolved_start,
                 "end_line": resolved_end,
                 "total_lines": total_lines,
@@ -348,7 +380,7 @@ class _InfoSearchToolBase(BaseTool):
         end = self._clamp_int(end_line, start, max(start, total_lines), end_default)
         return start, end
 
-    def _parse_rg_json(self, stdout: str, max_matches: int) -> list[dict]:
+    def _parse_rg_json(self, stdout: str, max_matches: int, scope: Path) -> list[dict]:
         matches = []
         for line in stdout.splitlines():
             if len(matches) >= max_matches:
@@ -373,7 +405,7 @@ class _InfoSearchToolBase(BaseTool):
                 )
             matches.append(
                 {
-                    "file_path": self._relative_to_project(Path(path_text)) if path_text else "",
+                    "file_path": self._relative_to_allowed_scope(Path(path_text), scope) if path_text else "",
                     "absolute_file_path": path_text,
                     "line_number": data.get("line_number"),
                     "line": line_text,
@@ -382,7 +414,7 @@ class _InfoSearchToolBase(BaseTool):
             )
         return matches
 
-    def _parse_plain_matches(self, stdout: str, max_matches: int) -> list[dict]:
+    def _parse_plain_matches(self, stdout: str, max_matches: int, scope: Path) -> list[dict]:
         matches = []
         for line in stdout.splitlines():
             if len(matches) >= max_matches:
@@ -396,7 +428,7 @@ class _InfoSearchToolBase(BaseTool):
                 line_number = int(line_number_text)
             matches.append(
                 {
-                    "file_path": self._relative_to_project(Path(file_path)) if file_path else "",
+                    "file_path": self._relative_to_allowed_scope(Path(file_path), scope) if file_path else "",
                     "absolute_file_path": file_path,
                     "line_number": line_number,
                     "line": text,
@@ -458,23 +490,33 @@ class _InfoSearchToolBase(BaseTool):
                 command[0] = executable
             if not any(item.startswith("-n") or item == "--line-number" for item in command):
                 command.insert(1, "-n")
+            if "-H" not in command and "--with-filename" not in command:
+                command.insert(1, "-H")
             if not any("R" in item or "r" in item for item in command if item.startswith("-")):
-                command.insert(1, "-R")
+                command.insert(1, "-r")
             parser_mode = "grep"
 
-        path_tokens = self._extract_existing_path_tokens(command[1:])
+        path_tokens = self._extract_existing_path_tokens(command[1:], scope)
         for path_token in path_tokens:
             path = self._resolve_path_against_scope(path_token, scope)
             if path is None:
-                return self._guard_error("PATH_OUTSIDE_PROJECT", raw, f"path argument escapes project root: {path_token}")
+                return self._guard_error("PATH_OUTSIDE_ALLOWED_SCOPE", raw, f"path argument escapes the bound allowed_scope: {path_token}")
+            allowed_scope = scope if scope.is_dir() else scope.parent
+            try:
+                path.relative_to(allowed_scope.resolve())
+            except ValueError:
+                return self._guard_error("PATH_OUTSIDE_SCOPE", raw, f"path argument escapes scope_path: {path_token}")
+            if scope.is_file() and path != scope.resolve():
+                return self._guard_error("PATH_OUTSIDE_SCOPE", raw, f"path argument must match scope_path: {path_token}")
         if not path_tokens:
             command.append(str(scope))
         return {"ok": True, "command": command, "parser_mode": parser_mode}
 
-    def _extract_existing_path_tokens(self, tokens: list[str]) -> list[str]:
+    def _extract_existing_path_tokens(self, tokens: list[str], scope: Path) -> list[str]:
         result = []
         skip_next = False
         options_with_value = {"-g", "--glob", "-e", "--regexp", "-C", "-A", "-B", "-m", "--max-count", "--context"}
+        base = scope if scope.is_dir() else scope.parent
         for index, token in enumerate(tokens):
             if skip_next:
                 skip_next = False
@@ -484,34 +526,25 @@ class _InfoSearchToolBase(BaseTool):
                 continue
             if token.startswith("-"):
                 continue
-            candidate = Path(token).expanduser()
+            raw = Path(token).expanduser()
+            candidate = raw if raw.is_absolute() else base / raw
             if candidate.exists() or (index == len(tokens) - 1 and ("/" in token or token in {".", ".."})):
                 result.append(token)
         return result
 
     def _resolve_scope_path(self, scope_path: str) -> Optional[Path]:
-        if not scope_path:
-            return None
+        if str(scope_path or ".").strip() in {"", "."}:
+            return self.allowed_scope
         raw_path = Path(str(scope_path)).expanduser()
-        if not raw_path.is_absolute():
-            raw_path = PROJECT_ROOT / raw_path
-        path = raw_path.resolve()
-        try:
-            path.relative_to(PROJECT_ROOT)
-        except ValueError:
-            return None
-        return path
+        base = self.allowed_scope if self.allowed_scope.is_dir() else self.allowed_scope.parent
+        path = (raw_path if raw_path.is_absolute() else base / raw_path).resolve()
+        return path if self._inside_allowed_scope(path) else None
 
     def _resolve_path_against_scope(self, value: str, scope: Path) -> Optional[Path]:
         raw_path = Path(str(value)).expanduser()
-        if not raw_path.is_absolute():
-            raw_path = scope / raw_path
-        path = raw_path.resolve()
-        try:
-            path.relative_to(PROJECT_ROOT)
-        except ValueError:
-            return None
-        return path
+        base = scope if scope.is_dir() else scope.parent
+        path = (raw_path if raw_path.is_absolute() else base / raw_path).resolve()
+        return path if self._inside_allowed_scope(path) else None
 
     def _require_safe_glob(self, glob_pattern: str) -> str:
         text = self._require_text(glob_pattern, "file_glob")
@@ -519,9 +552,13 @@ class _InfoSearchToolBase(BaseTool):
             raise ValueError(f"unsafe file_glob: {glob_pattern}")
         return text
 
-    def _relative_to_project(self, path: Path) -> str:
+    def _relative_to_allowed_scope(self, path: Path, scope: Path | None = None) -> str:
+        base = self.allowed_scope if self.allowed_scope.is_dir() else self.allowed_scope.parent
+        if not path.is_absolute() and scope is not None:
+            search_base = scope if scope.is_dir() else scope.parent
+            path = search_base / path
         try:
-            return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+            return path.resolve().relative_to(base).as_posix()
         except (OSError, ValueError):
             return str(path)
 
@@ -548,6 +585,7 @@ class _InfoSearchToolBase(BaseTool):
             "ok": False,
             "mode": "info_search",
             "error_type": error_type,
+            "allowed_scope": str(self.allowed_scope),
             "error_message": message,
             "raw_command": raw_command,
             "matches": [],
@@ -560,7 +598,7 @@ class _InfoSearchToolBase(BaseTool):
             "ok": False,
             "mode": "info_search",
             "error_type": error_type,
-            "project_root": str(PROJECT_ROOT),
+            "allowed_scope": str(self.allowed_scope),
             "scope_path": str(scope_path or ""),
             "command": command or [],
             "error_message": error_message,
@@ -573,7 +611,7 @@ class _InfoSearchToolBase(BaseTool):
             "ok": False,
             "mode": "file_read",
             "error_type": error_type,
-            "project_root": str(PROJECT_ROOT),
+            "allowed_scope": str(self.allowed_scope),
             "file_path": str(file_path or ""),
             "error_message": error_message,
             "content": "",
@@ -591,9 +629,9 @@ class _InfoSearchToolBase(BaseTool):
 class InfoSearchTool(_InfoSearchToolBase):
     """仅负责项目范围内的只读文本搜索。"""
 
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.description = InfoSearchDescription
+    def __init__(self, name: str, allowed_scope: str | Path):
+        super().__init__(name, allowed_scope)
+        self.description = ScopedInfoSearchDescription.format(allowed_scope=self.allowed_scope)
 
     def _run(
         self,
@@ -628,9 +666,9 @@ class InfoSearchTool(_InfoSearchToolBase):
 class FileReadTool(_InfoSearchToolBase):
     """仅负责项目范围内的文件或行区间读取。"""
 
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.description = FileReadDescription
+    def __init__(self, name: str, allowed_scope: str | Path):
+        super().__init__(name, allowed_scope)
+        self.description = ScopedFileReadDescription.format(allowed_scope=self.allowed_scope)
 
     def _run(
         self,

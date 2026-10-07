@@ -1,9 +1,9 @@
-﻿from AIOralExamSystem.utils.base_object import BaseObject
+from AIOralExamSystem.utils.base_object import BaseObject
 from langchain_openai import ChatOpenAI
 
 from loguru import logger
 
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.tools import BaseTool
 from langchain_core.agents import AgentAction, AgentFinish
 from typing import Awaitable, Callable, List
@@ -16,231 +16,12 @@ from langchain.agents.middleware import (
     ModelCallLimitMiddleware,
     ModelRequest,
     ModelResponse,
-    SummarizationMiddleware,
 )
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 import asyncio
 import json
 import math
+from AIOralExamSystem.Agent.base_prompt import BasePrompt
 
-
-
-class TokenBudgetMiddleware(AgentMiddleware):
-    """Prune old tool results before model input exceeds the configured budget."""
-
-    def __init__(
-        self,
-        agent_name: str,
-        model,
-        max_input_tokens: int = 12000,
-        token_counter: Callable | None = None,
-    ):
-        super().__init__()
-        self.agent_name = agent_name
-        self.model = model
-        self.max_input_tokens = max(1, int(max_input_tokens or 12000))
-        self.token_counter = token_counter
-
-    def wrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
-        request = self._prune_request_if_needed(request)
-        return handler(request)
-
-    async def awrap_model_call(
-        self,
-        request: ModelRequest,
-        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
-        request = self._prune_request_if_needed(request)
-        return await handler(request)
-
-    def _prune_request_if_needed(self, request: ModelRequest) -> ModelRequest:
-        input_tokens = self._count_request_tokens(request)
-        if input_tokens <= self.max_input_tokens:
-            logger.info(
-                f"[{self.agent_name}] next_model_input_tokens={input_tokens}, "
-                f"limit={self.max_input_tokens}"
-            )
-            return request
-
-        pruned_messages = self._keep_latest_tool_result(request.messages)
-        pruned_request = request.override(messages=pruned_messages)
-        pruned_tokens = self._count_request_tokens(pruned_request)
-        logger.warning(
-            f"[{self.agent_name}] model input tokens exceeded limit; "
-            f"before={input_tokens}, after_prune={pruned_tokens}, "
-            f"limit={self.max_input_tokens}"
-        )
-
-        if pruned_tokens > self.max_input_tokens:
-            raise ValueError(
-                f"Agent input tokens still exceed limit after pruning old tool results: "
-                f"{pruned_tokens} > {self.max_input_tokens}"
-            )
-
-        return pruned_request
-
-    def _count_request_tokens(self, request: ModelRequest) -> int:
-        messages = self._request_messages(request)
-        tools = getattr(request, "tools", None)
-
-        if self.token_counter is not None:
-            counted = self._call_token_counter(messages)
-            if counted is not None:
-                return counted + self._estimate_tools_tokens(tools)
-
-        model = getattr(request, "model", None) or self.model
-        if hasattr(model, "get_num_tokens_from_messages"):
-            try:
-                return int(model.get_num_tokens_from_messages(messages, tools=tools))
-            except TypeError:
-                try:
-                    return int(model.get_num_tokens_from_messages(messages)) + self._estimate_tools_tokens(tools)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        return self._estimate_messages_tokens(messages) + self._estimate_tools_tokens(tools)
-
-    def _request_messages(self, request: ModelRequest) -> list[BaseMessage]:
-        messages = list(getattr(request, "messages", None) or [])
-        system_message = getattr(request, "system_message", None)
-        if system_message is not None and system_message not in messages:
-            return [system_message, *messages]
-        return messages
-
-    def _call_token_counter(self, messages: list[BaseMessage]) -> int | None:
-        try:
-            return int(self.token_counter(messages))
-        except TypeError:
-            return None
-        except Exception:
-            return None
-
-    def _keep_latest_tool_result(self, messages: list[BaseMessage]) -> list[BaseMessage]:
-        latest_tool_index = None
-        latest_tool_call_id = None
-        for index, message in enumerate(messages):
-            if isinstance(message, ToolMessage):
-                latest_tool_index = index
-                latest_tool_call_id = getattr(message, "tool_call_id", None)
-
-        if latest_tool_index is None or not latest_tool_call_id:
-            return messages
-
-        pruned_messages: list[BaseMessage] = []
-        for index, message in enumerate(messages):
-            if isinstance(message, ToolMessage):
-                if index == latest_tool_index:
-                    pruned_messages.append(message)
-                continue
-
-            if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
-                cleaned_message = self._clean_ai_tool_calls(message, latest_tool_call_id)
-                if cleaned_message is not None:
-                    pruned_messages.append(cleaned_message)
-                continue
-
-            pruned_messages.append(message)
-
-        return pruned_messages
-
-    def _clean_ai_tool_calls(self, message: AIMessage, keep_tool_call_id: str | None) -> AIMessage | None:
-        keep_ids = {keep_tool_call_id} if keep_tool_call_id else set()
-        tool_calls = [
-            tool_call
-            for tool_call in getattr(message, "tool_calls", None) or []
-            if tool_call.get("id") in keep_ids
-        ]
-
-        if tool_calls:
-            return self._copy_message(
-                message,
-                {
-                    "tool_calls": tool_calls,
-                    "invalid_tool_calls": self._filter_tool_calls(
-                        getattr(message, "invalid_tool_calls", None) or [],
-                        keep_ids,
-                    ),
-                    "additional_kwargs": self._filter_additional_kwargs(message, keep_ids),
-                },
-            )
-
-        if self._has_content(message.content):
-            return self._copy_message(
-                message,
-                {
-                    "tool_calls": [],
-                    "invalid_tool_calls": [],
-                    "additional_kwargs": self._filter_additional_kwargs(message, set()),
-                },
-            )
-
-        return None
-
-    def _copy_message(self, message: BaseMessage, updates: dict) -> BaseMessage:
-        if hasattr(message, "model_copy"):
-            return message.model_copy(update=updates)
-        return message.copy(update=updates)
-
-    def _filter_tool_calls(self, tool_calls: list, keep_ids: set[str]) -> list:
-        return [tool_call for tool_call in tool_calls if tool_call.get("id") in keep_ids]
-
-    def _filter_additional_kwargs(self, message: AIMessage, keep_ids: set[str]) -> dict:
-        additional_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
-        raw_tool_calls = additional_kwargs.get("tool_calls")
-        if isinstance(raw_tool_calls, list):
-            filtered = [tool_call for tool_call in raw_tool_calls if tool_call.get("id") in keep_ids]
-            if filtered:
-                additional_kwargs["tool_calls"] = filtered
-            else:
-                additional_kwargs.pop("tool_calls", None)
-        return additional_kwargs
-
-    def _has_content(self, content) -> bool:
-        if isinstance(content, str):
-            return bool(content.strip())
-        if isinstance(content, list):
-            return bool(content)
-        return content is not None
-
-    def _estimate_messages_tokens(self, messages: list[BaseMessage]) -> int:
-        total = 0
-        for message in messages:
-            total += self._estimate_text_tokens(getattr(message, "type", "message"))
-            total += self._estimate_text_tokens(str(getattr(message, "content", "")))
-            if isinstance(message, AIMessage):
-                total += self._estimate_text_tokens(json.dumps(getattr(message, "tool_calls", []) or [], ensure_ascii=False))
-            if isinstance(message, ToolMessage):
-                total += self._estimate_text_tokens(str(getattr(message, "tool_call_id", "")))
-            total += 4
-        return total
-
-    def _estimate_tools_tokens(self, tools) -> int:
-        if not tools:
-            return 0
-        payloads = []
-        for tool in tools:
-            payloads.append(
-                {
-                    "name": getattr(tool, "name", ""),
-                    "description": getattr(tool, "description", ""),
-                    "args": getattr(tool, "args", None),
-                }
-            )
-        return self._estimate_text_tokens(json.dumps(payloads, ensure_ascii=False, default=str))
-
-    def _estimate_text_tokens(self, text: str) -> int:
-        if not text:
-            return 0
-        cjk_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
-        visible_chars = sum(1 for char in text if not char.isspace())
-        non_cjk_chars = max(0, visible_chars - cjk_chars)
-        return cjk_chars + math.ceil(non_cjk_chars / 2)
 
 
 class FinalizationBudgetMiddleware(AgentMiddleware):
@@ -368,10 +149,40 @@ class ToolNameHandler(BaseCallbackHandler):
             self.callback(name)
 
 
+class ModelRoundProgressMiddleware(AgentMiddleware):
+    """Report main Agent model calls without counting tool-internal models."""
+
+    def __init__(self, callback: Callable[[str], None]):
+        super().__init__()
+        self.callback = callback
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelResponse:
+        self.callback("started")
+        response = handler(request)
+        self.callback("completed")
+        return response
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        self.callback("started")
+        response = await handler(request)
+        self.callback("completed")
+        return response
+
+
 class BaseAgent(BaseObject):
-    def __init__(self, name: str, model_settings: dict, thinking: bool = False, response_format: bool = False, temperature: float = 0.0, top_p = 1, show_tool_io: bool | None = None, tool_event_callback: Callable[[str], None] | None = None):
+    def __init__(self, name: str, model_settings: dict, thinking: bool = False, response_format: bool = False, temperature: float = 0.0, top_p = 1, show_tool_io: bool | None = None, tool_event_callback: Callable[[str], None] | None = None, model_round_callback: Callable[[str], None] | None = None):
         super().__init__()
         self._name = name
+        self._model_round_callback = model_round_callback
+        self.prompt_builder = getattr(self, "prompt_builder", None) or BasePrompt()
         self.tools: List[BaseTool] = self.get_tools()
         if self.tools:
             tool_names = [t.name for t in self.tools]
@@ -419,29 +230,11 @@ class BaseAgent(BaseObject):
                 "callbacks": callbacks,
             })
         logger.info(f"agent {self._name} init success")
-        self.queue = asyncio.Queue()
-
-        self.global_monitor = GlobalMonitor()
 
     
 
     async def run(self, **kwargs):
         await self.start_heartbeat()
-        self.event_signal = asyncio.Event()
-
-        await self.global_monitor._queue.put(
-            "reqObj",
-            (
-                {"id": self.id, "name": self._name},
-                self.rule,
-                self.event_signal,
-                self.queue,
-                "start",
-            ),
-        )
-
-        await self.event_signal.wait()
-
         cleanup_in_wrapper = False
         try:
             ret = self.execute(**kwargs)
@@ -464,16 +257,6 @@ class BaseAgent(BaseObject):
 
         finally:
             if not cleanup_in_wrapper:
-                await self.global_monitor._queue.put(
-                    "reqObj",
-                    (
-                        {"id": self.id, "name": self._name},
-                        self.rule,
-                        self.event_signal,
-                        self.queue,
-                        "stop",
-                    ),
-                )
                 await self.stop_heartbeat()
         
     async def _wrap_async_generator(self, agen):
@@ -488,16 +271,6 @@ class BaseAgent(BaseObject):
                 yield self._build_error_stream_chunk(exc)
 
         finally:
-            await self.global_monitor._queue.put(
-                "reqObj",
-                (
-                    {"id": self.id, "name": self._name},
-                    self.rule,
-                    self.event_signal,
-                    self.queue,
-                    "stop",
-                ),
-            )
             await self.stop_heartbeat()
 
     def _build_error_response(self, exc: Exception) -> dict:
@@ -558,7 +331,6 @@ class BaseAgent(BaseObject):
         )
     
     def _build_middlewares(self, model_settings: dict):
-        summarization_config = model_settings.get("summarization") or {}
         max_agent_model_calls = max(
             1,
             int(model_settings.get("max_agent_model_calls", 40) or 40),
@@ -577,13 +349,12 @@ class BaseAgent(BaseObject):
             if configured_rewrite_tool in registered_tool_names
             else None
         )
-        middlewares = [
-            TokenBudgetMiddleware(
-                agent_name=self._name,
-                model=self.model,
-                max_input_tokens=model_settings.get("max_input_tokens", 12000),
-                token_counter=summarization_config.get("token_counter"),
-            ),
+        middlewares = self.prompt_builder.build_compression_middlewares(
+            agent_name=self._name,
+            model=self.model,
+            model_settings=model_settings,
+        )
+        middlewares.extend((
             ModelCallLimitMiddleware(
                 run_limit=max_agent_model_calls,
                 exit_behavior="end",
@@ -594,35 +365,23 @@ class BaseAgent(BaseObject):
                 warning_ratio=finish_warning_ratio,
                 rewrite_tool_name=rewrite_tool_name,
             ),
-        ]
-
-        if not summarization_config.get("enabled", False):
-            return middlewares
-
-        middleware_kwargs = {
-            "model": summarization_config.get("model", self.model),
-            "trigger": summarization_config.get("trigger", ("tokens", 8000)),
-            "keep": summarization_config.get("keep", ("messages", 8)),
-        }
-
-        if summarization_config.get("trim_tokens_to_summarize") is not None:
-            middleware_kwargs["trim_tokens_to_summarize"] = summarization_config["trim_tokens_to_summarize"]
-        if summarization_config.get("summary_prompt") is not None:
-            middleware_kwargs["summary_prompt"] = summarization_config["summary_prompt"]
-        if summarization_config.get("token_counter") is not None:
-            middleware_kwargs["token_counter"] = summarization_config["token_counter"]
-
-        middlewares.append(SummarizationMiddleware(**middleware_kwargs))
+        ))
+        if self._model_round_callback is not None:
+            middlewares.append(ModelRoundProgressMiddleware(self._model_round_callback))
         return middlewares
-    
-    async def rule(self, obj_id: str, active_nodes: dict) -> bool:
-        if obj_id in active_nodes:
-            logger.info(f"obj_id {obj_id} is in active_nodes")
-            return False
-            logger.info(f"active_nodes={active_nodes}")
-            return False
-        return True
-        
+
+    def build_prompt_messages(self, task: str) -> list[dict[str, str]]:
+        return self.prompt_builder.build_messages(task)
+
+    def update_prompt_context(
+        self,
+        section: str,
+        values: dict,
+        *,
+        replace: bool = False,
+    ) -> None:
+        self.prompt_builder.update_context(section, values, replace=replace)
+
     def get_tools(self):
         return []
     

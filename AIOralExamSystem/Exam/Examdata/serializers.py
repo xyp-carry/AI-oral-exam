@@ -117,9 +117,20 @@ def record_row_to_dict(row) -> Dict[str, object]:
         "standard_answer",
         "is_preset_question",
         "created_at",
+        "root_question_id",
+        "parent_question_id",
+        "root_order",
+        "followup_order",
+        "chain_depth",
+        "relation",
+        "question_evaluation_json",
+        "question_evaluation_status",
     )
     result = dict(zip(fields, row))
     result["is_preset_question"] = bool(result.get("is_preset_question"))
+    result["question_evaluation"] = _json_loads(
+        result.pop("question_evaluation_json", None), None
+    )
     value = result.get("created_at")
     if value is not None:
         result["created_at"] = value.strftime("%Y-%m-%d %H:%M:%S")

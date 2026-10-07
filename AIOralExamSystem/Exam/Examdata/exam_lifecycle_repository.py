@@ -97,6 +97,8 @@ def _readiness(cursor, state: Dict[str, object], owner_user_id: str) -> Dict[str
     )
     agents = cursor.fetchall()
     roles = [str(row[0]) for row in agents]
+    if is_mode_c and "tts" not in roles:
+        missing.append("TTS_MODEL_REQUIRED")
     for role, code in (
         ("scorer", "JUDGE_MODEL_REQUIRED"),
         ("setter", "SETTER_MODEL_REQUIRED"),
@@ -107,7 +109,7 @@ def _readiness(cursor, state: Dict[str, object], owner_user_id: str) -> Dict[str
     expected_types = {
         "scorer": "chat", "setter": "chat", "main_judger": "chat",
         "report_judger": "chat", "adjudicator": "chat",
-        "mineru": "file", "embedding": "embedding",
+        "mineru": "file", "embedding": "embedding", "tts": "tts",
     }
     for role, _, model_type, model_status, model_owner in agents:
         role = str(role)

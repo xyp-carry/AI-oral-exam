@@ -20,7 +20,6 @@ from AIOralExamSystem.Exam.OutputSetting import build_final_review_output
 from AIOralExamSystem.Exam.QAmanagerA import QAmanagerA
 from AIOralExamSystem.Graph.ExamA import ExamAFlow
 from AIOralExamSystem.message.session import ExamMessageSession
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 
 
 def get_current_user_id(current_user: dict) -> Optional[str]:
@@ -133,14 +132,12 @@ class InterviewServiceA(FrameProcessor):
 
     def __init__(
         self,
-        monitor: GlobalMonitor,
         current_user: dict,
         history: List[Dict[str, str]] = [],
         qa_manager: Optional[QAmanagerA] = None,
         startup_error: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
-        self.monitor = monitor
         self.current_user = current_user
         self.history = history
         self.qa_manager = qa_manager

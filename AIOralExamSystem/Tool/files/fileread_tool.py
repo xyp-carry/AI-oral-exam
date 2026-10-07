@@ -7,7 +7,7 @@ from AIOralExamSystem.Tool.base_tool import BaseTool
 PROJECT_ROOT = Path("/root/AI-Oral-exam").resolve()
 
 
-class FileReadTool(BaseTool):
+class DocumentChunkReadTool(BaseTool):
     """Read a project-scoped file and split it into conservative text chunks."""
 
     def __init__(self, name: str):
@@ -156,3 +156,6 @@ class FileReadTool(BaseTool):
             },
             ensure_ascii=False,
         )
+
+# Keep the old import name available to existing callers.
+FileReadTool = DocumentChunkReadTool

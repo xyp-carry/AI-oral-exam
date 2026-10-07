@@ -23,9 +23,17 @@ def merge_node_outputs(
     return merged
 
 
+def merge_context_events(
+    left: list[dict[str, Any]] | None,
+    right: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    return [*(left or []), *(right or [])]
+
+
 class BaseGraphState(TypedDict, total=False):
     data: Any
     node_outputs: Annotated[dict[NodeId, Any], merge_node_outputs]
+    context_events: Annotated[list[dict[str, Any]], merge_context_events]
 
 
 class ParsedGraph(TypedDict):
@@ -55,8 +63,10 @@ class BaseGraph:
         self,
         graph_list: Iterable[Sequence[NodeId]],
         node_functions: Mapping[NodeId, NodeFunction] | None = None,
+        *,
+        nodes: Iterable[NodeId] | None = None,
     ):
-        self.parsed_graph = self.parse_graph_list(graph_list)
+        self.parsed_graph = self.parse_graph_list(graph_list, nodes=nodes)
         self.nodes = self.parsed_graph["nodes"]
         self.edges = self.parsed_graph["edges"]
         self.incoming = self.parsed_graph["incoming"]
@@ -72,10 +82,21 @@ class BaseGraph:
             self.add_node(node_id, node_function)
 
     @staticmethod
-    def parse_graph_list(graph_list: Iterable[Sequence[NodeId]]) -> ParsedGraph:
+    def parse_graph_list(
+        graph_list: Iterable[Sequence[NodeId]],
+        *,
+        nodes: Iterable[NodeId] | None = None,
+    ) -> ParsedGraph:
         edges: list[Edge] = []
-        nodes: list[NodeId] = []
+        parsed_nodes: list[NodeId] = []
         seen_nodes: set[NodeId] = set()
+        seen_edges: set[Edge] = set()
+
+        for node_id in nodes or ():
+            if node_id in seen_nodes:
+                raise ValueError(f"Duplicate node: {node_id!r}")
+            parsed_nodes.append(node_id)
+            seen_nodes.add(node_id)
 
         for item in graph_list:
             if len(item) != 2:
@@ -83,28 +104,31 @@ class BaseGraph:
             source, target = item[0], item[1]
             if source == target:
                 raise ValueError(f"Self-loop is not allowed: {item!r}")
+            if (source, target) in seen_edges:
+                raise ValueError(f"Duplicate edge: {item!r}")
+            seen_edges.add((source, target))
             edges.append((source, target))
 
             for node_id in (source, target):
                 if node_id not in seen_nodes:
-                    nodes.append(node_id)
+                    parsed_nodes.append(node_id)
                     seen_nodes.add(node_id)
 
-        if not edges:
-            raise ValueError("graph_list must contain at least one edge.")
+        if not parsed_nodes:
+            raise ValueError("graph must contain at least one node.")
 
-        incoming: dict[NodeId, list[NodeId]] = {node_id: [] for node_id in nodes}
-        outgoing: dict[NodeId, list[NodeId]] = {node_id: [] for node_id in nodes}
+        incoming: dict[NodeId, list[NodeId]] = {node_id: [] for node_id in parsed_nodes}
+        outgoing: dict[NodeId, list[NodeId]] = {node_id: [] for node_id in parsed_nodes}
         for source, target in edges:
             incoming[target].append(source)
             outgoing[source].append(target)
 
-        entry_nodes = [node_id for node_id in nodes if not incoming[node_id]]
-        terminal_nodes = [node_id for node_id in nodes if not outgoing[node_id]]
-        layers = BaseGraph._build_layers(nodes, incoming, outgoing)
+        entry_nodes = [node_id for node_id in parsed_nodes if not incoming[node_id]]
+        terminal_nodes = [node_id for node_id in parsed_nodes if not outgoing[node_id]]
+        layers = BaseGraph._build_layers(parsed_nodes, incoming, outgoing)
 
         return {
-            "nodes": nodes,
+            "nodes": parsed_nodes,
             "edges": edges,
             "incoming": incoming,
             "outgoing": outgoing,
@@ -119,7 +143,9 @@ class BaseGraph:
         self.graph_nodes[node_id] = node_function
         self._compiled_graph = None
 
-    async def arun(self, state: Mapping[str, Any] | Any = None) -> dict[str, Any]:
+    async def arun(
+        self, state: Mapping[str, Any] | Any = None, *, include_state: bool = False
+    ) -> dict[str, Any]:
         input_state: BaseGraphState
         if isinstance(state, Mapping):
             input_state = dict(state)
@@ -128,6 +154,8 @@ class BaseGraph:
 
         graph = self.compile()
         output_state = await graph.ainvoke(input_state)
+        if include_state:
+            return dict(output_state)
         return {"data": output_state.get("data")}
 
     def compile(self):
@@ -184,7 +212,12 @@ class BaseGraph:
             if not isinstance(output_state, dict):
                 raise TypeError("Node function must return a dict, for example: {'data': state}.")
 
-            return {"node_outputs": {node_id: self._extract_data(output_state)}}
+            update: BaseGraphState = {
+                "node_outputs": {node_id: self._extract_data(output_state)}
+            }
+            if "context_events" in output_state:
+                update["context_events"] = list(output_state["context_events"])
+            return update
 
         return graph_node
 
@@ -200,6 +233,9 @@ class BaseGraph:
         else:
             node_state["data"] = [node_outputs[parent] for parent in parents]
 
+        node_state["upstream_outputs"] = {
+            parent: node_outputs[parent] for parent in parents
+        }
         node_state["node_id"] = node_id
         return node_state
 

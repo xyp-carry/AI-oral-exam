@@ -11,11 +11,23 @@ from AIOralExamSystem.Tool.git.git_tool import (
 )
 from AIOralExamSystem.Tool.files.documentoutput import RewriteTool, TextReplacement
 from AIOralExamSystem.Tool.files.folder_tool import FolderStatsTool, FolderTreeTool
+from AIOralExamSystem.Tool.files.filesystem_tools import (
+    FILESYSTEM_TOOL_DESCRIPTIONS,
+    FileInfoInput,
+    ListDirectoryInput,
+    ProjectFileTool,
+    ReadFileInput,
+    ReadHeadInput,
+    ReadLinesInput,
+    ReadTailInput,
+    SearchFilesInput,
+    TreeInput,
+)
 from AIOralExamSystem.Tool.files.info_search_tool import (
     FileReadTool,
-    FileReadToolInput,
+    ScopedFileReadToolInput,
     InfoSearchTool,
-    InfoSearchToolInput,
+    ScopedInfoSearchToolInput,
 )
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
@@ -358,10 +370,12 @@ class FileRunnerAgent(BaseAgent):
         你是一名优秀的评委助理，现在有一个仓库和一个模板，你需要根据模板对仓库进行评审，可以调用其中的工具，。
 
         ## 可用工具
-        - folderTree：查看项目目录结构。
-        - folderStats：统计文件数量。
-        - infoSearch：搜索项目材料，定位文件和匹配位置。
-        - readFile：读取指定文件或行区间的完整内容。
+        - read_file / read_lines：按字节或按行读取项目文件。
+        - search_files：搜索文本，返回匹配行、行号和上下文。
+        - list_directory / tree：列出目录或按深度查看目录树。
+        - file_info：查看文件大小、修改时间、权限和类型。
+        - read_head / read_tail：预览文件前后若干行。
+        - folderTree / folderStats / infoSearch / readFile：兼容旧步骤的文件工具。
         - ReadDocument：无需参数，直接读取当前目标文档的完整内容。
         - gitHistoryReader：读取必要的 Git 历史证据。
         - rewriteDocument：根据 file_path 和多个 old_text/new_text 修改文件。
@@ -382,6 +396,82 @@ class FileRunnerAgent(BaseAgent):
         ''' + self.outerprompt
     
     def get_tools(self):
+        allowed_scopes = ", ".join(
+            str(root) for root in [self.allowed_scope_root, *self.extra_allowed_roots]
+        )
+        async def run_project_file_tool(operation: str, path: str, **kwargs) -> str:
+            path_resolution = self.resolve_runner_tool_path(path, ".")
+            if not path_resolution.get("ok"):
+                return json.dumps(path_resolution, ensure_ascii=False)
+            filesystem_tool = ProjectFileTool(
+                f"runner_{operation}_tool",
+                operation=operation,
+                scope_root=path_resolution["scope_root"],
+            )
+            result = await filesystem_tool.execute(
+                path=path_resolution["resolved_path"], **kwargs,
+            )
+            return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+
+        @tool(args_schema=ReadFileInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["read_file"])
+        async def read_file(
+            path: str, offset: int = 0, length: int | None = None,
+            mode: Literal["text", "binary"] = "text",
+        ) -> str:
+            return await run_project_file_tool(
+                "read_file", path, offset=offset, length=length, mode=mode,
+            )
+
+        @tool(args_schema=ReadLinesInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["read_lines"])
+        async def read_lines(
+            path: str, start_line: int = 1, end_line: int | None = None,
+        ) -> str:
+            return await run_project_file_tool(
+                "read_lines", path, start_line=start_line, end_line=end_line,
+            )
+
+        @tool(args_schema=SearchFilesInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["search_files"])
+        async def search_files(
+            pattern: str, path: str = ".", regex: bool = False,
+            context: int = 0, case_sensitive: bool = False,
+            file_globs: list[str] | None = None, max_matches: int = 200,
+            timeout_seconds: int = 10,
+        ) -> str:
+            return await run_project_file_tool(
+                "search_files", path, pattern=pattern, regex=regex,
+                context=context, case_sensitive=case_sensitive,
+                file_globs=file_globs or [], max_matches=max_matches,
+                timeout_seconds=timeout_seconds,
+            )
+
+        @tool(args_schema=ListDirectoryInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["list_directory"])
+        async def list_directory(
+            path: str = ".", recursive: bool = False,
+            pattern: str = "*", max_entries: int = 5000,
+        ) -> str:
+            return await run_project_file_tool(
+                "list_directory", path, recursive=recursive,
+                pattern=pattern, max_entries=max_entries,
+            )
+
+        @tool(args_schema=FileInfoInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["file_info"])
+        async def file_info(path: str) -> str:
+            return await run_project_file_tool("file_info", path)
+
+        @tool(args_schema=ReadHeadInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["read_head"])
+        async def read_head(path: str, n: int = 10) -> str:
+            return await run_project_file_tool("read_head", path, n=n)
+
+        @tool(args_schema=ReadTailInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["read_tail"])
+        async def read_tail(path: str, n: int = 10) -> str:
+            return await run_project_file_tool("read_tail", path, n=n)
+
+        @tool(args_schema=TreeInput, description=FILESYSTEM_TOOL_DESCRIPTIONS["tree"])
+        async def tree(path: str = ".", depth: int = 2, max_entries: int = 5000) -> str:
+            return await run_project_file_tool(
+                "tree", path, depth=depth, max_entries=max_entries,
+            )
+
         @tool(args_schema=FolderTreeToolInput, description=FolderTreeToolDescription)
         async def folderTree(
             folder_path: str = '',
@@ -414,7 +504,7 @@ class FileRunnerAgent(BaseAgent):
                 file_type=file_type,
             )
 
-        @tool(args_schema=InfoSearchToolInput, description=RunnerInfoSearchDescription)
+        @tool(args_schema=ScopedInfoSearchToolInput, description=f"{RunnerInfoSearchDescription} 允许范围：{allowed_scopes}。")
         async def infoSearch(
             scope_path: str = ".",
             query: str = "",
@@ -429,7 +519,7 @@ class FileRunnerAgent(BaseAgent):
             scope_resolution = self.resolve_runner_tool_path(scope_path, ".")
             if not scope_resolution.get("ok"):
                 return json.dumps(scope_resolution, ensure_ascii=False)
-            info_search_tool = InfoSearchTool("runner_info_search_tool")
+            info_search_tool = InfoSearchTool("runner_info_search_tool", allowed_scope=scope_resolution["scope_root"])
             return await info_search_tool.execute(
                 scope_path=scope_resolution["resolved_path"],
                 query=query,
@@ -442,7 +532,7 @@ class FileRunnerAgent(BaseAgent):
                 timeout_seconds=timeout_seconds,
             )
 
-        @tool(args_schema=FileReadToolInput, description=RunnerFileReadDescription)
+        @tool(args_schema=ScopedFileReadToolInput, description=f"{RunnerFileReadDescription} 允许范围：{allowed_scopes}。")
         async def readFile(
             scope_path: str = ".",
             file_path: str = "",
@@ -456,7 +546,7 @@ class FileRunnerAgent(BaseAgent):
             file_resolution = self.resolve_runner_tool_path(file_path, "")
             if not file_resolution.get("ok"):
                 return json.dumps(file_resolution, ensure_ascii=False)
-            file_read_tool = FileReadTool("runner_file_read_tool")
+            file_read_tool = FileReadTool("runner_file_read_tool", allowed_scope=scope_resolution["scope_root"])
             return await file_read_tool.execute(
                 scope_path=scope_resolution["resolved_path"],
                 file_path=file_resolution["resolved_path"],
@@ -477,7 +567,7 @@ class FileRunnerAgent(BaseAgent):
             file_resolution = self.resolve_runner_tool_path(target_path, "")
             if not file_resolution.get("ok"):
                 return json.dumps(file_resolution, ensure_ascii=False)
-            file_read_tool = FileReadTool("runner_document_read_tool")
+            file_read_tool = FileReadTool("runner_document_read_tool", allowed_scope=file_resolution["scope_root"])
             return await file_read_tool.execute(
                 file_path=file_resolution["resolved_path"],
                 start_line=None,
@@ -511,7 +601,12 @@ class FileRunnerAgent(BaseAgent):
                 replacements=replacements,
             )
             return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
-        return [folderTree, folderStats, infoSearch, readFile, read_document, gitHistoryReader, rewriteDocument] + self.extra_tools
+        return [
+            read_file, read_lines, search_files, list_directory, file_info,
+            read_head, read_tail, tree,
+            folderTree, folderStats, infoSearch, readFile,
+            read_document, gitHistoryReader, rewriteDocument,
+        ] + self.extra_tools
 
     async def execute(self, step: dict) -> str:
         if not isinstance(step, dict):

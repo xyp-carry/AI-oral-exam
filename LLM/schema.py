@@ -1,4 +1,4 @@
-﻿from .config import MODEL_STATUS_ACTIVE, MODEL_TABLE_NAME
+from .config import MODEL_STATUS_ACTIVE, MODEL_TABLE_NAME
 from .model_token_limits import MODEL_TOKEN_LIMITS, get_model_token_limits
 from .config import MODEL_TYPE_DEFAULT
 

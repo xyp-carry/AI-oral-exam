@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import time
 from typing import Any, Literal
 
@@ -25,6 +25,39 @@ LOCAL_MODEL_PARAM_KEYS = {"max_context_tokens", "max_input_tokens"}
 
 
 MODEL_PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
+    "volcengine": {
+        "label": "火山引擎",
+        "model_type": "tts",
+        "base_url": "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
+        "models": {
+            "seed-tts-2.0": {
+                "label": "语音合成 2.0 · 解说小明",
+                "model_name": "seed-tts-2.0",
+                "params_schema": {
+                    "speaker": {
+                        "type": "string",
+                        "default": "zh_male_jieshuoxiaoming_uranus_bigtts",
+                    },
+                    "speech_rate": {
+                        "type": "integer",
+                        "default": 0,
+                        "min": -50,
+                        "max": 100,
+                    },
+                    "app_id": {
+                        "type": "string",
+                        "description": "Old-console APP ID; use model_api_key for its Access Token",
+                    },
+                    "sample_rate": {
+                        "type": "integer",
+                        "default": 24000,
+                        "enum": [8000, 16000, 22050, 24000, 32000, 44100, 48000],
+                    },
+                    "timeout_seconds": {"type": "number", "default": 60, "min": 1},
+                },
+            },
+        },
+    },
     "mineru": {
         "label": "MinerU",
         "model_type": "file",
@@ -83,6 +116,7 @@ MODEL_PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
     },
     "glm": {
         "label": "GLM",
+        "model_type": "chat",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "models": {
             "glm-5.1": {
@@ -111,6 +145,7 @@ MODEL_PROVIDER_TEMPLATES: dict[str, dict[str, Any]] = {
     },
     "deepseek": {
         "label": "DeepSeek",
+        "model_type": "chat",
         "base_url": "https://api.deepseek.com",
         "models": {
             "deepseek-v4-flash": {
@@ -149,7 +184,7 @@ class ModelCreateRequest(BaseModel):
     provider: str
     provider_model_key: str
     model_api_key: str
-    model_type: Literal["chat", "embedding", "file"] = "chat"
+    model_type: Literal["chat", "embedding", "file", "tts"] = "chat"
     display_name: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -158,7 +193,7 @@ class ModelTestRequest(BaseModel):
     provider: str
     provider_model_key: str
     model_api_key: str
-    model_type: Literal["chat", "embedding", "file"] = "chat"
+    model_type: Literal["chat", "embedding", "file", "tts"] = "chat"
     params: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -176,7 +211,7 @@ def raise_model_value_error(error: ValueError) -> None:
         "MODEL_NAME_REQUIRED": (400, "model_name cannot be empty"),
         "MODEL_API_KEY_REQUIRED": (400, "model_api_key cannot be empty"),
         "MODEL_ID_REQUIRED": (400, "model_id cannot be empty"),
-        "MODEL_TYPE_INVALID": (400, "model_type must be chat, embedding, or file"),
+        "MODEL_TYPE_INVALID": (400, "model_type must be chat, embedding, file, or tts"),
     }
     if message in error_map:
         status_code, detail = error_map[message]
@@ -328,7 +363,20 @@ def build_model_config(req: ModelCreateRequest | ModelTestRequest) -> dict[str, 
         req.provider,
         req.provider_model_key,
     )
-    params = validate_model_params(req.params, model_template)
+    raw_params = dict(req.params)
+    if provider == "volcengine" and "voice_id" in raw_params:
+        if "speaker" in raw_params:
+            raise_param_error("speaker", "speaker and voice_id cannot both be set")
+        raw_params["speaker"] = raw_params.pop("voice_id")
+    params = validate_model_params(raw_params, model_template)
+    if provider == "volcengine":
+        params["speaker"] = params["speaker"].strip()
+        if not params["speaker"]:
+            raise_param_error("speaker", "value cannot be empty")
+    if "app_id" in params:
+        params["app_id"] = params["app_id"].strip()
+        if not params["app_id"]:
+            raise_param_error("app_id", "value cannot be empty")
     params.update(build_model_token_limits(model_template))
     model_type = str(req.model_type or "chat").strip().lower()
     expected_model_type = provider_template.get("model_type", "chat")
@@ -403,6 +451,8 @@ def message_to_text(message) -> str:
 
 async def test_model_response(config: dict[str, Any]) -> dict[str, Any]:
     started_at = time.perf_counter()
+    if config.get("model_type") == "tts":
+        return await _test_tts_model(config, started_at)
     if config.get("model_type") == "embedding":
         return await _test_embedding_model(config, started_at)
     if config.get("model_type") == "file":
@@ -449,6 +499,88 @@ async def test_model_response(config: dict[str, Any]) -> dict[str, Any]:
         "success": True,
         "duration_ms": duration_ms,
         "response_preview": response_text[:200],
+    }
+
+
+async def _test_tts_model(config: dict[str, Any], started_at: float) -> dict[str, Any]:
+    from contextlib import aclosing
+    from tts.factory import create_tts_backend
+    from tts.types import TTSRequest
+
+    settings = dict(config["params"])
+    settings.update({
+        "provider": config["provider"],
+        "api_key": config["model_api_key"],
+        "resource_id": config["provider_model_key"],
+        "url": config["base_url"],
+    })
+    backend = create_tts_backend(settings)
+
+    async def receive_audio() -> tuple[int, int, float]:
+        chunks = 0
+        audio_bytes = 0
+        first_chunk_ms = 0.0
+        async with aclosing(backend.synthesize(TTSRequest("你好"))) as stream:
+            async for payload in stream:
+                if payload.data:
+                    if chunks == 0:
+                        first_chunk_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                    chunks += 1
+                    audio_bytes += len(payload.data)
+        if not chunks:
+            raise ValueError("TTS returned no audio")
+        return chunks, audio_bytes, first_chunk_ms
+
+    try:
+        chunks, audio_bytes, first_chunk_ms = await asyncio.wait_for(
+            receive_audio(), timeout=MODEL_TEST_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError as error:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=model_error_detail("MODEL_TEST_TIMEOUT", "TTS model test timed out"),
+        ) from error
+    except Exception as error:
+        detail = {
+            **model_error_detail("MODEL_TEST_FAILED", "TTS model test failed"),
+            "error_class": error.__class__.__name__,
+            "error": str(error),
+        }
+        response = getattr(error, "response", None)
+        if response is not None:
+            http_status = getattr(response, "status_code", None)
+            if http_status is not None:
+                detail["http_status"] = http_status
+            log_id = getattr(response, "headers", {}).get("x-tt-logid")
+            if log_id:
+                detail["log_id"] = log_id
+            try:
+                provider_error = response.text.strip()
+            except Exception:
+                provider_error = ""
+            if provider_error:
+                detail["provider_error"] = provider_error.replace(
+                    config["model_api_key"], "[REDACTED]"
+                )[:500]
+            if http_status == 403:
+                detail["hint"] = (
+                    "TTS authentication was rejected. Check the API Key and that "
+                    "seed-tts-2.0 is enabled for this account."
+                )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=detail,
+        ) from error
+    finally:
+        await backend.close()
+
+    return {
+        "success": True,
+        "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        "response_preview": "audio received",
+        "audio_chunks": chunks,
+        "audio_bytes": audio_bytes,
+        "first_chunk_ms": first_chunk_ms,
     }
 
 
@@ -647,6 +779,14 @@ def llm_routes(app, args):
     )
     async def list_embedding_model_configs(current_user: dict = Depends(get_current_user)):
         return await list_model_configs_by_type("embedding", current_user)
+
+    @app.get(
+        "/tts_model",
+        tags=["LLM"],
+        summary="List TTS model configurations",
+    )
+    async def list_tts_model_configs(current_user: dict = Depends(get_current_user)):
+        return await list_model_configs_by_type("tts", current_user)
 
     @app.get(
         "/file_model",

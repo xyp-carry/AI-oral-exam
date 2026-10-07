@@ -7,20 +7,17 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from AIOralExamSystem.Exam.OutputSetting import build_final_review_output
 from AIOralExamSystem.Exam.QAserverA import QAserverA
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 
 
 class InterviewServiceA(FrameProcessor):
     def __init__(
         self,
-        monitor: GlobalMonitor,
         current_user: dict,
         history: List[Dict[str, str]] = [],
         exam_state: Optional[Any] = None,
         startup_error: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
-        self.monitor = monitor
         self.current_user = current_user
         self.history = history
         self.exam_state = exam_state

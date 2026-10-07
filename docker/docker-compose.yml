@@ -1,39 +1,58 @@
-version: '3.8'
-
 services:
-  # 1. Meilisearch 核心服务
-  meilisearch:
-    image: getmeili/meilisearch:v1.37
-    container_name: meilisearch
-    restart: always      # 容器挂掉或 Docker 重启时自动重启
-    ports:
-      - "7700:7700"
-    environment:
-      - MEILI_ENV=development
-    volumes:
-      - ./meili_data:/meili_data
-
-  # 2. Meilisearch-UI 可视化管理服务
-  meilisearch-ui:
-    image: eyeix/meilisearch-ui:latest
-    container_name: meilisearch-ui
-    ports:
-      - "24900:24900"   # 将原来的 <your-port> 替换为了 24900，你可以改成自己想要的，比如 8080:24900
-    restart: on-failure:5
-    depends_on:
-      - meilisearch     # 确保 Meilisearch 先启动
-
-  # 3. MySQL 数据库服务
+  # 1. MySQL 数据库服务
   mysql:
-    image: mysql:latest
+    image: mysql:8.4
     container_name: mysql-db
+    restart: always
     ports:
-      - "3306:3306"      # 宿主机端口:容器端口
-    restart: always      # 容器挂掉或 Docker 重启时自动重启
+      - "3306:3306"
     environment:
-      MYSQL_ROOT_PASSWORD: 123456   # 设置 root 用户密码 (请修改为你自己的强密码)
+      MYSQL_ROOT_PASSWORD: 123456   # root 用户密码，与后端配置保持一致
     command:
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_unicode_ci
     volumes:
       - ./mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p123456"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # 2. 后端服务（Python / FastAPI，HTTPS 端口 7860）
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+    container_name: ai-exam-backend
+    restart: on-failure
+    ports:
+      - "7860:7860"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: 123456
+    volumes:
+      - ../.env:/app/.env:ro                                  # 大模型等 API 密钥配置
+      - ../updateFile:/app/updateFile                         # 上传文件持久化
+      - ../exam_records:/app/exam_records                     # 考试录音等记录持久化
+      - model_cache:/root/.cache                              # funasr 等模型缓存，避免重复下载
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # 3. 前端服务（Node / Vite，端口 5173）
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: ai-exam-frontend
+    restart: on-failure
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  model_cache:

@@ -9,6 +9,7 @@ import bleach
 from AIOralExamSystem.Agent.General_Agent import GeneralAgent
 from AIOralExamSystem.Graph.ExamA import parse_agent_json
 from AIOralExamSystem.Exam.Examdata.final_review_repository import claim_final_review
+from AIOralExamSystem.Exam.Examdata.c_question_repository import save_c_exam_questions
 
 
 class _ReportText(HTMLParser):
@@ -63,9 +64,11 @@ class CFinalReviewService:
         async with self.lock:
             async with self.claim(exam_id, user_id) as writer:
                 if writer.saved:
+                    await save_c_exam_questions(exam_id, user_id, writer.saved["review"])
                     return writer.saved
                 if self.pending is None:
                     frozen = deepcopy(review)
+                    await save_c_exam_questions(exam_id, user_id, frozen)
                     payload = {
                         "question_reviews": frozen["question_reviews"],
                         "scores": frozen["scores"],

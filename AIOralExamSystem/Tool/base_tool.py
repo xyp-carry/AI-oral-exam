@@ -5,7 +5,6 @@ from asyncio import iscoroutinefunction
 from typing import Any, Optional
 
 from AIOralExamSystem.utils.base_object import BaseObject
-from AIOralExamSystem.utils.monitor import GlobalMonitor
 
 
 DEFAULT_TOOL_TIMEOUT_SECONDS = 60
@@ -20,32 +19,13 @@ class BaseTool(BaseObject):
         self._name = name
         self._approval_result: Optional[bool] = None
         self._error_msg: str = ""
-        self._monitor = GlobalMonitor()
-        self.queue = asyncio.Queue()
         self.timeout_seconds = DEFAULT_TOOL_TIMEOUT_SECONDS
-
-    async def request_approval(self):
-        self.event_signal = asyncio.Event()
-        await self._monitor._queue.put(
-            "reqObj",
-            (
-                {"id": self.id, "name": self.name},
-                self.rule,
-                self.event_signal,
-                self.queue,
-                "start",
-            ),
-        )
-        await self.event_signal.wait()
 
     async def execute(self, *args, **kwargs) -> Any:
         heartbeat_started = False
-        approval_requested = False
         try:
             await self.start_heartbeat()
             heartbeat_started = True
-            await self.request_approval()
-            approval_requested = True
             return await asyncio.wait_for(
                 self._execute_run(*args, **kwargs),
                 timeout=self.timeout_seconds,
@@ -60,20 +40,6 @@ class BaseTool(BaseObject):
                     await self.stop_heartbeat()
                 except Exception as exc:
                     logger.warning("Failed to stop tool heartbeat for %s: %s", self.name, exc)
-            if approval_requested and hasattr(self, "event_signal"):
-                try:
-                    await self._monitor._queue.put(
-                        "reqObj",
-                        (
-                            {"id": self.id, "name": self.name},
-                            self.rule,
-                            self.event_signal,
-                            self.queue,
-                            "stop",
-                        ),
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to notify tool stop for %s: %s", self.name, exc)
 
     async def _execute_run(self, *args, **kwargs) -> Any:
         run_method = self._run
@@ -116,9 +82,3 @@ class BaseTool(BaseObject):
         """
         raise NotImplementedError(f"tool [{self.name}] must implement _run")
 
-    async def rule(self, obj_id: str, active_nodes: dict) -> bool:
-        if obj_id in active_nodes:
-            return False
-        if len(active_nodes) > 3:
-            return False
-        return True

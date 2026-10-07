@@ -838,7 +838,7 @@ class ExamCFlow:
         self.probe_initial_score = 3
         self.probe_score = self.probe_initial_score
         self.probe_turn_count = 0
-        self.max_probe_turns = 3
+        self.max_probe_turns = 2
         self.probe_score_history: List[Dict[str, Any]] = []
         self.last_followup_kind = "none"
         self.last_followup_focus = ""
@@ -1440,6 +1440,10 @@ class ExamCFlow:
             )
             question_chain.append({
                 "question_id": question_id,
+                "root_question_id": root_id,
+                "parent_question_id": question.get("parent_question_id"),
+                "chain_depth": int(question.get("chain_depth") or 0),
+                "relation": str(question.get("relation") or "root"),
                 "question": question_value(
                     question,
                     ("question_content", "content", "question", "text"),

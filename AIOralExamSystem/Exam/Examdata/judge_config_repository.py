@@ -27,6 +27,7 @@ async def upsert_exam_judge_config(
     report_judger_model_id: Optional[str] = None,
     mineru_model_id: Optional[str] = None,
     embedding_model_id: Optional[str] = None,
+    tts_model_id: Optional[str] = None,
     clear_optional_roles: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     return await asyncio.to_thread(
@@ -43,6 +44,7 @@ async def upsert_exam_judge_config(
         report_judger_model_id,
         mineru_model_id,
         embedding_model_id,
+        tts_model_id,
         clear_optional_roles,
     )
 
@@ -123,6 +125,7 @@ def _upsert_exam_judge_config_sync(
     report_judger_model_id: Optional[str],
     mineru_model_id: Optional[str],
     embedding_model_id: Optional[str],
+    tts_model_id: Optional[str],
     clear_optional_roles: Optional[List[str]],
 ) -> Dict[str, object]:
     ensure_database()
@@ -137,11 +140,14 @@ def _upsert_exam_judge_config_sync(
     report_judger_model_id = _normalize_optional_text(report_judger_model_id)
     mineru_model_id = _normalize_optional_text(mineru_model_id)
     embedding_model_id = _normalize_optional_text(embedding_model_id)
+    tts_model_id = _normalize_optional_text(tts_model_id)
     clear_optional_roles = list(clear_optional_roles or [])
-    if set(clear_optional_roles) - {"mineru", "embedding"}:
+    if set(clear_optional_roles) - {"mineru", "embedding", "tts"}:
         raise ValueError("AGENT_ROLE_INVALID")
     if ("mineru" in clear_optional_roles and mineru_model_id) or (
         "embedding" in clear_optional_roles and embedding_model_id
+    ) or (
+        "tts" in clear_optional_roles and tts_model_id
     ):
         raise ValueError("AGENT_ROLE_INVALID")
     model_settings_by_agent = model_settings_by_agent or {}
@@ -162,6 +168,7 @@ def _upsert_exam_judge_config_sync(
                     + ([report_judger_model_id] if report_judger_model_id else [])
                     + ([mineru_model_id] if mineru_model_id else [])
                     + ([embedding_model_id] if embedding_model_id else [])
+                    + ([tts_model_id] if tts_model_id else [])
                 ),
                 created_by,
             )
@@ -217,6 +224,8 @@ def _upsert_exam_judge_config_sync(
                 roles_to_replace.append("mineru")
             if embedding_model_id:
                 roles_to_replace.append("embedding")
+            if tts_model_id:
+                roles_to_replace.append("tts")
             roles_to_replace.extend(clear_optional_roles)
             cursor.execute(
                 f"""
@@ -294,6 +303,16 @@ def _upsert_exam_judge_config_sync(
                     0,
                     embedding_model_id,
                     model_settings_by_agent.get("embedding"),
+                    now,
+                )
+            if tts_model_id:
+                _insert_config_agent(
+                    cursor,
+                    active_config_id,
+                    "tts",
+                    0,
+                    tts_model_id,
+                    model_settings_by_agent.get("tts"),
                     now,
                 )
         connection.commit()
@@ -394,7 +413,7 @@ def _upsert_exam_optional_agent_models_sync(
     created_by: str,
     model_ids_by_role: Dict[str, Optional[str]],
 ) -> Dict[str, object]:
-    if not model_ids_by_role or set(model_ids_by_role) - {"mineru", "embedding"}:
+    if not model_ids_by_role or set(model_ids_by_role) - {"mineru", "embedding", "tts"}:
         raise ValueError("AGENT_ROLE_INVALID")
     ensure_database()
     exam_item_id = _normalize_required_text(exam_item_id, "EXAM_ITEM_ID_REQUIRED")
@@ -583,6 +602,7 @@ def _fetch_exam_judge_config_by_exam_item(
     report_judger = None
     mineru = None
     embedding = None
+    tts = None
     for row in cursor.fetchall():
         agent = _agent_row_to_dict(row, include_api_key)
         agent_role = agent["agent_role"]
@@ -598,6 +618,8 @@ def _fetch_exam_judge_config_by_exam_item(
             mineru = agent
         elif agent_role == "embedding":
             embedding = agent
+        elif agent_role == "tts":
+            tts = agent
         elif agent_role == "scorer":
             scorers.append(agent)
     config["scorers"] = scorers
@@ -607,6 +629,7 @@ def _fetch_exam_judge_config_by_exam_item(
     config["report_judger"] = report_judger
     config["mineru"] = mineru
     config["embedding"] = embedding
+    config["tts"] = tts
     return config
 
 

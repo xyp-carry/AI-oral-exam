@@ -13,6 +13,7 @@ def ensure_tables(connection) -> None:
 
 def _create_stage_0_base_tables(cursor) -> None:
     _create_exam_sessions_table(cursor)
+    _create_exam_analysis_documents_table(cursor)
     _create_exam_report_scores_table(cursor)
     _create_courses_table(cursor)
     # 表说明：user_model_library 记录用户配置的可用 LLM 模型，供后续评分 Agent 配置引用。
@@ -62,6 +63,7 @@ def _ensure_schema_migrations(cursor) -> None:
         _ensure_exam_questions_is_preset_question,
         _ensure_exam_questions_based_on_record_index_type,
         _ensure_exam_questions_exam_id_index,
+        _ensure_exam_questions_chain_fields,
         _ensure_exam_report_scores_extra_fields,
         _ensure_exam_report_templates_exam_item_schema,
         _ensure_exam_report_templates_content_schema,
@@ -95,6 +97,8 @@ def _create_exam_sessions_table(cursor) -> None:
             exam_completed TINYINT(1) NOT NULL DEFAULT 0,
             exam_active_token CHAR(36) DEFAULT NULL,
             exam_active_until DATETIME DEFAULT NULL,
+            exam_pipeline_id CHAR(36) DEFAULT NULL,
+            exam_pipeline_owner CHAR(36) DEFAULT NULL,
             ended_at DATETIME DEFAULT NULL,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_exam_sessions_user_id (user_id),
@@ -102,6 +106,28 @@ def _create_exam_sessions_table(cursor) -> None:
             INDEX idx_exam_sessions_exam_item_id (exam_item_id),
             INDEX idx_exam_sessions_active_until (exam_item_id, exam_active_until),
             UNIQUE KEY uniq_exam_session_user_course_item (user_id, course_id, exam_item_id)
+        ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """)
+
+
+def _create_exam_analysis_documents_table(cursor) -> None:
+    # Keep the latest completed Markdown analysis for each user/course/exam.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS exam_analysis_documents (
+            user_id VARCHAR(128) NOT NULL,
+            course_id VARCHAR(128) NOT NULL,
+            exam_id CHAR(36) NOT NULL,
+            analysis_id CHAR(36) NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            markdown_content LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                ON UPDATE CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, course_id, exam_id),
+            CONSTRAINT fk_exam_analysis_documents_exam
+                FOREIGN KEY (exam_id)
+                REFERENCES exam_sessions(exam_id)
+                ON DELETE CASCADE
         ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """)
 
@@ -168,8 +194,17 @@ def _create_exam_questions_table(cursor) -> None:
             evaluation TEXT,
             standard_answer TEXT,
             is_preset_question TINYINT(1) NOT NULL DEFAULT 0,
+            root_question_id VARCHAR(128) DEFAULT NULL,
+            parent_question_id VARCHAR(128) DEFAULT NULL,
+            root_order INT DEFAULT NULL,
+            followup_order INT NOT NULL DEFAULT 0,
+            chain_depth INT NOT NULL DEFAULT 0,
+            relation VARCHAR(32) DEFAULT NULL,
+            question_evaluation_json JSON DEFAULT NULL,
+            question_evaluation_status VARCHAR(32) DEFAULT NULL,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_exam_questions_exam_id (exam_id),
+            INDEX idx_exam_questions_chain (exam_id, root_order, followup_order),
             INDEX idx_exam_questions_dimension (question_dimension),
             CONSTRAINT fk_exam_questions_exam
                 FOREIGN KEY (exam_id)
@@ -1097,6 +1132,40 @@ def _ensure_exam_questions_exam_id_index(cursor) -> None:
         cursor.execute("ALTER TABLE exam_questions ADD INDEX idx_exam_questions_exam_id (exam_id)")
 
 
+def _ensure_exam_questions_chain_fields(cursor) -> None:
+    database = LOCAL_MYSQL_CONFIG["database"]
+    fields = (
+        ("root_question_id", "VARCHAR(128) DEFAULT NULL"),
+        ("parent_question_id", "VARCHAR(128) DEFAULT NULL"),
+        ("root_order", "INT DEFAULT NULL"),
+        ("followup_order", "INT NOT NULL DEFAULT 0"),
+        ("chain_depth", "INT NOT NULL DEFAULT 0"),
+        ("relation", "VARCHAR(32) DEFAULT NULL"),
+        ("question_evaluation_json", "JSON DEFAULT NULL"),
+        ("question_evaluation_status", "VARCHAR(32) DEFAULT NULL"),
+    )
+    for column_name, column_type in fields:
+        cursor.execute(
+            """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+               WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'exam_questions'
+                 AND COLUMN_NAME = %s""",
+            (database, column_name),
+        )
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(f"ALTER TABLE exam_questions ADD COLUMN {column_name} {column_type}")
+    cursor.execute(
+        """SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS
+           WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'exam_questions'
+             AND INDEX_NAME = 'idx_exam_questions_chain'""",
+        (database,),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE exam_questions ADD INDEX idx_exam_questions_chain "
+            "(exam_id, root_order, followup_order)"
+        )
+
+
 def _ensure_exam_questions_is_preset_question(cursor) -> None:
     database = LOCAL_MYSQL_CONFIG["database"]
     cursor.execute(
@@ -1225,6 +1294,8 @@ def _ensure_exam_sessions_activity_fields(cursor) -> None:
     for column_name, column_type in (
         ("exam_active_token", "CHAR(36) DEFAULT NULL"),
         ("exam_active_until", "DATETIME DEFAULT NULL"),
+        ("exam_pipeline_id", "CHAR(36) DEFAULT NULL"),
+        ("exam_pipeline_owner", "CHAR(36) DEFAULT NULL"),
     ):
         cursor.execute(
             """

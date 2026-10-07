@@ -65,7 +65,7 @@ class FinalReviewWriter:
                     WHERE exam_id = %s AND final_review_html IS NULL
                     """,
                     (html, to_json(review), scores["total"], to_json(scores["dimensions"]),
-                     sum(item["question_count"] for item in review["question_reviews"]),
+                     sum(len(item.get("question_chain") or []) for item in review["question_reviews"]),
                      int(review["status"] == "finished"), self.exam_id),
                 )
                 if cursor.rowcount != 1:
