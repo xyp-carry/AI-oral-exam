@@ -2,22 +2,45 @@ from .config import LOCAL_MYSQL_CONFIG
 from LLM.schema import create_llm_tables
 
 
+class _SchemaStatements:
+    """DDL/迁移语句执行器：把游标式调用映射到 SQLAlchemy 连接上。
+
+    建表与增量迁移的 SQL 保持原文（INFORMATION_SCHEMA 检查 + ALTER），
+    通过 connection.exec_driver_sql 送入 SQLAlchemy 引擎执行。
+    """
+
+    def __init__(self, connection) -> None:
+        self._connection = connection
+        self._result = None
+
+    def execute(self, sql: str, params=None):
+        self._result = self._connection.exec_driver_sql(sql, params or ())
+        return self._result
+
+    def fetchone(self):
+        return self._result.fetchone() if self._result is not None else None
+
+    def fetchall(self):
+        return self._result.fetchall() if self._result is not None else []
+
+
 def ensure_tables(connection) -> None:
-    with connection.cursor() as cursor:
-        _create_stage_0_base_tables(cursor)
-        _create_stage_1_dependent_tables(cursor)
-        _create_stage_2_dependent_tables(cursor)
-        _create_stage_3_dependent_tables(cursor)
-        _ensure_schema_migrations(cursor)
+    statements = _SchemaStatements(connection)
+    _create_stage_0_base_tables(connection)
+    _create_stage_1_dependent_tables(statements)
+    _create_stage_2_dependent_tables(statements)
+    _create_stage_3_dependent_tables(statements)
+    _ensure_schema_migrations(statements)
 
 
-def _create_stage_0_base_tables(cursor) -> None:
-    _create_exam_sessions_table(cursor)
-    _create_exam_analysis_documents_table(cursor)
-    _create_exam_report_scores_table(cursor)
-    _create_courses_table(cursor)
+def _create_stage_0_base_tables(connection) -> None:
+    statements = _SchemaStatements(connection)
+    _create_exam_sessions_table(statements)
+    _create_exam_analysis_documents_table(statements)
+    _create_exam_report_scores_table(statements)
+    _create_courses_table(statements)
     # 表说明：user_model_library 记录用户配置的可用 LLM 模型，供后续评分 Agent 配置引用。
-    create_llm_tables(cursor)
+    create_llm_tables(connection)
 
 
 def _create_stage_1_dependent_tables(cursor) -> None:
@@ -47,14 +70,17 @@ def _ensure_schema_migrations(cursor) -> None:
         _ensure_exam_sessions_exam_item_id,
         _ensure_exam_sessions_extra_fields,
         _ensure_exam_sessions_activity_fields,
+        _ensure_exam_sessions_c_probe_turns,
         _ensure_exam_sessions_ended_at_nullable,
         _ensure_exam_sessions_unique_user_course_item,
-        _ensure_courses_course_name_unique_index,
+        _ensure_courses_owner_active_name_unique_index,
         _ensure_courses_invite_code_fields,
         _ensure_course_exam_items_availability_fields,
         _ensure_course_exam_items_need_code_repository,
         _ensure_course_exam_items_use_preset_questions,
         _ensure_course_exam_items_report_analysis,
+        _ensure_course_exam_items_c_probe_turns,
+        _ensure_course_exam_items_analysis_question_count,
         _ensure_course_exam_items_course_documents,
         _ensure_course_exam_items_lifecycle_fields,
         _ensure_course_exam_item_active_name_unique_index,
@@ -83,6 +109,7 @@ def _create_exam_sessions_table(cursor) -> None:
             exam_item_name VARCHAR(128) DEFAULT NULL,
             candidate_info_json JSON,
             total_score DOUBLE,
+            c_max_probe_turns INT DEFAULT NULL,
             exam_score DOUBLE DEFAULT NULL,
             dimension_count INT,
             question_count INT,
@@ -166,9 +193,13 @@ def _create_courses_table(cursor) -> None:
             invite_code_expires_at DATETIME DEFAULT NULL,
             invite_code_created_at DATETIME DEFAULT NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
+            active_course_name VARCHAR(128)
+                GENERATED ALWAYS AS (
+                    CASE WHEN status = 'active' THEN course_name ELSE NULL END
+                ) STORED,
             created_at DATETIME NOT NULL,
             updated_at DATETIME NOT NULL,
-            UNIQUE KEY uniq_courses_course_name (course_name),
+            UNIQUE KEY uniq_courses_owner_active_name (owner_teacher_id, active_course_name),
             UNIQUE KEY uniq_courses_invite_code (invite_code),
             INDEX idx_courses_owner_teacher_id (owner_teacher_id),
             INDEX idx_courses_status (status)
@@ -296,6 +327,8 @@ def _create_course_exam_items_table(cursor) -> None:
             enable_report_analysis TINYINT(1) NOT NULL DEFAULT 0,
             report_total_score DOUBLE DEFAULT NULL,
             report_judge_rule TEXT DEFAULT NULL,
+            c_max_probe_turns INT NOT NULL DEFAULT 2,
+            analysis_question_count INT NOT NULL DEFAULT 3,
             course_document_sources_json JSON DEFAULT NULL,
             exam_available_valid_times INT NOT NULL DEFAULT 0,
             exam_available_from DATETIME NOT NULL,
@@ -718,8 +751,61 @@ def _ensure_exam_sessions_user_id(cursor) -> None:
         cursor.execute("ALTER TABLE exam_sessions ADD INDEX idx_exam_sessions_user_id (user_id)")
 
 
-def _ensure_courses_course_name_unique_index(cursor) -> None:
+def _ensure_courses_owner_active_name_unique_index(cursor) -> None:
     database = LOCAL_MYSQL_CONFIG["database"]
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+          AND TABLE_NAME = 'courses'
+          AND COLUMN_NAME = 'active_course_name'
+        """,
+        (database,),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            """
+            ALTER TABLE courses
+            ADD COLUMN active_course_name VARCHAR(128)
+                GENERATED ALWAYS AS (
+                    CASE WHEN status = 'active' THEN course_name ELSE NULL END
+                ) STORED
+            """
+        )
+
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = %s
+          AND TABLE_NAME = 'courses'
+          AND INDEX_NAME = 'uniq_courses_owner_active_name'
+        """,
+        (database,),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            """
+            SELECT owner_teacher_id, course_name
+            FROM courses
+            WHERE status = 'active'
+            GROUP BY owner_teacher_id, course_name
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        )
+        duplicate = cursor.fetchone()
+        if duplicate is not None:
+            raise ValueError(
+                "duplicate active course_name exists for owner: "
+                f"{duplicate[0]}, {duplicate[1]}"
+            )
+        cursor.execute(
+            "ALTER TABLE courses ADD UNIQUE KEY uniq_courses_owner_active_name "
+            "(owner_teacher_id, active_course_name)"
+        )
+
     cursor.execute(
         """
         SELECT COUNT(*)
@@ -731,22 +817,7 @@ def _ensure_courses_course_name_unique_index(cursor) -> None:
         (database,),
     )
     if cursor.fetchone()[0] > 0:
-        return
-
-    cursor.execute(
-        """
-        SELECT course_name
-        FROM courses
-        GROUP BY course_name
-        HAVING COUNT(*) > 1
-        LIMIT 1
-        """
-    )
-    duplicate = cursor.fetchone()
-    if duplicate is not None:
-        raise ValueError(f"duplicate course_name exists: {duplicate[0]}")
-
-    cursor.execute("ALTER TABLE courses ADD UNIQUE KEY uniq_courses_course_name (course_name)")
+        cursor.execute("ALTER TABLE courses DROP INDEX uniq_courses_course_name")
 
 
 def _ensure_course_exam_item_active_name_unique_index(cursor) -> None:
@@ -1095,6 +1166,45 @@ def _ensure_course_exam_items_report_analysis(cursor) -> None:
         )
         if cursor.fetchone()[0] == 0:
             cursor.execute(f"ALTER TABLE course_exam_items ADD COLUMN {field_name} {field_type}")
+
+
+def _ensure_course_exam_items_c_probe_turns(cursor) -> None:
+    cursor.execute(
+        """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'course_exam_items'
+             AND COLUMN_NAME = 'c_max_probe_turns'""",
+        (LOCAL_MYSQL_CONFIG["database"],),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE course_exam_items "
+            "ADD COLUMN c_max_probe_turns INT NOT NULL DEFAULT 2"
+        )
+
+
+def _ensure_course_exam_items_analysis_question_count(cursor) -> None:
+    cursor.execute(
+        """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'course_exam_items'
+             AND COLUMN_NAME = 'analysis_question_count'""",
+        (LOCAL_MYSQL_CONFIG["database"],),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "ALTER TABLE course_exam_items "
+            "ADD COLUMN analysis_question_count INT NOT NULL DEFAULT 3"
+        )
+
+
+def _ensure_exam_sessions_c_probe_turns(cursor) -> None:
+    cursor.execute(
+        """SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+           WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'exam_sessions'
+             AND COLUMN_NAME = 'c_max_probe_turns'""",
+        (LOCAL_MYSQL_CONFIG["database"],),
+    )
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("ALTER TABLE exam_sessions ADD COLUMN c_max_probe_turns INT DEFAULT NULL")
 
 
 def _ensure_course_exam_items_course_documents(cursor) -> None:

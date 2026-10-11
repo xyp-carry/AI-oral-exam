@@ -1,6 +1,6 @@
 import asyncio
+import math
 from html import escape
-from time import monotonic
 from typing import Any, Dict, Mapping, Optional
 
 from loguru import logger
@@ -8,7 +8,6 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InputTransportMessageFrame,
-    LLMContextFrame,
     LLMTextFrame,
     OutputTransportMessageFrame,
     StartFrame,
@@ -20,50 +19,44 @@ from pathlib import Path
 from AIOralExamSystem.Exam.Examdata import (
     get_exam_judge_config_by_exam_id,
     get_exam_session_by_exam_id,
+    get_exam_item_by_id,
     list_ai_preset_questions_by_exam_item_and_user,
     list_preset_questions_by_exam_item,
 )
-from AIOralExamSystem.Exam.QAmanagerC import QAmanagerC
+from AIOralExamSystem.Exam.QAmanager import QAmanager
 from AIOralExamSystem.Graph.ExamC import ExamCFlow
 from AIOralExamSystem.message.session import ExamMessageSession
 from AIOralExamSystem.Exam.CFinalReview import CFinalReviewService
 from AIOralExamSystem.Exam.Examdata.final_review_repository import get_final_review
 from AIOralExamSystem.Exam.Examdata.c_question_repository import save_c_exam_questions
+from AIOralExamSystem.Exam.Examdata.c_score_repository import initialize_c_score_limits
+from OralService.CAnswerBoundaryProcessor import CAnswerEventFrame
 
 import time
 
 class InterviewServiceC(FrameProcessor):
-    """Pure Exam C processor for incremental text answers."""
+    """Run the C-mode exam session and publish its output."""
 
     SENTENCE_END_MARKS = ("。", ".")
 
     def __init__(
         self,
-        answer_idle_timeout_secs: float = 5.0,
         exam_id: Optional[str] = None,
-        min_chunk_interval_secs: float = 10.0,
-        min_chunk_chars: int = 50,
+        startup_error: Optional[Dict[str, object]] = None,
+        mode: str = "C",
         **_: Any,
     ):
         super().__init__()
-        self.answer_idle_timeout_secs = float(answer_idle_timeout_secs)
-        self.min_chunk_interval_secs = float(min_chunk_interval_secs)
-        self.min_chunk_chars = int(min_chunk_chars)
+        if mode not in {"B", "C"}:
+            raise ValueError("EXAM_MODE_INVALID")
+        self.mode = mode
         self.exam_id = str(exam_id or "").strip()
-        self.lock = asyncio.Lock()
+        self.startup_error = startup_error
         self.exam_graph_init_lock = asyncio.Lock()
         self.exam_graph: Optional[ExamMessageSession] = None
         self.exam_output_task: Optional[asyncio.Task] = None
         self.followup_poll_task: Optional[asyncio.Task] = None
-        self.answer_idle_task: Optional[asyncio.Task] = None
         self.current_question_id = ""
-        self.answer_buffer = ""
-        self.question_started_at = 0.0
-        self.answer_started_at = 0.0
-        self.last_chunk_sent_at = 0.0
-        self.answer_finished = False
-        self.has_answer_text = False
-        self.answer_finish_confirming = False
         self.startup_failed = False
         self.final_review_service = None
         self.pending_final_review = None
@@ -76,6 +69,23 @@ class InterviewServiceC(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartFrame):
+            if self.startup_error:
+                await self.push_frame(frame, direction)
+                self.startup_failed = True
+                message = str(
+                    self.startup_error.get("message")
+                    or "考试启动失败，请联系老师或稍后重试。"
+                )
+                await self.push_exam_event(
+                    {
+                        "type": "error",
+                        "error": str(self.startup_error.get("code") or "EXAM_STARTUP_ERROR"),
+                        "detail": message,
+                    }
+                )
+                await self.push_frame(LLMTextFrame(escape(message)), FrameDirection.DOWNSTREAM)
+                await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
+                return
             await self.ensure_exam_graph()
             await self.push_frame(frame, direction)
             return
@@ -85,10 +95,9 @@ class InterviewServiceC(FrameProcessor):
             if handled:
                 return
 
-        if isinstance(frame, LLMContextFrame):
-            handled = await self.handle_context_frame(frame)
-            if handled:
-                return
+        if isinstance(frame, CAnswerEventFrame):
+            await self.handle_answer_event(frame)
+            return
 
         if isinstance(frame, EndFrame):
             await self.close_exam_graph()
@@ -98,292 +107,49 @@ class InterviewServiceC(FrameProcessor):
     async def handle_input_message(self, frame: InputTransportMessageFrame) -> bool:
         message = frame.message or {}
         event_type = str(message.get("type") or message.get("message") or "").strip()
-
         if event_type == "finish":
             await self.ensure_exam_graph()
             if self.exam_graph is not None:
                 await self.exam_graph.handle_message({"type": "finish"})
             return True
-
         if self.pending_final_review is not None:
             return True
-
-        if event_type in {"speech_start", "speech_active"}:
-            await self.handle_speech_activity()
-            return True
-
-        if event_type == "speech_end":
-            return True
-
-        if event_type in {"user-stt", "answer_chunk"}:
-            data = message.get("data") if isinstance(message.get("data"), Mapping) else {}
-            text = str(data.get("text") or message.get("text") or "")
-            source = "stt" if event_type == "user-stt" else "message"
-            await self.receive_answer_delta(text, finished=False, source=source)
-            return True
-
-        if event_type == "answer_end":
-            data = message.get("data") if isinstance(message.get("data"), Mapping) else {}
-            text = str(data.get("text") or message.get("text") or "")
-            await self.handle_answer_finish_confirmation(True, text=text)
-            return True
-
-        if event_type == "answer_finish_confirmation":
-            data = message.get("data") if isinstance(message.get("data"), Mapping) else {}
-            finished = self.parse_bool(
-                data.get("finished", message.get("finished")),
-                default=False,
-            )
-            await self.handle_answer_finish_confirmation(finished)
-            return True
-
-        if event_type in {"answer_text", "user-text"}:
-            data = message.get("data") if isinstance(message.get("data"), Mapping) else {}
-            text = str(data.get("text") or message.get("text") or "")
-            await self.receive_answer_delta(text, finished=False, source="message")
-            return True
-
         return False
 
-    async def handle_context_frame(self, frame: LLMContextFrame) -> bool:
-        messages = getattr(getattr(frame, "context", None), "messages", None)
-        if not messages:
-            return False
-        latest = messages[-1]
-        if not isinstance(latest, Mapping) or latest.get("role") != "user":
-            return False
-        text = str(latest.get("content") or "")
-        if not text.strip():
-            return True
-        if self.exam_graph is None or self.startup_failed or not self.current_question_id:
-            logger.info("Ignoring C-mode context answer before active question")
-            return True
-        await self.receive_answer_delta(text, finished=False, source="stt")
-        return True
-
-    async def handle_speech_activity(self) -> None:
-        if self.pending_final_review is not None or self.final_review_ready:
+    async def handle_answer_event(self, frame: CAnswerEventFrame) -> None:
+        if self.startup_failed or self.pending_final_review is not None or self.final_review_ready:
             return
-        async with self.lock:
-            if self.exam_graph is None or self.exam_graph.closed:
-                return
-            if self.answer_finished or not self.current_question_id:
-                return
-            if not self.answer_started_at:
-                self.answer_started_at = monotonic()
-            self.answer_finish_confirming = False
-            if self.has_answer_text:
-                self.reset_answer_idle_timer()
-
-    async def receive_answer_delta(self, text: str, finished: bool, source: str = "message") -> None:
-        if self.pending_final_review is not None or self.final_review_ready:
+        if frame.kind == "error":
+            await self.push_exam_event({
+                "type": "error", "error": frame.error, "question_id": frame.question_id,
+            })
             return
-        await self.ensure_exam_graph()
-        if self.exam_graph is None or self.startup_failed:
-            return
-        async with self.lock:
-            if not self.current_question_id:
-                await self.push_exam_event(
-                    {
-                        "type": "error",
-                        "error": "NO_ACTIVE_QUESTION",
-                    }
-                )
-                return
-            if self.answer_finished:
-                logger.info(
-                    "Ignoring C-mode answer event after answer finished, question_id={}",
-                    self.current_question_id,
-                )
-                return
-
-            if text:
-                self.answer_buffer += text
-                if text.strip():
-                    if not self.answer_started_at:
-                        self.answer_started_at = monotonic()
-                    self.has_answer_text = True
-                    self.answer_finish_confirming = False
-                    if source == "stt":
-                        print(f"C-mode answer buffer: {self.answer_buffer}", flush=True)
-
-            if finished:
-                await self.finish_buffered_answer_locked(reason="answer_end")
-                return
-
-            if not text.strip():
-                return
-            self.reset_answer_idle_timer()
-            await self.send_ready_answer_chunk_locked()
-
-    async def send_ready_answer_chunk_locked(
-        self,
-        force: bool = False,
-        reason: str = "answer_chunk",
-    ) -> None:
         if self.exam_graph is None or self.exam_graph.closed:
             return
-        if self.answer_finished:
+        if not frame.question_id or frame.question_id != self.current_question_id:
             return
-        buffer_text = self.answer_buffer.strip()
-        if not buffer_text:
-            return
+        if frame.kind in {"answer_chunk", "answer_end"}:
+            await self.exam_graph.handle_message({
+                "type": frame.kind,
+                "question_id": frame.question_id,
+                "text": frame.text,
+                "reason": frame.reason,
+            })
+        elif frame.kind == "confirmation_required":
+            await self.push_exam_event({
+                "type": "answer_finish_confirmation_required",
+                "question_id": frame.question_id,
+                "idle_timeout_secs": frame.idle_timeout_secs,
+                "message": "你是否已经回答完毕？",
+            })
 
-        now = monotonic()
-        if force:
-            send_text = buffer_text
-            self.answer_buffer = ""
-        else:
-            last_sent_or_started = self.last_chunk_sent_at or self.answer_started_at or self.question_started_at or now
-            if now - last_sent_or_started < self.min_chunk_interval_secs:
-                return
-            send_text = buffer_text
-            self.answer_buffer = ""
-
-        self.last_chunk_sent_at = now
-        await self.exam_graph.handle_message(
-            {
-                "type": "answer_chunk",
-                "question_id": self.current_question_id,
-                "text": send_text,
-                "reason": reason,
-            }
+    async def send_answer_control(self, kind: str, question_id: str = "") -> None:
+        ack = asyncio.get_running_loop().create_future()
+        await self.push_frame(
+            CAnswerEventFrame(kind=kind, question_id=question_id, ack=ack),
+            FrameDirection.UPSTREAM,
         )
-
-    async def handle_answer_finish_confirmation(
-        self,
-        finished: bool,
-        text: str = "",
-    ) -> None:
-        await self.ensure_exam_graph()
-        if self.exam_graph is None or self.startup_failed:
-            return
-        async with self.lock:
-            if not self.current_question_id:
-                await self.push_exam_event(
-                    {
-                        "type": "error",
-                        "error": "NO_ACTIVE_QUESTION",
-                    }
-                )
-                return
-            if self.answer_finished:
-                logger.info(
-                    "Ignoring C-mode answer confirmation after answer finished, question_id={}",
-                    self.current_question_id,
-                )
-                return
-            if not self.answer_finish_confirming:
-                logger.info(
-                    "Ignoring C-mode answer confirmation before idle prompt, question_id={}",
-                    self.current_question_id,
-                )
-                return
-            if text:
-                self.answer_buffer += text
-                if text.strip():
-                    self.has_answer_text = True
-            if finished:
-                await self.finish_buffered_answer_locked(reason="finish_confirmation_done")
-                return
-
-            self.answer_finish_confirming = False
-            await self.send_ready_answer_chunk_locked(
-                force=True,
-                reason="finish_confirmation_continue",
-            )
-            self.reset_answer_idle_timer()
-
-    async def finish_buffered_answer_locked(self, reason: str) -> None:
-        if self.exam_graph is None or self.exam_graph.closed:
-            return
-        self.cancel_answer_idle_timer()
-        text = self.answer_buffer.strip()
-        if not text and not self.has_answer_text:
-            await self.push_exam_event(
-                {
-                    "type": "error",
-                    "error": "ANSWER_TEXT_REQUIRED",
-                    "question_id": self.current_question_id,
-                }
-            )
-            return
-        self.answer_buffer = ""
-        self.answer_finished = True
-        self.answer_finish_confirming = False
-        await self.exam_graph.handle_message(
-            {
-                "type": "answer_end",
-                "question_id": self.current_question_id,
-                "text": text,
-                "reason": reason,
-            }
-        )
-
-    def reset_answer_idle_timer(self) -> None:
-        self.cancel_answer_idle_timer()
-        if self.answer_finished or not self.has_answer_text:
-            return
-        question_id = self.current_question_id
-        if not question_id:
-            return
-        self.answer_idle_task = asyncio.create_task(
-            self.finish_answer_after_idle(question_id)
-        )
-
-    def cancel_answer_idle_timer(self) -> None:
-        task = self.answer_idle_task
-        self.answer_idle_task = None
-        if task and not task.done() and task is not asyncio.current_task():
-            task.cancel()
-
-    def reset_answer_state(self) -> None:
-        self.cancel_answer_idle_timer()
-        self.answer_buffer = ""
-        self.question_started_at = monotonic()
-        self.answer_started_at = 0.0
-        self.last_chunk_sent_at = 0.0
-        self.answer_finished = False
-        self.has_answer_text = False
-        self.answer_finish_confirming = False
-
-    async def finish_answer_after_idle(self, question_id: str) -> None:
-        try:
-            await asyncio.sleep(self.answer_idle_timeout_secs)
-            async with self.lock:
-                print("test,89898", self.answer_finished, self.answer_finish_confirming)
-                if self.exam_graph is None or self.exam_graph.closed:
-                    return
-                if self.answer_finished:
-                    return
-                if question_id != self.current_question_id:
-                    return
-                if self.answer_finish_confirming:
-                    return
-                self.answer_finish_confirming = True
-                await self.push_exam_event(
-                    {
-                        "type": "answer_finish_confirmation_required",
-                        "question_id": question_id,
-                        "idle_timeout_secs": self.answer_idle_timeout_secs,
-                        "message": "你是否已经回答完毕？",
-                    }
-                )
-                logger.info(
-                    "C-mode answer finish confirmation requested after {}s idle, question_id={}",
-                    self.answer_idle_timeout_secs,
-                    question_id,
-                )
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.error(
-                "C-mode answer idle timeout failed, question_id={}",
-                question_id,
-            )
-        finally:
-            if self.answer_idle_task is asyncio.current_task():
-                self.answer_idle_task = None
+        await asyncio.wait_for(ack, timeout=10.0)
 
     async def ensure_exam_graph(self) -> None:
         async with self.exam_graph_init_lock:
@@ -408,44 +174,86 @@ class InterviewServiceC(FrameProcessor):
                     terminal = "finished" if saved_review["review"].get("status") == "finished" else "closed"
                     await self.handle_exam_event({"type": terminal, "exam_id": self.exam_id})
                     return
-                root_questions = await list_ai_preset_questions_by_exam_item_and_user(
-                    course_id,
-                    exam_item_id,
-                    user_id,
-                )
-                if not root_questions:
+                if self.mode == "B":
                     root_questions = await list_preset_questions_by_exam_item(
                         course_id,
                         exam_item_id,
-                        user_id=user_id,
                     )
+                    for question in root_questions:
+                        try:
+                            score = float(question.get("score") or 0)
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError("B_MODE_PRESET_QUESTION_INVALID") from exc
+                        if (
+                            not str(question.get("question_dimension") or "").strip()
+                            or not str(question.get("question_content") or "").strip()
+                            or not str(question.get("standard_answer") or "").strip()
+                            or not math.isfinite(score) or score <= 0
+                        ):
+                            raise RuntimeError("B_MODE_PRESET_QUESTION_INVALID")
+                else:
+                    root_questions = await list_ai_preset_questions_by_exam_item_and_user(
+                        course_id,
+                        exam_item_id,
+                        user_id,
+                    )
+                    if not root_questions:
+                        root_questions = await list_preset_questions_by_exam_item(
+                            course_id,
+                            exam_item_id,
+                            user_id=user_id,
+                        )
                 if not root_questions:
-                    raise RuntimeError("C_MODE_PRESET_QUESTIONS_REQUIRED")
+                    raise RuntimeError(f"{self.mode}_MODE_PRESET_QUESTIONS_REQUIRED")
+                exam_item = await get_exam_item_by_id(exam_item_id)
+                if not exam_item:
+                    raise RuntimeError("EXAM_ITEM_NOT_FOUND")
+                max_probe_turns = (
+                    2 if self.mode == "B" else await initialize_c_score_limits(
+                        self.exam_id, user_id, int(exam_item.get("c_max_probe_turns") or 2),
+                        len(root_questions),
+                    )
+                )
                 judge_config = await get_exam_judge_config_by_exam_id(self.exam_id)
-                model_settings = self.extract_model_settings(judge_config)
-                self.final_review_service = CFinalReviewService(model_settings)
-                flow = ExamCFlow(
-                    QAmanagerC(root_questions),
+                model_settings = self.extract_model_settings(judge_config, self.mode)
+                review_settings = (
+                    self.extract_role_model_settings(judge_config, "main_judger")
+                    if self.mode == "B" else model_settings
+                )
+                if not model_settings.get("model_name") or not review_settings.get("model_name"):
+                    raise RuntimeError(f"{self.mode}_MODE_MODEL_CONFIG_REQUIRED")
+                self.final_review_service = CFinalReviewService(review_settings, mode=self.mode)
+                if self.mode == "B":
+                    from AIOralExamSystem.Graph.ExamB import ExamBFlow
+
+                    flow_class = ExamBFlow
+                else:
+                    flow_class = ExamCFlow
+                flow_kwargs = dict(
                     model_settings=model_settings,
                     exam_id=self.exam_id,
                     user_id=user_id,
                     exam_item_id=exam_item_id,
+                    max_probe_turns=max_probe_turns,
                 )
+                if self.mode == "B":
+                    flow_kwargs["mode"] = "B"
+                flow = flow_class(QAmanager(root_questions), **flow_kwargs)
                 self.exam_graph = ExamMessageSession(flow=flow, exam_id=self.exam_id)
                 await self.exam_graph.start()
                 self.exam_output_task = asyncio.create_task(self.consume_exam_output())
                 await self.exam_graph.handle_message({"type": "start"})
             except Exception as exc:
                 self.startup_failed = True
-                logger.error("C-mode InterviewServiceC startup failed")
+                logger.error(f"{self.mode}-mode interview startup failed")
                 await self.push_exam_event(
                     {
                         "type": "error",
-                        "error": "C_MODE_STARTUP_FAILED",
+                        "error": f"{self.mode}_MODE_STARTUP_FAILED",
                         "detail": str(exc),
                     }
                 )
-                message = "C模式口试启动失败，请联系老师或稍后重试。"
+                message = f"{self.mode}模式口试启动失败，请联系老师或稍后重试。"
                 await self.speak_exam_text(message)
                 await self.push_frame(EndFrame(), FrameDirection.DOWNSTREAM)
 
@@ -470,17 +278,22 @@ class InterviewServiceC(FrameProcessor):
             if self.terminal_sent:
                 return
             self.terminal_sent = True
-        await self.push_exam_event(event)
-        if event_type == "question":
+            await self.send_answer_control("stop")
+        if event_type == "question_evaluation_error":
+            await self.send_answer_control(
+                "retry_confirmation", str(event.get("question_id") or ""),
+            )
+        if event_type in {"question", "generated_question_ready"}:
             question = event.get("question") if isinstance(event.get("question"), Mapping) else {}
             self.current_question_id = str(question.get("question_id") or "")
-            self.reset_answer_state()
+            await self.send_answer_control("question_start", self.current_question_id)
+        await self.push_exam_event(event)
+        if event_type == "question_evaluation_error":
+            return
+        if event_type == "question":
             await self.speak_question(question)
             return
         if event_type == "generated_question_ready":
-            question = event.get("question") if isinstance(event.get("question"), Mapping) else {}
-            self.current_question_id = str(question.get("question_id") or "")
-            self.reset_answer_state()
             self._cancel(self.followup_poll_task)
             self.followup_poll_task = None
             await self.speak_question(question)
@@ -501,11 +314,11 @@ class InterviewServiceC(FrameProcessor):
             return
         if self.final_review_task is not None and not self.final_review_task.done():
             return
+        await self.send_answer_control("stop")
         await save_c_exam_questions(
             self.exam_id, self.exam_user_id, event["review"]
         )
         self.pending_final_review = event
-        self.cancel_answer_idle_timer()
         self._cancel(self.followup_poll_task)
         self.followup_poll_task = None
         self.final_review_task = asyncio.create_task(
@@ -552,7 +365,7 @@ class InterviewServiceC(FrameProcessor):
             return
         await self.push_frame(
             OutputTransportMessageFrame(
-                message={"type": "c-exam-event", "data": dict(event or {})}
+                message={"type": "c-exam-event", "mode": self.mode, "data": dict(event or {})}
             ),
             FrameDirection.DOWNSTREAM,
         )
@@ -582,7 +395,11 @@ class InterviewServiceC(FrameProcessor):
             public["question"] = {key: value for key, value in public["question"].items() if key in {
                 "question_id", "root_question_id", "parent_question_id", "content", "question_content",
                 "question_blocks", "code_fragments", "chain_depth", "root_index",
+                "question_dimension", "score",
             }}
+            if public["question"].get("parent_question_id"):
+                public["question"].pop("question_dimension", None)
+                public["question"].pop("score", None)
         return public
 
     async def speak_exam_text(self, text: str) -> None:
@@ -811,7 +628,7 @@ class InterviewServiceC(FrameProcessor):
         }.get(suffix, suffix or "text")
 
     async def close_exam_graph(self) -> None:
-        self.cancel_answer_idle_timer()
+        await self.send_answer_control("stop")
         self._cancel(self.followup_poll_task)
         self.followup_poll_task = None
         session = self.exam_graph
@@ -828,13 +645,23 @@ class InterviewServiceC(FrameProcessor):
         self.exam_graph = None
 
     @staticmethod
-    def extract_model_settings(judge_config: Any) -> Dict[str, Any]:
+    def extract_model_settings(judge_config: Any, mode: str = "C") -> Dict[str, Any]:
+        if mode == "B":
+            if isinstance(judge_config, Mapping):
+                scorers = judge_config.get("scorers")
+                if isinstance(scorers, list) and scorers:
+                    return InterviewServiceC.extract_role_model_settings(
+                        {"scorer": scorers[0]}, "scorer"
+                    )
+            return {}
+        return InterviewServiceC.extract_role_model_settings(judge_config, "report_judger")
+
+    @staticmethod
+    def extract_role_model_settings(judge_config: Any, role: str) -> Dict[str, Any]:
         if not isinstance(judge_config, Mapping):
             return {}
-        for role in ("report_judger", "main_judger", "setter"):
-            agent_config = judge_config.get(role)
-            if not isinstance(agent_config, Mapping):
-                continue
+        agent_config = judge_config.get(role)
+        if isinstance(agent_config, Mapping):
             runtime = agent_config.get("runtime_model_settings")
             if isinstance(runtime, Mapping) and runtime.get("model_name"):
                 return dict(runtime)
@@ -843,21 +670,6 @@ class InterviewServiceC(FrameProcessor):
     @classmethod
     def last_sentence_end_index(cls, text: str) -> int:
         return max((str(text or "").rfind(mark) for mark in cls.SENTENCE_END_MARKS), default=-1)
-
-    @staticmethod
-    def parse_bool(value: Any, default: bool = False) -> bool:
-        if isinstance(value, bool):
-            return value
-        if value is None:
-            return default
-        if isinstance(value, (int, float)):
-            return bool(value)
-        text = str(value).strip().lower()
-        if text in {"true", "1", "yes", "y", "done", "finished"}:
-            return True
-        if text in {"false", "0", "no", "n", "continue", "unfinished"}:
-            return False
-        return default
 
     @staticmethod
     def _question_text(question: Mapping[str, Any]) -> str:

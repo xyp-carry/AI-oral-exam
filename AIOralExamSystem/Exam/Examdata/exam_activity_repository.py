@@ -3,8 +3,11 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Callable
 
-from .connection import connect, ensure_database
+from sqlalchemy import select, update
+
+from .connection import ensure_database, get_engine
 from .exam_lifecycle_repository import _load_state, _readiness
+from .models import CourseExamItem, ExamSession
 from .schema import ensure_tables
 
 EXAM_LEASE_SECONDS = 300
@@ -69,136 +72,118 @@ def _begin_exam_session_sync(
     is_local_pipeline_active: Callable[[str], bool],
 ) -> str:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT exam_item_id FROM exam_sessions WHERE exam_id = %s",
-                (exam_id,),
+        row = connection.execute(
+            select(ExamSession.exam_item_id).where(ExamSession.exam_id == exam_id)
+        ).fetchone()
+        if not row or not row[0]:
+            raise ValueError("EXAM_SESSION_NOT_FOUND")
+        exam_item_id = str(row[0])
+        item = connection.execute(
+            select(
+                CourseExamItem.course_id,
+                CourseExamItem.status,
+                CourseExamItem.exam_available_from,
+                CourseExamItem.exam_available_until,
             )
-            row = cursor.fetchone()
-            if not row or not row[0]:
-                raise ValueError("EXAM_SESSION_NOT_FOUND")
-            exam_item_id = str(row[0])
-            cursor.execute(
-                """
-                SELECT course_id, status, exam_available_from, exam_available_until
-                FROM course_exam_items WHERE exam_item_id = %s FOR UPDATE
-                """,
-                (exam_item_id,),
+            .where(CourseExamItem.exam_item_id == exam_item_id)
+            .with_for_update()
+        ).fetchone()
+        now = datetime.now()
+        if (
+            not item or item[1] != "active"
+            or not item[2] or not item[3]
+            or not item[2] <= now <= item[3]
+        ):
+            raise ValueError("EXAM_UNAVAILABLE")
+        state = _load_state(connection, str(item[0]), exam_item_id)
+        if state is None or not _readiness(connection, state, state["created_by"])["ready"]:
+            raise ValueError("EXAM_UNAVAILABLE")
+        session = connection.execute(
+            select(
+                ExamSession.exam_item_id,
+                ExamSession.user_id,
+                ExamSession.exam_completed,
+                ExamSession.exam_active_token,
+                ExamSession.exam_active_until,
+                ExamSession.exam_pipeline_id,
+                ExamSession.exam_pipeline_owner,
             )
-            item = cursor.fetchone()
-            now = datetime.now()
-            if (
-                not item or item[1] != "active"
-                or not item[2] or not item[3]
-                or not item[2] <= now <= item[3]
-            ):
-                raise ValueError("EXAM_UNAVAILABLE")
-            state = _load_state(cursor, str(item[0]), exam_item_id)
-            if state is None or not _readiness(cursor, state, state["created_by"])["ready"]:
-                raise ValueError("EXAM_UNAVAILABLE")
-            cursor.execute(
-                """
-                SELECT exam_item_id, user_id, exam_completed,
-                       exam_active_token, exam_active_until,
-                       exam_pipeline_id, exam_pipeline_owner
-                FROM exam_sessions WHERE exam_id = %s FOR UPDATE
-                """,
-                (exam_id,),
+            .where(ExamSession.exam_id == exam_id)
+            .with_for_update()
+        ).fetchone()
+        if not session or str(session[0]) != exam_item_id or str(session[1]) != str(user_id):
+            raise ValueError("EXAM_SESSION_NOT_FOUND")
+        if session[2]:
+            raise ValueError("EXAM_SESSION_COMPLETED")
+        if _binding_blocks_start(
+            session[3], session[4], session[5], session[6],
+            pipeline_owner, now, is_local_pipeline_active,
+        ):
+            raise ValueError("EXAM_IN_PROGRESS")
+        token = str(uuid.uuid4())
+        connection.execute(
+            update(ExamSession)
+            .where(ExamSession.exam_id == exam_id)
+            .values(
+                exam_active_token=token,
+                exam_active_until=now + timedelta(seconds=EXAM_LEASE_SECONDS),
+                exam_pipeline_id=pipeline_id,
+                exam_pipeline_owner=pipeline_owner,
             )
-            session = cursor.fetchone()
-            if not session or str(session[0]) != exam_item_id or str(session[1]) != str(user_id):
-                raise ValueError("EXAM_SESSION_NOT_FOUND")
-            if session[2]:
-                raise ValueError("EXAM_SESSION_COMPLETED")
-            if _binding_blocks_start(
-                session[3], session[4], session[5], session[6],
-                pipeline_owner, now, is_local_pipeline_active,
-            ):
-                raise ValueError("EXAM_IN_PROGRESS")
-            token = str(uuid.uuid4())
-            cursor.execute(
-                """
-                UPDATE exam_sessions
-                SET exam_active_token = %s, exam_active_until = %s,
-                    exam_pipeline_id = %s, exam_pipeline_owner = %s
-                WHERE exam_id = %s
-                """,
-                (
-                    token,
-                    now + timedelta(seconds=EXAM_LEASE_SECONDS),
-                    pipeline_id,
-                    pipeline_owner,
-                    exam_id,
-                ),
-            )
-        connection.commit()
-        return token
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+    return token
 
 
 def _renew_exam_session_sync(
     exam_id: str, token: str, pipeline_id: str, pipeline_owner: str
 ) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE exam_sessions AS s
-                JOIN course_exam_items AS i ON i.exam_item_id = s.exam_item_id
-                SET s.exam_active_until = %s
-                WHERE s.exam_id = %s AND s.exam_active_token = %s
-                  AND s.exam_pipeline_id = %s AND s.exam_pipeline_owner = %s
-                  AND s.exam_completed = 0 AND i.status = 'active'
-                """,
-                (
-                    datetime.now() + timedelta(seconds=EXAM_LEASE_SECONDS),
-                    exam_id,
-                    token,
-                    pipeline_id,
-                    pipeline_owner,
+        # 等价于 UPDATE exam_sessions JOIN course_exam_items：仅当所属考试项
+        # 仍为 active 时续租（IN 子查询不涉及被更新的表，MySQL 允许）。
+        result = connection.execute(
+            update(ExamSession)
+            .where(
+                ExamSession.exam_id == exam_id,
+                ExamSession.exam_active_token == token,
+                ExamSession.exam_pipeline_id == pipeline_id,
+                ExamSession.exam_pipeline_owner == pipeline_owner,
+                ExamSession.exam_completed == 0,
+                ExamSession.exam_item_id.in_(
+                    select(CourseExamItem.exam_item_id).where(
+                        CourseExamItem.status == "active"
+                    )
                 ),
             )
-            renewed = cursor.rowcount == 1
-        connection.commit()
-        return renewed
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            .values(
+                exam_active_until=datetime.now() + timedelta(seconds=EXAM_LEASE_SECONDS)
+            )
+        )
+        renewed = result.rowcount == 1
+    return renewed
 
 
 def _end_exam_session_sync(
     exam_id: str, token: str, pipeline_id: str, pipeline_owner: str
 ) -> None:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE exam_sessions
-                SET exam_active_token = NULL, exam_active_until = NULL,
-                    exam_pipeline_id = NULL, exam_pipeline_owner = NULL
-                WHERE exam_id = %s AND exam_active_token = %s
-                  AND exam_pipeline_id = %s AND exam_pipeline_owner = %s
-                """,
-                (exam_id, token, pipeline_id, pipeline_owner),
+        connection.execute(
+            update(ExamSession)
+            .where(
+                ExamSession.exam_id == exam_id,
+                ExamSession.exam_active_token == token,
+                ExamSession.exam_pipeline_id == pipeline_id,
+                ExamSession.exam_pipeline_owner == pipeline_owner,
             )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            .values(
+                exam_active_token=None,
+                exam_active_until=None,
+                exam_pipeline_id=None,
+                exam_pipeline_owner=None,
+            )
+        )

@@ -34,3 +34,4 @@ scipy
 torch==2.8.0+cu129
 uvicorn==0.46.0
 websockets==15.0.1
+sqlalchemy==2.0.43

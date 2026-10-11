@@ -316,7 +316,7 @@ function QuestionFlowModal({
   }, [nodes, activeId])
 
   return (
-    <div className="qflow-overlay" onClick={onClose}>
+    <div className="qflow-overlay">
       <div className="qflow-modal" onClick={e => e.stopPropagation()}>
         <div className="qflow-header">
           <div className="qflow-header-info">
@@ -634,7 +634,7 @@ export default function ExamHistory() {
 
       {/* 题目流程弹窗 */}
       {selectedRecord && questionsLoading && (
-        <div className="qflow-overlay" onClick={handleCloseModal}>
+        <div className="qflow-overlay">
           <div className="qflow-modal" onClick={e => e.stopPropagation()}>
             <div className="qflow-header">
               <h3>加载中...</h3>
@@ -650,7 +650,7 @@ export default function ExamHistory() {
         </div>
       )}
       {selectedRecord && !questionsLoading && questionsError && (
-        <div className="qflow-overlay" onClick={handleCloseModal}>
+        <div className="qflow-overlay">
           <div className="qflow-modal" onClick={e => e.stopPropagation()}>
             <div className="qflow-header">
               <h3>加载失败</h3>

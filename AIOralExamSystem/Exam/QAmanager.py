@@ -5,8 +5,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 Question = Dict[str, Any]
 
 
-class QAmanagerC:
-    """Own C-mode root questions and generated question chains."""
+class QAmanager:
+    """Own root questions and generated question chains for B/C exams."""
 
     VALID_RELATIONS = {"deepen", "simplify"}
 

@@ -4,10 +4,31 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from sqlalchemy import delete, select
+
+from AIOralExamSystem.Exam.Examdata.models import ExamJudgeConfigAgent
 from .config import MODEL_STATUS_ACTIVE, MODEL_TABLE_NAME
 from .model_token_limits import get_model_token_limits
+from .models import UserModelLibrary
 from .schema import create_llm_tables
 from .config import MODEL_TYPE_DEFAULT, MODEL_TYPES
+
+_MODEL_COLUMNS = (
+    UserModelLibrary.model_id,
+    UserModelLibrary.owner_user_id,
+    UserModelLibrary.model_name,
+    UserModelLibrary.model_type,
+    UserModelLibrary.model_api_key,
+    UserModelLibrary.provider,
+    UserModelLibrary.provider_model_key,
+    UserModelLibrary.base_url,
+    UserModelLibrary.display_name,
+    UserModelLibrary.params_json,
+    UserModelLibrary.last_test_result_json,
+    UserModelLibrary.status,
+    UserModelLibrary.created_at,
+    UserModelLibrary.updated_at,
+)
 
 
 async def create_user_model(
@@ -79,7 +100,7 @@ def _create_user_model_sync(
     last_test_result: Optional[Dict[str, object]],
     model_type: str,
 ) -> Dict[str, object]:
-    connect, ensure_database = _load_database_helpers()
+    get_engine, ensure_database = _load_database_helpers()
     ensure_database()
     owner_user_id = _normalize_required_text(owner_user_id, "OWNER_USER_ID_REQUIRED")
     model_name = _normalize_required_text(model_name, "MODEL_NAME_REQUIRED")
@@ -96,53 +117,27 @@ def _create_user_model_sync(
     last_test_result_json = _json_dumps(last_test_result or {})
     model_id = str(uuid.uuid4())
     now = _now()
-    connection = connect(use_database=True)
-    try:
-        with connection.cursor() as cursor:
-            create_llm_tables(cursor)
-            cursor.execute(
-                f"""
-                INSERT INTO {MODEL_TABLE_NAME} (
-                    model_id,
-                    owner_user_id,
-                    model_name,
-                    model_type,
-                    model_api_key,
-                    provider,
-                    provider_model_key,
-                    base_url,
-                    display_name,
-                    params_json,
-                    last_test_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    model_id,
-                    owner_user_id,
-                    model_name,
-                    model_type,
-                    model_api_key,
-                    provider,
-                    provider_model_key,
-                    base_url,
-                    display_name,
-                    params_json,
-                    last_test_result_json,
-                    MODEL_STATUS_ACTIVE,
-                    now,
-                    now,
-                ),
+    with get_engine().begin() as connection:
+        create_llm_tables(connection)
+        connection.execute(
+            UserModelLibrary.__table__.insert().values(
+                model_id=model_id,
+                owner_user_id=owner_user_id,
+                model_name=model_name,
+                model_type=model_type,
+                model_api_key=model_api_key,
+                provider=provider,
+                provider_model_key=provider_model_key,
+                base_url=base_url,
+                display_name=display_name,
+                params_json=params_json,
+                last_test_result_json=last_test_result_json,
+                status=MODEL_STATUS_ACTIVE,
+                created_at=now,
+                updated_at=now,
             )
-        connection.commit()
-        return _get_user_model_sync(model_id, owner_user_id, include_api_key=False) or {}
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+    return _get_user_model_sync(model_id, owner_user_id, include_api_key=False) or {}
 
 
 def _list_user_models_sync(
@@ -150,46 +145,24 @@ def _list_user_models_sync(
     include_api_key: bool = False,
     model_type: Optional[str] = None,
 ) -> List[Dict[str, object]]:
-    connect, ensure_database = _load_database_helpers()
+    get_engine, ensure_database = _load_database_helpers()
     ensure_database()
     owner_user_id = _normalize_required_text(owner_user_id, "OWNER_USER_ID_REQUIRED")
     normalized_model_type = _normalize_model_type(model_type) if model_type is not None else None
-    model_type_filter = "AND model_type = %s" if normalized_model_type else ""
-    query_params = [owner_user_id, MODEL_STATUS_ACTIVE]
-    if normalized_model_type:
-        query_params.append(normalized_model_type)
-    connection = connect(use_database=True)
-    try:
-        with connection.cursor() as cursor:
-            create_llm_tables(cursor)
-            cursor.execute(
-                f"""
-                SELECT
-                    model_id,
-                    owner_user_id,
-                    model_name,
-                    model_type,
-                    model_api_key,
-                    provider,
-                    provider_model_key,
-                    base_url,
-                    display_name,
-                    params_json,
-                    last_test_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                FROM {MODEL_TABLE_NAME}
-                WHERE owner_user_id = %s
-                  AND status = %s
-                  {model_type_filter}
-                ORDER BY created_at DESC
-                """,
-                tuple(query_params),
-            )
-            return [model_row_to_dict(row, include_api_key) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+    with get_engine().begin() as connection:
+        create_llm_tables(connection)
+        conditions = [
+            UserModelLibrary.owner_user_id == owner_user_id,
+            UserModelLibrary.status == MODEL_STATUS_ACTIVE,
+        ]
+        if normalized_model_type:
+            conditions.append(UserModelLibrary.model_type == normalized_model_type)
+        rows = connection.execute(
+            select(*_MODEL_COLUMNS)
+            .where(*conditions)
+            .order_by(UserModelLibrary.created_at.desc())
+        ).fetchall()
+        return [model_row_to_dict(row, include_api_key) for row in rows]
 
 
 def _get_user_model_sync(
@@ -197,112 +170,67 @@ def _get_user_model_sync(
     owner_user_id: Optional[str] = None,
     include_api_key: bool = True,
 ) -> Optional[Dict[str, object]]:
-    connect, ensure_database = _load_database_helpers()
+    get_engine, ensure_database = _load_database_helpers()
     ensure_database()
     model_id = _normalize_required_text(model_id, "MODEL_ID_REQUIRED")
     owner_user_id = _normalize_optional_text(owner_user_id)
-    connection = connect(use_database=True)
-    try:
-        where_owner = "AND owner_user_id = %s" if owner_user_id else ""
-        values = [model_id]
+    with get_engine().begin() as connection:
+        create_llm_tables(connection)
+        conditions = [
+            UserModelLibrary.model_id == model_id,
+            UserModelLibrary.status == MODEL_STATUS_ACTIVE,
+        ]
         if owner_user_id:
-            values.append(owner_user_id)
-        values.append(MODEL_STATUS_ACTIVE)
-        with connection.cursor() as cursor:
-            create_llm_tables(cursor)
-            cursor.execute(
-                f"""
-                SELECT
-                    model_id,
-                    owner_user_id,
-                    model_name,
-                    model_type,
-                    model_api_key,
-                    provider,
-                    provider_model_key,
-                    base_url,
-                    display_name,
-                    params_json,
-                    last_test_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                FROM {MODEL_TABLE_NAME}
-                WHERE model_id = %s
-                  {where_owner}
-                  AND status = %s
-                LIMIT 1
-                """,
-                tuple(values),
-            )
-            row = cursor.fetchone()
-            return model_row_to_dict(row, include_api_key) if row else None
-    finally:
-        connection.close()
+            conditions.append(UserModelLibrary.owner_user_id == owner_user_id)
+        row = connection.execute(
+            select(*_MODEL_COLUMNS).where(*conditions).limit(1)
+        ).fetchone()
+        return model_row_to_dict(row, include_api_key) if row else None
 
 
 def _delete_user_model_sync(model_id: str, owner_user_id: str) -> bool:
-    connect, ensure_database = _load_database_helpers()
+    get_engine, ensure_database = _load_database_helpers()
     ensure_database()
     model_id = _normalize_required_text(model_id, "MODEL_ID_REQUIRED")
     owner_user_id = _normalize_required_text(owner_user_id, "OWNER_USER_ID_REQUIRED")
-    connection = connect(use_database=True)
-    try:
-        with connection.cursor() as cursor:
-            create_llm_tables(cursor)
-            cursor.execute(
-                f"""
-                SELECT 1
-                FROM {MODEL_TABLE_NAME}
-                WHERE model_id = %s
-                  AND owner_user_id = %s
-                  AND status = %s
-                LIMIT 1
-                FOR UPDATE
-                """,
-                (model_id, owner_user_id, MODEL_STATUS_ACTIVE),
+    with get_engine().begin() as connection:
+        create_llm_tables(connection)
+        row = connection.execute(
+            select(UserModelLibrary.model_id)
+            .where(
+                UserModelLibrary.model_id == model_id,
+                UserModelLibrary.owner_user_id == owner_user_id,
+                UserModelLibrary.status == MODEL_STATUS_ACTIVE,
             )
-            if cursor.fetchone() is None:
-                connection.rollback()
-                return False
+            .limit(1)
+            .with_for_update()
+        ).fetchone()
+        if row is None:
+            return False
 
-            cursor.execute(
-                "DELETE FROM exam_judge_config_agents WHERE model_id = %s",
-                (model_id,),
+        connection.execute(
+            delete(ExamJudgeConfigAgent).where(ExamJudgeConfigAgent.model_id == model_id)
+        )
+        result = connection.execute(
+            delete(UserModelLibrary).where(
+                UserModelLibrary.model_id == model_id,
+                UserModelLibrary.owner_user_id == owner_user_id,
             )
-            cursor.execute(
-                f"""
-                DELETE FROM {MODEL_TABLE_NAME}
-                WHERE model_id = %s
-                  AND owner_user_id = %s
-                """,
-                (model_id, owner_user_id),
-            )
-            deleted = cursor.rowcount > 0
-        connection.commit()
-        return deleted
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+        return result.rowcount > 0
 
 
-def ensure_models_exist(cursor, model_ids: List[str], owner_user_id: str) -> None:
+def ensure_models_exist(connection, model_ids: List[str], owner_user_id: str) -> None:
     if not model_ids:
         raise ValueError("JUDGE_MODEL_REQUIRED")
-    placeholders = ",".join(["%s"] * len(model_ids))
-    cursor.execute(
-        f"""
-        SELECT model_id
-        FROM {MODEL_TABLE_NAME}
-        WHERE model_id IN ({placeholders})
-          AND owner_user_id = %s
-          AND status = %s
-        """,
-        tuple(model_ids + [owner_user_id, MODEL_STATUS_ACTIVE]),
-    )
-    found_model_ids = {row[0] for row in cursor.fetchall()}
+    rows = connection.execute(
+        select(UserModelLibrary.model_id).where(
+            UserModelLibrary.model_id.in_(model_ids),
+            UserModelLibrary.owner_user_id == owner_user_id,
+            UserModelLibrary.status == MODEL_STATUS_ACTIVE,
+        )
+    ).fetchall()
+    found_model_ids = {row[0] for row in rows}
     missing = [model_id for model_id in model_ids if model_id not in found_model_ids]
     if missing:
         raise ValueError("MODEL_NOT_FOUND")
@@ -391,8 +319,8 @@ def _normalize_optional_text(value) -> Optional[str]:
     return value or None
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _now() -> datetime:
+    return datetime.now()
 
 
 def _json_dumps(value: Dict[str, object]) -> str:
@@ -411,6 +339,6 @@ def _json_loads(value, default):
 
 
 def _load_database_helpers():
-    from AIOralExamSystem.Exam.Examdata.connection import connect, ensure_database
+    from AIOralExamSystem.Exam.Examdata.connection import get_engine, ensure_database
 
-    return connect, ensure_database
+    return get_engine, ensure_database

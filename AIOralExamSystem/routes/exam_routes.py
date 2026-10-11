@@ -29,6 +29,7 @@ from AIOralExamSystem.Exam.Examdata.judge_config_repository import (
     upsert_exam_optional_agent_models,
     upsert_exam_report_model_config,
 )
+from AIOralExamSystem.Course import CourseService
 from AIOralExamSystem.Exam.QAserver import QAserver
 from AIOralExamSystem.Exam.report_storage import (
     resolve_exam_report_path,
@@ -43,8 +44,6 @@ from AIOralExamSystem.Exam.Examdata.preset_question_repository import (
     create_preset_question,
     delete_preset_questions_by_exam_item_and_user,
 )
-from AIOralExamSystem.Agent.QuestionSetter import QuestionSetterAgent
-from AIOralExamSystem.Graph.AIOralExamsetter import AIOralExamsetter
 from AIOralExamSystem.Graph.template_content_loader import (
     load_local_report_template,
     normalize_template_prompt,
@@ -92,12 +91,14 @@ class ExamItemCreateRequest(BaseModel):
     dimensions: List[ExamItemDimension] | None = None
     exam_available_valid_times: int
     description: str | None = None
-    item_type: str | None = None
+    item_type: Literal["A", "B", "C"]
     need_code_repository: bool = False
     use_preset_questions: bool = False
     enable_report_analysis: bool = False
     report_total_score: float | None = None
     report_judge_rule: str | None = None
+    c_max_probe_turns: int = 2
+    analysis_question_count: int = Field(default=3, ge=1, le=5)
 
 
 class ExamItemUpdateRequest(BaseModel):
@@ -107,17 +108,18 @@ class ExamItemUpdateRequest(BaseModel):
     dimensions: List[ExamItemDimension] | None = None
     exam_available_valid_times: int | None = None
     description: str | None = None
-    item_type: str | None = None
+    item_type: Literal["A", "B", "C"] | None = None
     need_code_repository: bool | None = None
     use_preset_questions: bool | None = None
     enable_report_analysis: bool | None = None
     report_total_score: float | None = None
     report_judge_rule: str | None = None
+    c_max_probe_turns: int | None = None
+    analysis_question_count: int | None = Field(default=None, ge=1, le=5)
 
 
 class ExamAgentBindingRequest(BaseModel):
     judge_model_ids: List[str] | None = None
-    setter_model_id: str | None = None
     main_judger_model_id: str | None = None
     report_judger_model_id: str | None = None
     mineru_model_id: str | None = None
@@ -161,7 +163,7 @@ class ExamReportTemplateInsertRequest(BaseModel):
 class PresetQuestionCreateRequest(BaseModel):
     question_dimension: str
     question_content: str
-    standard_answer: str | None = None
+    standard_answer: str
     score: float = 1.0
     sort_order: int | None = None
 
@@ -206,6 +208,7 @@ def raise_course_value_error(error: ValueError) -> None:
         "EXAM_ITEM_NAME_REQUIRED": (400, "考试项名称不能为空"),
         "EXAM_ITEM_DIMENSIONS_REQUIRED": (400, "考试项维度不能为空"),
         "EXAM_ITEM_DIMENSION_NAME_REQUIRED": (400, "考试项维度名称不能为空"),
+        "ANALYSIS_QUESTION_COUNT_INVALID": (400, "AI 解析生成题数必须在 1 到 5 之间"),
         "INVITE_CODE_VALID_TIMES_INVALID": (400, "邀请码有效时长必须在 1 到 2592000 秒之间"),
         "EXAM_AVAILABLE_VALID_TIMES_INVALID": (400, "考试可开启时长必须在 1 到 2592000 秒之间"),
     }
@@ -222,6 +225,7 @@ def raise_course_value_error(error: ValueError) -> None:
         "PRESET_QUESTION_DIMENSION_REQUIRED": (400, "预设题目维度不能为空"),
         "PRESET_QUESTION_DIMENSION_INVALID": (400, "预设题目维度必须属于该考试项"),
         "PRESET_QUESTION_CONTENT_REQUIRED": (400, "预设题目内容不能为空"),
+        "PRESET_QUESTION_STANDARD_ANSWER_REQUIRED": (400, "预设题目标准答案不能为空"),
         "PRESET_QUESTION_SCORE_INVALID": (400, "预设题目分值不合法"),
         "PRESET_QUESTION_SORT_ORDER_INVALID": (400, "预设题目排序值不合法"),
         "PRESET_QUESTION_BLOCKS_INVALID": (400, "预设题目结构化内容必须是列表"),
@@ -234,9 +238,8 @@ def raise_course_value_error(error: ValueError) -> None:
         "EXAM_IN_PROGRESS": (409, "A student is taking this exam or has uploaded a repository"),
         "EXAM_VERSION_CONFLICT": (409, "Exam version conflict"),
         "EXAM_UNAVAILABLE": (409, "Exam is unavailable"),
-        "SETTER_MODEL_REQUIRED": (400, "Setter model is required"),
         "MAIN_JUDGER_MODEL_REQUIRED": (400, "Main judger model is required"),
-        "PRESET_QUESTION_REQUIRED": (400, "At least one preset question is required"),
+        "PRESET_QUESTION_REQUIRED": (400, "至少需要一道有效的预设题目"),
         "EXAM_ITEM_DIMENSION_SCORE_INVALID": (400, "Dimension scores must be positive"),
         "EXAM_ITEM_TOTAL_SCORE_INVALID": (400, "Exam total score must be positive"),
         "MINERU_MODEL_NOT_CONFIGURED": (400, "当前考试项未配置 MinerU 模型"),
@@ -269,7 +272,6 @@ def dimensions_to_scores(dimensions: List[ExamItemDimension] | None) -> Dict[str
 def has_core_exam_model_config(req) -> bool:
     return bool(req.model_fields_set & {
         "judge_model_ids",
-        "setter_model_id",
         "main_judger_model_id",
     })
 
@@ -282,9 +284,11 @@ def has_optional_model_config(req) -> bool:
     return bool(req.model_fields_set & {"mineru_model_id", "embedding_model_id", "tts_model_id"})
 
 
-async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> Dict[str, object] | None:
+async def save_exam_model_config(
+    exam_item_id: str, req, current_user: dict, item_type: str | None = None,
+) -> Dict[str, object] | None:
     has_core_config = has_core_exam_model_config(req)
-    has_report_config = has_report_model_config(req)
+    has_report_config = item_type != "B" and has_report_model_config(req)
     has_optional_config = has_optional_model_config(req)
     if not has_core_config and not has_report_config and not has_optional_config:
         return None
@@ -293,7 +297,6 @@ async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> 
         raise ValueError("USER_NOT_FOUND")
     if has_core_config and (
         not req.judge_model_ids
-        or not req.setter_model_id
         or not req.main_judger_model_id
     ):
         raise ValueError("EXAM_MODEL_CONFIG_REQUIRED")
@@ -322,7 +325,6 @@ async def save_exam_model_config(exam_item_id: str, req, current_user: dict) -> 
             created_by=user_id,
             scorer_model_ids=req.judge_model_ids,
             flow_type=flow_type,
-            setter_model_id=req.setter_model_id,
             main_judger_model_id=req.main_judger_model_id,
             report_judger_model_id=req.report_judger_model_id if has_report_config else None,
             mineru_model_id=optional_models.get("mineru"),
@@ -405,7 +407,6 @@ async def attach_exam_item_view_configs(items: List[Dict[str, object]]) -> List[
         enriched = dict(item)
         enriched["judge_config"] = judge_config
         enriched["judge_model_ids"] = []
-        enriched["setter_model_id"] = None
         enriched["main_judger_model_id"] = None
         enriched["report_judger_model_id"] = None
         enriched["mineru_model_id"] = None
@@ -419,7 +420,6 @@ async def attach_exam_item_view_configs(items: List[Dict[str, object]]) -> List[
                 for model_id in (agent_model_id(scorer) for scorer in scorers)
                 if model_id
             ]
-            enriched["setter_model_id"] = agent_model_id(judge_config.get("setter"))
             enriched["main_judger_model_id"] = agent_model_id(judge_config.get("main_judger"))
             enriched["report_judger_model_id"] = agent_model_id(judge_config.get("report_judger"))
             enriched["mineru_model_id"] = agent_model_id(judge_config.get("mineru"))
@@ -553,7 +553,12 @@ def register_exam_routes(app, args):
             readiness = await get_exam_item_readiness(course_id, exam_item_id, user_id)
             if req.version is not None and req.version != readiness["version"]:
                 raise ValueError("EXAM_VERSION_CONFLICT")
-            config = await save_exam_model_config(exam_item_id, req, current_user)
+            item = await get_exam_item_for_edit(course_id, exam_item_id)
+            if item is None:
+                raise ValueError("EXAM_ITEM_NOT_FOUND")
+            config = await save_exam_model_config(
+                exam_item_id, req, current_user, item_type=item.get("item_type"),
+            )
             if config is None:
                 raise ValueError("EXAM_MODEL_CONFIG_REQUIRED")
             readiness = await get_exam_item_readiness(course_id, exam_item_id, user_id)
@@ -614,7 +619,7 @@ def register_exam_routes(app, args):
             if not exam_item:
                 raise ValueError("EXAM_ITEM_NOT_FOUND")
             course_id = str(exam_item.get("course_id") or "").strip()
-            if not course_id or not await QAserver.can_view_course(
+            if not course_id or not await CourseService.can_view_course(
                 current_user, course_id,
             ):
                 raise PermissionError("No permission to view this exam report template")
@@ -645,7 +650,7 @@ def register_exam_routes(app, args):
             session = await get_exam_session_by_exam_id(exam_id)
             if not session:
                 raise HTTPException(404, detail=course_error_detail("EXAM_SESSION_NOT_FOUND", "考试记录不存在"))
-            user_id, include_all_users = await QAserver.resolve_course_exam_query_scope(
+            user_id, include_all_users = await CourseService.resolve_course_exam_query_scope(
                 current_user, str(session.get("course_id") or ""),
             )
             if not include_all_users and str(user_id or "") != str(session.get("user_id") or ""):
@@ -680,7 +685,7 @@ def register_exam_routes(app, args):
 
             course_id = str(exam_session.get("course_id") or "").strip()
             session_user_id = str(exam_session.get("user_id") or "").strip()
-            user_id, include_all_users = await QAserver.resolve_course_exam_query_scope(
+            user_id, include_all_users = await CourseService.resolve_course_exam_query_scope(
                 current_user,
                 course_id,
             )
@@ -838,6 +843,8 @@ def register_exam_routes(app, args):
                 enable_report_analysis=req.enable_report_analysis,
                 report_total_score=req.report_total_score,
                 report_judge_rule=req.report_judge_rule,
+                c_max_probe_turns=req.c_max_probe_turns,
+                analysis_question_count=req.analysis_question_count,
             )
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))
@@ -1304,6 +1311,8 @@ def register_exam_routes(app, args):
                 enable_report_analysis=req.enable_report_analysis,
                 report_total_score=req.report_total_score,
                 report_judge_rule=req.report_judge_rule,
+                c_max_probe_turns=req.c_max_probe_turns,
+                analysis_question_count=req.analysis_question_count,
             )
         except PermissionError as e:
             raise HTTPException(status_code=403, detail=course_error_detail("FORBIDDEN", str(e)))

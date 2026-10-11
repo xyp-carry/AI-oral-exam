@@ -4,14 +4,26 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from .connection import connect, ensure_database
+from sqlalchemy import delete, select
+
+from .connection import ensure_database, get_engine
 from .schema import ensure_tables
 from .exam_item_repository import ensure_exam_item_editable
+from .models import CourseExamItem, ExamReportTemplate
 
 
 MAX_TEMPLATE_BODY_CHARS = 200_000
 MAX_TEMPLATE_PROMPT_CHARS = 20_000
 MAX_TEMPLATE_QUEUE_CHARS = 1_000_000
+
+_TEMPLATE_COLUMNS = (
+    ExamReportTemplate.template_id,
+    ExamReportTemplate.exam_item_id,
+    ExamReportTemplate.template_name,
+    ExamReportTemplate.module_queue_json,
+    ExamReportTemplate.created_at,
+    ExamReportTemplate.updated_at,
+)
 
 
 async def replace_exam_report_template(
@@ -52,62 +64,37 @@ def _replace_exam_report_template_sync(
         raise ValueError("REPORT_TEMPLATE_QUEUE_TOO_LARGE")
 
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
     template_id = str(uuid.uuid4())
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _raise_if_active_exam_item_missing(cursor, exam_item_id)
-            ensure_exam_item_editable(cursor, exam_item_id)
-            cursor.execute(
-                """
-                SELECT template_id
-                FROM exam_report_templates
-                WHERE exam_item_id = %s
-                FOR UPDATE
-                """,
-                (exam_item_id,),
+        _raise_if_active_exam_item_missing(connection, exam_item_id)
+        ensure_exam_item_editable(connection, exam_item_id)
+        previous = connection.execute(
+            select(ExamReportTemplate.template_id)
+            .where(ExamReportTemplate.exam_item_id == exam_item_id)
+            .with_for_update()
+        ).fetchone()
+        deleted_template_id = str(previous[0]) if previous else None
+        connection.execute(
+            delete(ExamReportTemplate).where(
+                ExamReportTemplate.exam_item_id == exam_item_id
             )
-            previous = cursor.fetchone()
-            deleted_template_id = str(previous[0]) if previous else None
-            cursor.execute(
-                """
-                DELETE FROM exam_report_templates
-                WHERE exam_item_id = %s
-                """,
-                (exam_item_id,),
+        )
+        connection.execute(
+            ExamReportTemplate.__table__.insert().values(
+                template_id=template_id,
+                exam_item_id=exam_item_id,
+                template_name=template_name,
+                module_queue_json=module_queue_json,
+                created_at=now,
+                updated_at=now,
             )
-            cursor.execute(
-                """
-                INSERT INTO exam_report_templates (
-                    template_id,
-                    exam_item_id,
-                    template_name,
-                    module_queue_json,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    template_id,
-                    exam_item_id,
-                    template_name,
-                    module_queue_json,
-                    now,
-                    now,
-                ),
-            )
-            result = _select_exam_report_template(cursor, exam_item_id)
-            result["replaced"] = previous is not None
-            result["deleted_template_id"] = deleted_template_id
-        connection.commit()
-        return result
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+        result = _select_exam_report_template(connection, exam_item_id)
+        result["replaced"] = previous is not None
+        result["deleted_template_id"] = deleted_template_id
+    return result
 
 
 def _get_exam_report_template_sync(
@@ -115,36 +102,21 @@ def _get_exam_report_template_sync(
 ) -> Dict[str, object]:
     exam_item_id = _required_text(exam_item_id, "EXAM_ITEM_ID_REQUIRED")
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _raise_if_active_exam_item_missing(cursor, exam_item_id)
-            return _select_exam_report_template(cursor, exam_item_id)
-    finally:
-        connection.close()
+        _raise_if_active_exam_item_missing(connection, exam_item_id)
+        return _select_exam_report_template(connection, exam_item_id)
 
 
 def _select_exam_report_template(
-    cursor,
+    connection,
     exam_item_id: str,
 ) -> Dict[str, object]:
-    cursor.execute(
-        """
-        SELECT
-            template_id,
-            exam_item_id,
-            template_name,
-            module_queue_json,
-            created_at,
-            updated_at
-        FROM exam_report_templates
-        WHERE exam_item_id = %s
-        LIMIT 1
-        """,
-        (exam_item_id,),
-    )
-    row = cursor.fetchone()
+    row = connection.execute(
+        select(*_TEMPLATE_COLUMNS)
+        .where(ExamReportTemplate.exam_item_id == exam_item_id)
+        .limit(1)
+    ).fetchone()
     if row is None:
         return {
             "configured": False,
@@ -166,18 +138,16 @@ def _select_exam_report_template(
     }
 
 
-def _raise_if_active_exam_item_missing(cursor, exam_item_id: str) -> None:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM course_exam_items
-        WHERE exam_item_id = %s
-          AND status = 'active'
-        LIMIT 1
-        """,
-        (exam_item_id,),
-    )
-    if cursor.fetchone() is None:
+def _raise_if_active_exam_item_missing(connection, exam_item_id: str) -> None:
+    row = connection.execute(
+        select(CourseExamItem.exam_item_id)
+        .where(
+            CourseExamItem.exam_item_id == exam_item_id,
+            CourseExamItem.status == "active",
+        )
+        .limit(1)
+    ).fetchone()
+    if row is None:
         raise ValueError("EXAM_ITEM_NOT_FOUND")
 
 

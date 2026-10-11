@@ -1,6 +1,6 @@
 import asyncio
 from html import escape
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from pipecat.frames.frames import EndFrame, Frame, LLMContextFrame, LLMTextFrame, StartFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -14,13 +14,11 @@ class InterviewServiceA(FrameProcessor):
         self,
         current_user: dict,
         history: List[Dict[str, str]] = [],
-        exam_state: Optional[Any] = None,
         startup_error: Optional[Dict[str, object]] = None,
     ):
         super().__init__()
         self.current_user = current_user
         self.history = history
-        self.exam_state = exam_state
         self.startup_error = startup_error
         self.nickname = current_user.get("nickname") or current_user.get("username") or "同学"
         self.qa_server: Optional[QAserverA] = None

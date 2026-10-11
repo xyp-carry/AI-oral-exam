@@ -5,12 +5,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
 from AIOralExamSystem.Agent.General_Agent import GeneralAgent
-from AIOralExamSystem.Exam.QAmanagerC import QAmanagerC
+from AIOralExamSystem.Exam.QAmanager import QAmanager
 from AIOralExamSystem.Graph.ExamA import parse_agent_json, question_value
 
 
 class CExamRecordStore:
-    """Keep a compact JSON record of one C-mode exam."""
+    """Keep a compact JSON record of one C-mode follow-up exam."""
 
     def __init__(
         self,
@@ -493,7 +493,7 @@ class CFollowupQuestionRunner:
         normalized_question = dict(question or {})
         result = dict(judgement.get("result") or {})
         relation = str(result.get("relation") or "deepen").strip().lower()
-        if relation not in QAmanagerC.VALID_RELATIONS:
+        if relation not in QAmanager.VALID_RELATIONS:
             relation = "deepen"
         matched_core_points = CFollowupQuestionRunner._text_list(
             result.get("matched_core_points")
@@ -638,7 +638,7 @@ JSON 字段必须包含：
             ("standard_answer", "reference_answer", "answer_key", "correct_answer"),
         )
         normalized_relation = str(source.get("relation") or relation).strip().lower()
-        if normalized_relation not in QAmanagerC.VALID_RELATIONS:
+        if normalized_relation not in QAmanager.VALID_RELATIONS:
             normalized_relation = relation
         question = dict(source)
         question["question_content"] = content
@@ -655,7 +655,7 @@ JSON 字段必须包含：
     ) -> str:
         relation = str(result.get("relation") or payload.get("relation") or "deepen")
         relation = relation.strip().lower()
-        if relation not in QAmanagerC.VALID_RELATIONS:
+        if relation not in QAmanager.VALID_RELATIONS:
             return "deepen"
         return relation
 
@@ -746,7 +746,7 @@ class CQuestionEvaluationRunner:
 JSON 字段必须包含：
 {
   "is_correct": false,
-  "correctness": "correct|partially_correct|incorrect|unclear",
+  "correctness": "correct|partially_correct|incorrect|missing|unclear",
   "coverage": "充分|部分|不足|无法判断",
   "summary": "对本题回答质量的简短总结",
   "missing_points": [],
@@ -755,6 +755,7 @@ JSON 字段必须包含：
   "confidence": 0.0
 }
         """.strip()
+        system_prompt += "\n判定类别：正确=核心结论正确且覆盖充分；部分正确=有正确要点但覆盖不全且没有关键错误；错误=有明显错误结论；未命中=空白、离题或没有有效要点；无法辨认时用 unclear。"
         user_prompt = json.dumps({
             "question_id": payload.get("question_id"),
             "question": payload.get("question"),
@@ -800,15 +801,17 @@ class ExamCFlow:
 
     def __init__(
         self,
-        qa_manager: QAmanagerC,
+        qa_manager: QAmanager,
         answer_judger: Optional[Any] = None,
         model_settings: Optional[Mapping[str, Any]] = None,
         followup_generator: Optional[Any] = None,
         exam_id: str = "",
         user_id: str = "",
         exam_item_id: str = "",
-        **_: Any,
+        question_evaluator: Optional[Any] = None,
+        max_probe_turns: int = 2,
     ):
+        self.mode = "C"
         self.qa_manager = qa_manager
         self.judgement_runner = CAnswerJudgementRunner(
             answer_judger,
@@ -819,6 +822,7 @@ class ExamCFlow:
             model_settings,
         )
         self.question_evaluation_runner = CQuestionEvaluationRunner(
+            question_evaluator=question_evaluator,
             model_settings=model_settings,
         )
         self.exam_id = str(exam_id or "")
@@ -828,6 +832,7 @@ class ExamCFlow:
             exam_id=self.exam_id,
             user_id=self.user_id,
             exam_item_id=self.exam_item_id,
+            output_dir=Path(__file__).resolve().parents[2] / "exam_records" / "c_mode",
         )
         self.answer_question_id: Optional[str] = None
         self.answer_segments: List[str] = []
@@ -835,11 +840,15 @@ class ExamCFlow:
         self.answer_version = 0
         self.answer_finished = False
         self.latest_judgement: Optional[Dict[str, Any]] = None
-        self.probe_initial_score = 3
+        if isinstance(max_probe_turns, bool) or not isinstance(max_probe_turns, int) or not 1 <= max_probe_turns <= 20:
+            raise ValueError("C_MAX_PROBE_TURNS_INVALID")
+        self.max_probe_turns = max_probe_turns
+        self.probe_initial_score = 2 * max_probe_turns
+        self.probe_max_score = 4 * max_probe_turns
         self.probe_score = self.probe_initial_score
         self.probe_turn_count = 0
-        self.max_probe_turns = 2
         self.probe_score_history: List[Dict[str, Any]] = []
+        self.scored_question_ids: set[str] = set()
         self.last_followup_kind = "none"
         self.last_followup_focus = ""
         self.question_generation_seq = 0
@@ -849,7 +858,6 @@ class ExamCFlow:
         self.generation_errors: List[Dict[str, Any]] = []
         self.completed_root_reviews: List[Dict[str, Any]] = []
         self.question_answers: Dict[str, Dict[str, Any]] = {}
-        self.question_evaluation_tasks: Dict[str, asyncio.Task] = {}
         self.question_evaluations: Dict[str, Dict[str, Any]] = {}
         self.question_evaluation_errors: List[Dict[str, Any]] = []
         self.answer_trace: List[Dict[str, Any]] = []
@@ -857,7 +865,6 @@ class ExamCFlow:
 
     async def run(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._collect_finished_generation_tasks()
-        self._collect_finished_question_evaluation_tasks()
         event = dict(event or {})
         event_type = self._event_type(event)
         if event_type == self.EVENT_START:
@@ -947,11 +954,8 @@ class ExamCFlow:
         }]
 
         root_completed = False
-        had_core_point_before_finish = self._truthy(
-            self.answer_signals.get("has_core_point")
-        )
         judgement = None
-        if input_text and not (finished and had_core_point_before_finish):
+        if input_text:
             judgement = await self._run_answer_judgement(
                 question=question,
                 answer=answer,
@@ -962,10 +966,8 @@ class ExamCFlow:
             self._apply_corrected_text(answer, judgement, has_new_text=True)
             self._remember_question_answer(current_id, answer)
             self._record_answer_updated(current_id, answer)
-            score_message = None
             if judgement.get("status") == "done":
                 self._normalize_judgement_result(judgement)
-                score_message = self._apply_probe_score(current_id, judgement)
                 self._update_answer_signals(current_id, judgement)
                 self.qa_manager.record_judgement(
                     question=question,
@@ -977,8 +979,6 @@ class ExamCFlow:
             self._record_judgement(current_id, judgement)
             self.latest_judgement = deepcopy(judgement)
             messages.extend(self._build_judgement_outputs(current_id, answer, judgement))
-            if score_message is not None:
-                messages.append(score_message)
             if self._should_start_serious_error_generation(judgement):
                 generation_message = self._start_followup_generation(
                     question=question,
@@ -991,10 +991,18 @@ class ExamCFlow:
                 if generation_message is not None:
                     messages.append(generation_message)
 
-        if finished and self._truthy(self.answer_signals.get("has_core_point")):
-            self._start_question_evaluation(question, self.answer_snapshot)
-
         if finished:
+            evaluation = await self._evaluate_completed_answer(question, self.answer_snapshot)
+            if evaluation.get("status") != "done":
+                self.answer_finished = False
+                self._remember_question_answer(current_id, self.answer_snapshot)
+                return messages + [{
+                    "type": "question_evaluation_error",
+                    "question_id": current_id,
+                    "error": evaluation.get("error") or "QUESTION_EVALUATION_FAILED",
+                    "retryable": True,
+                }]
+            messages.append(self._apply_probe_score(current_id, evaluation))
             completion_message = self._probe_completion_message(current_id)
             if completion_message is not None:
                 messages.append(completion_message)
@@ -1008,6 +1016,34 @@ class ExamCFlow:
             if not root_completed:
                 messages.extend(self._generation_status_messages(current_id))
         return messages
+
+    async def _evaluate_completed_answer(self, question, answer):
+        question_id = str(question.get("question_id") or "")
+        if question_id in self.scored_question_ids:
+            return self.question_evaluations[question_id]
+        if not str(answer.get("corrected_text") or answer.get("text") or "").strip():
+            result = {
+                "question_id": question_id, "answer_version": answer.get("version"),
+                "status": "done", "result": {"correctness": "missing", "reason": "未提供回答"},
+            }
+        elif not self.question_evaluation_runner.configured:
+            result = {"status": "error", "error": "QUESTION_EVALUATOR_NOT_CONFIGURED"}
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    self.question_evaluation_runner.run(question, answer), timeout=30
+                )
+            except asyncio.TimeoutError:
+                result = {"status": "error", "error": "QUESTION_EVALUATION_TIMEOUT"}
+        if result.get("status") == "done":
+            correctness = str((result.get("result") or {}).get("correctness") or "").lower()
+            if correctness not in {"correct", "partially_correct", "incorrect", "missing", "unclear"}:
+                result = {"status": "error", "error": "QUESTION_EVALUATION_INVALID"}
+            else:
+                self.question_evaluations[question_id] = result
+        if result.get("status") != "done":
+            self.question_evaluation_errors.append({"question_id": question_id, **result})
+        return result
 
 
     def _remember_question_answer(
@@ -1071,80 +1107,6 @@ class ExamCFlow:
             "answer_status": "timeout_default_missing",
         })
 
-    def _start_question_evaluation(
-        self,
-        question: Mapping[str, Any],
-        answer: Mapping[str, Any],
-    ) -> None:
-        question_id = str(question.get("question_id") or "")
-        student_answer = str(answer.get("corrected_text") or answer.get("text") or "").strip()
-        if not question_id or not student_answer:
-            return
-        if not self.question_evaluation_runner.configured:
-            self.question_evaluation_errors.append({
-                "question_id": question_id,
-                "answer_version": int(answer.get("version") or 0),
-                "status": "error",
-                "error": "QUESTION_EVALUATOR_NOT_CONFIGURED",
-            })
-            return
-        existing = self.question_evaluations.get(question_id)
-        if existing and int(existing.get("answer_version") or 0) >= int(answer.get("version") or 0):
-            return
-        running = self.question_evaluation_tasks.get(question_id)
-        if running is not None and not running.done():
-            return
-        task = asyncio.create_task(
-            self.question_evaluation_runner.run(
-                question=dict(question),
-                answer=dict(answer),
-            )
-        )
-        self.question_evaluation_tasks[question_id] = task
-        task.add_done_callback(
-            lambda done, qid=question_id: self._store_question_evaluation_result(qid, done)
-        )
-
-    def _store_question_evaluation_result(self, question_id: str, task: asyncio.Task) -> None:
-        if self.question_evaluation_tasks.get(question_id) is not task:
-            return
-        self.question_evaluation_tasks.pop(question_id, None)
-        try:
-            result = task.result()
-        except asyncio.CancelledError:
-            result = {
-                "type": "c_question_evaluation_result",
-                "question_id": question_id,
-                "status": "error",
-                "error": "QUESTION_EVALUATION_CANCELLED",
-            }
-        except Exception as exc:
-            result = {
-                "type": "c_question_evaluation_result",
-                "question_id": question_id,
-                "status": "error",
-                "error": str(exc),
-            }
-        if isinstance(result, Mapping):
-            result = dict(result)
-        else:
-            result = {
-                "type": "c_question_evaluation_result",
-                "question_id": question_id,
-                "status": "error",
-                "error": "INVALID_QUESTION_EVALUATION_RESULT",
-            }
-        result.setdefault("question_id", question_id)
-        if result.get("status") == "done":
-            self.question_evaluations[question_id] = result
-        else:
-            self.question_evaluation_errors.append(result)
-
-    def _collect_finished_question_evaluation_tasks(self) -> None:
-        for question_id, task in list(self.question_evaluation_tasks.items()):
-            if task.done():
-                self._store_question_evaluation_result(question_id, task)
-
     def _apply_corrected_text(
         self,
         answer: Dict[str, Any],
@@ -1205,7 +1167,6 @@ class ExamCFlow:
                 default="标准答案核心要点",
             )
 
-        score_delta = self._score_delta_for_route(judgement_route)
         result.update({
             "has_core_point": has_core_point,
             "matched_core_points": matched_core_points,
@@ -1215,28 +1176,27 @@ class ExamCFlow:
             "judgement_route": judgement_route,
             "suggested_followup_kind": suggested_followup_kind,
             "generation_focus": generation_focus,
-            "score_delta": score_delta,
-            "score_reason": judgement_route,
         })
 
-    def _apply_probe_score(
-        self,
-        question_id: str,
-        judgement: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        result = judgement.get("result") if isinstance(judgement, Mapping) else {}
-        if not isinstance(result, Mapping):
-            result = {}
-        delta = int(result.get("score_delta") or 0)
-        route = str(result.get("judgement_route") or "unknown")
+    def _apply_probe_score(self, question_id: str, evaluation: Mapping[str, Any]) -> Dict[str, Any]:
+        if question_id in self.scored_question_ids:
+            raise ValueError("QUESTION_ALREADY_SCORED")
+        result = evaluation.get("result") or {}
+        route = str(result["correctness"]).lower()
+        if route == "unclear":
+            route = "missing"
+        delta = {"correct": 2, "partially_correct": 1,
+                 "incorrect": -2, "missing": -2}[route]
         before = self.probe_score
-        self.probe_score += delta
+        self.probe_score = max(0, min(self.probe_max_score, before + delta))
+        self.scored_question_ids.add(question_id)
         record = {
             "question_id": question_id,
-            "answer_version": judgement.get("answer_version"),
+            "answer_version": evaluation.get("answer_version"),
             "route": route,
-            "score_reason": result.get("score_reason") or route,
-            "delta": delta,
+            "score_reason": result.get("reason") or route,
+            "delta": self.probe_score - before,
+            "rule_delta": delta,
             "score_before": before,
             "score_after": self.probe_score,
         }
@@ -1325,6 +1285,10 @@ class ExamCFlow:
         self,
         question_id: str,
     ) -> Optional[Dict[str, Any]]:
+        if self.probe_score <= 0:
+            return self._probe_completed_message(question_id, "score_zero")
+        if self.probe_score >= self.probe_max_score:
+            return self._probe_completed_message(question_id, "score_maximum")
         if self.probe_turn_count >= self.max_probe_turns:
             return self._probe_completed_message(question_id, "max_probe_turns_reached")
         return None
@@ -1363,6 +1327,7 @@ class ExamCFlow:
                 next(root for root in self.qa_manager.roots if root["question_id"] == root_id),
                 score,
                 reason,
+                score_history,
             ),
         }
         self.completed_root_reviews.append(root_review)
@@ -1403,12 +1368,17 @@ class ExamCFlow:
         review = self._build_final_review(reason)
         return {
             "type": "final_review",
-            "mode": "C",
+            "mode": self.mode,
             "review": review,
         }
 
-    def _root_final_evaluation(self, root, score, reason):
-        self._collect_finished_question_evaluation_tasks()
+    def _root_max_score(self, root: Mapping[str, Any]) -> float:
+        return self.probe_max_score
+
+    def _root_earned_score(self, root: Mapping[str, Any], probe_score: Any) -> float:
+        return max(0.0, min(self.probe_max_score, self._float_value(probe_score)))
+
+    def _root_final_evaluation(self, root, score, reason, score_history=None):
         root_id = str(root["question_id"])
         chain = self.qa_manager.question_chains.get(root_id, [])
         chain_questions = [root] + list(chain)
@@ -1434,9 +1404,8 @@ class ExamCFlow:
                 ),
                 {},
             )
-            pending = question_id in self.question_evaluation_tasks
             evaluation_status = (
-                "done" if evaluation else "pending" if pending else "error" if error else "not_started"
+                "done" if evaluation else "error" if error else "not_started"
             )
             question_chain.append({
                 "question_id": question_id,
@@ -1482,15 +1451,16 @@ class ExamCFlow:
             "student_answer": "\n\n".join(student_answers),
             "question_chain": question_chain,
             "status": str(root.get("status") or "pending"),
-            "score": max(0.0, self._float_value(score)),
-            "max_score": self.probe_initial_score + self.max_probe_turns,
+            "score": self._root_earned_score(root, score),
+            "max_score": self._root_max_score(root),
+            "dimension": "",
+            "score_history": deepcopy(score_history or []),
             "question_count": 0 if root.get("status") == "pending" else len(question_chain),
             "followup_count": len(chain),
             "completion_reason": reason,
         }
 
     def _build_final_review(self, reason: str) -> Dict[str, Any]:
-        self._collect_finished_question_evaluation_tasks()
         roots = [dict(root or {}) for root in self.qa_manager.roots]
         history = deepcopy(self.qa_manager.judgement_history)
         completed_by_root = {
@@ -1513,9 +1483,18 @@ class ExamCFlow:
             ]
             root_stats = self._judgement_stats(root_history)
             completion = completed_by_root.get(root_id, {})
-            active_score = self.probe_score if root_id == self.qa_manager.current_root_id else 0
+            active_score = (
+                self.probe_score
+                if root_id == self.qa_manager.current_root_id and self.probe_score_history
+                else 0
+            )
             score = max(0.0, self._float_value(completion.get("probe_score"), active_score))
-            question_reviews.append(self._root_final_evaluation(root, score, reason))
+            score_history = (
+                completion.get("probe_score_history")
+                or (self.probe_score_history if root_id == self.qa_manager.current_root_id else [])
+            )
+            question_review = self._root_final_evaluation(root, score, reason, score_history)
+            question_reviews.append(question_review)
             dimension_scores[label] = score
             question_text = question_value(
                 root,
@@ -1536,9 +1515,11 @@ class ExamCFlow:
 
         completed_count = sum(1 for root in roots if root.get("status") == "completed")
         total_score = sum(dimension_scores.values())
-        max_total = len(roots) * (self.probe_initial_score + self.max_probe_turns)
+        max_dimensions = {f"根题 {index}": self.probe_max_score
+                          for index in range(1, len(roots) + 1)}
+        max_total = sum(max_dimensions.values())
         overall_summary = (
-            f"C模式口试已生成最终评审：共 {len(roots)} 道根题，"
+            f"{self.mode}模式口试已生成最终评审：共 {len(roots)} 道根题，"
             f"完成 {completed_count} 道；累计判断 {all_stats['judged']} 次，"
             f"命中核心点 {all_stats['core_hits']} 次，"
             f"严重错误 {all_stats['fundamental_errors']} 次。"
@@ -1566,7 +1547,7 @@ class ExamCFlow:
         ]
 
         return {
-            "mode": "C",
+            "mode": self.mode,
             "status": "finished" if self.qa_manager.selection_complete else "partial",
             "reason": reason,
             "overall_summary": overall_summary,
@@ -1577,9 +1558,14 @@ class ExamCFlow:
             "suggestions": suggestions,
             "scores": {
                 "dimensions": dimension_scores,
+                "max_dimensions": max_dimensions,
                 "total": total_score,
                 "max_total": max_total,
             },
+            "scoring": {"version": 2, "max_probe_turns": self.max_probe_turns,
+                        "initial_score": self.probe_initial_score,
+                        "max_root_score": self.probe_max_score,
+                        "policy": "probe"},
             "stats": all_stats,
             "exam_record_path": self.exam_record_path,
         }
@@ -1615,13 +1601,6 @@ class ExamCFlow:
             return float(value)
         except (TypeError, ValueError):
             return default
-
-    def _score_delta_for_route(self, route: str) -> int:
-        if route == "core_point_hit":
-            return 1
-        if route in {"fundamental_error", "core_point_missing"}:
-            return -1
-        return 0
 
     def _generation_focus_for_followup(
         self,
@@ -1944,11 +1923,18 @@ class ExamCFlow:
         return [{"type": "waiting", "reason": "no_generated_question"}]
 
     def _select_followup_kind(self) -> str:
+        current_id = str((self.qa_manager.current_question or {}).get("question_id") or "")
+        evaluation = self.question_evaluations.get(current_id) or {}
+        correctness = str((evaluation.get("result") or {}).get("correctness") or "").lower()
         if (
             self.answer_signals.get("has_fundamental_error")
             and not self.answer_signals.get("fundamental_error_resolved")
         ):
             return self.FOLLOWUP_KIND_SERIOUS_ERROR
+        if correctness in {"incorrect", "missing", "unclear"}:
+            return self.FOLLOWUP_KIND_MISSING_CORE
+        if correctness in {"correct", "partially_correct"}:
+            return self.FOLLOWUP_KIND_KEYWORD_DEEPEN
         if not self.answer_signals.get("has_core_point"):
             return self.FOLLOWUP_KIND_MISSING_CORE
         return self.FOLLOWUP_KIND_KEYWORD_DEEPEN
@@ -1990,7 +1976,7 @@ class ExamCFlow:
                 }]
             relation = str(result.get("relation") or generated_question.get("relation") or "deepen")
             relation = relation.strip().lower()
-            if relation not in QAmanagerC.VALID_RELATIONS:
+            if relation not in QAmanager.VALID_RELATIONS:
                 relation = "deepen"
             try:
                 question = self.qa_manager.add_generated_question(
@@ -2258,6 +2244,7 @@ class ExamCFlow:
         self.probe_score = self.probe_initial_score
         self.probe_turn_count = 0
         self.probe_score_history = []
+        self.scored_question_ids = set()
         self.last_followup_kind = "none"
         self.last_followup_focus = ""
 
@@ -2293,7 +2280,6 @@ class ExamCFlow:
     @property
     def state(self) -> Dict[str, Any]:
         self._collect_finished_generation_tasks()
-        self._collect_finished_question_evaluation_tasks()
         return {
             "answer": self.answer_snapshot,
             "latest_judgement": deepcopy(self.latest_judgement),
@@ -2302,7 +2288,6 @@ class ExamCFlow:
             "question_answers": deepcopy(self.question_answers),
             "question_evaluations": deepcopy(self.question_evaluations),
             "question_evaluation_errors": deepcopy(self.question_evaluation_errors),
-            "pending_question_evaluations": list(self.question_evaluation_tasks.keys()),
             "question_state": self.qa_manager.snapshot(),
             "pending_question_generations": deepcopy(
                 list(self.pending_question_meta.values())

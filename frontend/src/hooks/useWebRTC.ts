@@ -25,6 +25,7 @@ export function useWebRTC(showToast: ShowToastFn) {
   const [starting, setStarting] = useState(false)
   const [remoteAudioStarted, setRemoteAudioStarted] = useState(false)
   const [audioDetected, setAudioDetected] = useState(false)
+  const [dcOpen, setDcOpen] = useState(false)
   const audioDetectedFlagRef = useRef(false)
   const dcHandlersRef = useRef<Record<string, DCMessageHandler>>({})
 
@@ -104,6 +105,7 @@ export function useWebRTC(showToast: ShowToastFn) {
   const cleanupConnection = useCallback(() => {
     setRemoteAudioStarted(false)
     setAudioDetected(false)
+    setDcOpen(false)
     audioDetectedFlagRef.current = false
     stopMonitor()
 
@@ -193,26 +195,30 @@ export function useWebRTC(showToast: ShowToastFn) {
       const dc = pc.createDataChannel('messages')
       dcRef.current = dc
 
-      dc.onopen = () => console.log('[DC] open, label:', dc.label)
-      dc.onclose = () => console.log('[DC] closed')
+      dc.onopen = () => {
+        console.log('[DC] open, label:', dc.label)
+        setDcOpen(true)
+      }
+      dc.onclose = () => {
+        console.log('[DC] closed')
+        setDcOpen(false)
+      }
       dc.onerror = (ev) => console.error('[DC] error:', ev)
       dc.onmessage = (event) => {
         const ts = new Date().toISOString()
-        let data: Record<string, unknown>
-        try { data = JSON.parse(event.data as string) } catch { return console.log(`[DC][${ts}] non-JSON:`, event.data) }
+        let parsed: unknown
+        try { parsed = JSON.parse(event.data as string) } catch { return console.log(`[DC][${ts}] non-JSON:`, event.data) }
 
-        console.log(`[DC][${ts}] ← type: "${data.type}"`, data)
+        // C 模式后端可能一次返回消息数组，逐条分发
+        const items: Record<string, unknown>[] = Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>[])
+          : [parsed as Record<string, unknown>]
 
-        if (data.type === 'user-llm-text') {
-          const text = (data.data as Record<string, unknown>)?.text
-          if (text) console.log(`[DC][${ts}] ← User: "${text}"`)
-        } else if (data.type === 'bot-llm-text') {
-          const text = (data.data as Record<string, unknown>)?.text
-          if (text) console.log(`[DC][${ts}] ← AI: "${text}"`)
+        for (const data of items) {
+          console.log(`[DC][${ts}] ← type: "${data.type}"`, data)
+          const handler = dcHandlersRef.current[data.type as string]
+          handler ? handler(data) : console.warn(`[DC][${ts}] unhandled type: "${data.type}"`)
         }
-
-        const handler = dcHandlersRef.current[data.type as string]
-        handler ? handler(data) : console.warn(`[DC][${ts}] unhandled type: "${data.type}"`)
       }
 
       const candidates: RTCIceCandidate[] = []
@@ -314,5 +320,5 @@ export function useWebRTC(showToast: ShowToastFn) {
     }
   }, [])
 
-  return { sessionId, chatStatus, starting, remoteAudioStarted, audioDetected, startSession, closeSession, sendDCMessage, onDCMessage, replaceAudioTrack, cleanupConnection }
+  return { sessionId, chatStatus, starting, remoteAudioStarted, audioDetected, dcOpen, startSession, closeSession, sendDCMessage, onDCMessage, replaceAudioTrack, cleanupConnection }
 }

@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, HTTPException
-from fastapi.responses import PlainTextResponse
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
@@ -33,7 +32,7 @@ from AIOralExamSystem.Exam.Examdata.judge_config_repository import (
 )
 from AIOralExamSystem.Tool.git.git_tool import GitRepositoryTool
 from AIOralExamSystem.report_template import ReportTemplate
-from AIOralExamSystem.routes.other_routes import (
+from AIOralExamSystem.Exam.analysis_questions import (
     _extract_a_questions_from_report_result,
     _extract_c_core_module_questions_from_report_result,
     _save_a_questions_to_preset_questions,
@@ -128,36 +127,57 @@ def _analysis_document_title(agent_answer: str, markdown: str) -> str:
     return "已上传的作业文档"
 
 
-def _question_prompt(exam_type: str, dimensions: list[str]) -> str:
+def _question_prompt(exam_type: str, dimensions: list[str], question_count: int) -> str:
     if exam_type == "C":
         return (
-            "报告完成后还必须生成口试问题：从仓库中选择最多三个有证据的核心模块，"
-            "每个模块生成一道用于核验实际开发工作的题目，并调用 record_oral_questions。"
+            f"报告完成后请尽量生成 {question_count} 道口试问题：优先从仓库中选择有证据的不同核心模块，"
+            "先为每个模块生成一道核验实际开发工作的题目；若模块数少于目标题数，"
+            "再从已有模块的不同技术角度补充问题。调用 record_oral_questions。"
             "每项包含 module_name、question、Answer、aspect、source；"
-            "source 尽量给出可核查的仓库文件路径或 Git 提交。"
+            "source 尽量给出可核查的仓库文件路径或 Git 提交。证据不足时只记录能确认的问题。"
         )
     return (
-        "报告完成后还必须生成口试问题，并调用 record_oral_questions。"
-        "每个评分维度生成一道与仓库实际代码或文档对应的核验题目，"
+        f"报告完成后请尽量生成 {question_count} 道口试问题，并调用 record_oral_questions。"
+        "题目应与仓库实际代码或文档对应；题数少于评分维度数时选择最重要的维度，"
+        "题数多于维度数时可从同一维度的不同角度提问。"
         "每项包含 dimension、Question、standard_answer；不要编造仓库证据。"
         f"评分维度：{dimensions if dimensions else '依据报告中的主要模块'}。"
     )
 
 
-def _as_c_question_result(questions: list[dict]) -> dict:
-    by_module: dict[str, dict] = {}
+def _as_c_question_result(questions: list[dict], question_count: int) -> dict:
+    candidates: dict[str, list[dict]] = {}
+    seen_questions: set[str] = set()
     for item in questions:
         module_name = str(item.get("module_name") or item.get("dimension") or "").strip()
         question = str(item.get("question") or item.get("Question") or "").strip()
-        if not module_name or not question or module_name in by_module:
+        key = question.casefold()
+        if not module_name or not question or key in seen_questions:
             continue
-        by_module[module_name] = {
+        seen_questions.add(key)
+        candidates.setdefault(module_name, []).append(item)
+
+    selected: list[tuple[str, dict]] = []
+    for module_name, items in candidates.items():
+        selected.append((module_name, items[0]))
+        if len(selected) >= question_count:
+            break
+    if len(selected) < question_count:
+        for module_name, items in candidates.items():
+            for item in items[1:]:
+                selected.append((module_name, item))
+                if len(selected) >= question_count:
+                    break
+            if len(selected) >= question_count:
+                break
+
+    by_module: dict[str, dict] = {}
+    for module_name, item in selected:
+        by_module.setdefault(module_name, {
             "ok": True,
             "module_name": module_name,
-            "questions": [item],
-        }
-        if len(by_module) >= 3:
-            break
+            "questions": [],
+        })["questions"].append(item)
     return _extract_c_core_module_questions_from_report_result(
         {"core_module_questions": by_module}
     )
@@ -175,8 +195,16 @@ async def _execute_analysis(job: dict) -> dict:
     config = await get_exam_judge_config_by_exam_item(exam_item_id, include_api_key=True)
     if not isinstance(config, dict):
         raise RuntimeError("该考试项目没有可用的数据库模型配置")
-    model_settings = _model_settings_for_role(config)
+    model_settings = _model_settings_for_role(
+        config, "report_judger" if exam_type == "C" else "main_judger",
+    )
     exam_item = await get_exam_item_by_id(exam_item_id)
+    if not isinstance(exam_item, dict):
+        raise RuntimeError("考试项目不存在，无法读取 AI 解析生成题数")
+    question_count = exam_item.get("analysis_question_count")
+    if isinstance(question_count, bool) or not isinstance(question_count, int) or not 1 <= question_count <= 5:
+        raise RuntimeError("考试项目的 AI 解析生成题数必须在 1 到 5 之间")
+    _set_job(analysis_id, requested_question_count=question_count)
     dimensions = exam_item.get("dimension_names") if isinstance(exam_item, dict) else []
     dimensions = [str(value).strip() for value in dimensions if str(value).strip()] if isinstance(dimensions, list) else []
 
@@ -224,8 +252,8 @@ async def _execute_analysis(job: dict) -> dict:
             agent.run(
                 user_prompt=(
                     "现在请基于刚完成的报告和当前仓库生成口试问题。"
-                    + _question_prompt(exam_type, dimensions)
-                    + "必须调用 record_oral_questions，不要只在回复中列出问题。"
+                    + _question_prompt(exam_type, dimensions, question_count)
+                    + "如能生成题目，必须调用 record_oral_questions，不要只在回复中列出问题。"
                 )
             ),
             timeout=_QUESTIONS_TIMEOUT_SECONDS,
@@ -235,14 +263,9 @@ async def _execute_analysis(job: dict) -> dict:
     finally:
         await agent.cleanup()
 
-    if not agent.oral_questions:
-        raise RuntimeError(f"Agent 未生成口试问题；报告路径：{report_path}")
-
     _set_job(analysis_id, stage="saving", current_round=None, current_tool=None)
     if exam_type == "C":
-        question_result = _as_c_question_result(agent.oral_questions)
-        if not question_result.get("question_count"):
-            raise RuntimeError("C 类口试问题缺少核心模块或题目内容")
+        question_result = _as_c_question_result(agent.oral_questions, question_count)
         preset_result = await _save_c_core_module_questions_to_preset_questions(
             course_id, exam_item_id, user_id, question_result
         )
@@ -250,13 +273,18 @@ async def _execute_analysis(job: dict) -> dict:
         question_result = _extract_a_questions_from_report_result(
             {"questions": agent.oral_questions}
         )
-        if not question_result.get("question_count"):
-            raise RuntimeError("A 类口试问题为空")
+        question_result["questions"] = question_result["questions"][:question_count]
+        question_result["question_count"] = len(question_result["questions"])
         preset_result = await _save_a_questions_to_preset_questions(
             course_id, exam_item_id, user_id, question_result
         )
-    if not preset_result.get("ok") or not preset_result.get("saved_count"):
+    if not preset_result.get("ok"):
         raise RuntimeError(f"口试问题保存失败：{preset_result}")
+    saved_question_count = int(preset_result.get("saved_count") or 0)
+    question_generation_status = (
+        "complete" if saved_question_count >= question_count
+        else "partial" if saved_question_count else "empty"
+    )
 
     updated = await update_exam_session_repository_url(
         user_id=user_id,
@@ -284,7 +312,9 @@ async def _execute_analysis(job: dict) -> dict:
         "branch": result.get("branch"),
         "answer": result.get("answer"),
         "question_count": question_result["question_count"],
-        "saved_question_count": preset_result["saved_count"],
+        "requested_question_count": question_count,
+        "saved_question_count": saved_question_count,
+        "question_generation_status": question_generation_status,
         "question_result": question_result,
         "preset_question_result": preset_result,
     }
@@ -349,6 +379,7 @@ def register_agent_analysis_routes(app, args) -> None:
             "stage": "queued",
             "current_round": None,
             "completed_rounds": 0,
+            "requested_question_count": None,
             "current_tool": None,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": now,
@@ -410,12 +441,14 @@ def register_agent_analysis_routes(app, args) -> None:
                     "stage": job["stage"],
                     "current_round": job["current_round"],
                     "completed_rounds": job["completed_rounds"],
+                    "requested_question_count": job.get("requested_question_count"),
                     "current_tool": job["current_tool"],
                     "updated_at": job["updated_at"],
                     "error": job["error"],
                 }
                 if job is not None else None
             )
+            result = copy.deepcopy(job.get("result")) if job is not None else None
         document = await get_analysis_document_metadata(user_id, course_id, exam_id)
         if progress is None:
             if document is None:
@@ -427,11 +460,14 @@ def register_agent_analysis_routes(app, args) -> None:
                 "stage": "completed",
                 "current_round": None,
                 "completed_rounds": None,
+                "requested_question_count": None,
                 "current_tool": None,
                 "updated_at": document["updated_at"],
                 "error": None,
             }
         progress["title"] = document["title"] if document is not None else None
+        progress["saved_question_count"] = result.get("saved_question_count") if isinstance(result, dict) else None
+        progress["question_generation_status"] = result.get("question_generation_status") if isinstance(result, dict) else None
         return progress
 
     @app.get("/Agent/analysis/exams/{exam_id}/document")
@@ -446,22 +482,3 @@ def register_agent_analysis_routes(app, args) -> None:
             raise HTTPException(status_code=404, detail="解析文档不存在")
         document.pop("user_id")
         return document
-
-    @app.get("/Agent/analysis/{analysis_id}/report", response_class=PlainTextResponse)
-    async def get_agent_analysis_report(
-        analysis_id: str,
-        current_user: dict = Depends(get_current_user),
-    ):
-        user_id = str(current_user.get("uuid") or "").strip()
-        with _JOBS_LOCK:
-            job = _JOBS.get(analysis_id)
-            if job is None or job["user_id"] != user_id:
-                raise HTTPException(status_code=404, detail="分析任务不存在")
-        report_path = (
-            _PROJECT_ROOT / "AIreport" / "analysis_jobs" / analysis_id / "AIreport" / "report.md"
-        )
-        if not report_path.is_file():
-            raise HTTPException(status_code=404, detail="报告尚未生成")
-        return PlainTextResponse(
-            await asyncio.to_thread(report_path.read_text, encoding="utf-8")
-        )

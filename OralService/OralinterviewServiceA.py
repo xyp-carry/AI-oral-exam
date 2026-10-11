@@ -254,7 +254,7 @@ class InterviewServiceA(FrameProcessor):
         return self.qa_manager
 
     def build_main_judger(self, source: str) -> MainJudgerAgent:
-        model_settings = self.require_agent_settings("report_judger")
+        model_settings = self.require_agent_settings("main_judger")
         return MainJudgerAgent(
             model_settings,
             source,

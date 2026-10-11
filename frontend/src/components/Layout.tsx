@@ -4,7 +4,7 @@ import { useAuth } from '../hooks/useAuth'
 import { useExamSession } from '../hooks/useExamSession'
 
 const baseNavItems = [
-  { to: '/dashboard', icon: 'fa-chart-pie', label: '仪表盘' },
+  { to: '/dashboard', icon: 'fa-book-open', label: '操作指南' },
   { to: '/exam', icon: 'fa-microphone', label: 'AI 口语考试' },
   { to: '/join', icon: 'fa-user-plus', label: '课程申请' },
   { to: '/history', icon: 'fa-history', label: '考试历史管理' },
@@ -17,7 +17,7 @@ const teacherOnlyItems = [
 ]
 
 const pageTitles: Record<string, string> = {
-  '/dashboard': '仪表盘',
+  '/dashboard': '操作指南',
   '/exam': 'AI 口语考试',
   '/join': '课程申请',
   '/history': '考试历史管理',

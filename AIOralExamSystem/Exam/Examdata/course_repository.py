@@ -5,10 +5,27 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from .connection import connect, ensure_database
+from sqlalchemy import exists, func, literal, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+from .connection import ensure_database, get_engine, mysql_error_code
 from .exam_repository import create_pending_exam_sessions_for_user
+from .models import Course, CourseJoinRequest, CourseStudent, CourseTeacher
 from .schema import ensure_tables
 from .serializers import course_row_to_dict, join_request_row_to_dict
+
+_COURSE_COLUMNS = (
+    Course.course_id,
+    Course.course_name,
+    Course.description,
+    Course.owner_teacher_id,
+    Course.invite_code,
+    Course.invite_code_expires_at,
+    Course.invite_code_created_at,
+    Course.status,
+    Course.created_at,
+    Course.updated_at,
+)
 
 
 async def create_course(
@@ -121,222 +138,121 @@ def _create_course_sync(
     invite_code_valid_times: int,
 ) -> Dict[str, object]:
     ensure_database()
-    connection = connect(use_database=True)
     course_id = str(uuid.uuid4())
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
     course_name = _normalize_course_name(course_name)
     valid_times = _normalize_invite_code_valid_times(invite_code_valid_times)
-    expires_at = (datetime.now() + timedelta(seconds=valid_times)).strftime("%Y-%m-%d %H:%M:%S")
+    expires_at = datetime.now() + timedelta(seconds=valid_times)
     try:
-        ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _raise_if_course_name_exists(cursor, course_name)
-            _clear_expired_course_invite_codes(cursor, now)
-            invite_code = _generate_unique_course_invite_code(cursor, now)
-            cursor.execute(
-                """
-                INSERT INTO courses (
-                    course_id,
-                    course_name,
-                    description,
-                    owner_teacher_id,
-                    invite_code,
-                    invite_code_expires_at,
-                    invite_code_created_at,
-                    status,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)
-                """,
-                (
-                    course_id,
-                    course_name,
-                    description,
-                    owner_teacher_id,
-                    invite_code,
-                    expires_at,
-                    now,
-                    now,
-                    now,
-                ),
+        with get_engine().begin() as connection:
+            ensure_tables(connection)
+            _raise_if_course_name_exists(connection, course_name, owner_teacher_id)
+            _clear_expired_course_invite_codes(connection, now)
+            invite_code = _generate_unique_course_invite_code(connection, now)
+            connection.execute(
+                Course.__table__.insert().values(
+                    course_id=course_id,
+                    course_name=course_name,
+                    description=description,
+                    owner_teacher_id=owner_teacher_id,
+                    invite_code=invite_code,
+                    invite_code_expires_at=expires_at,
+                    invite_code_created_at=now,
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-            cursor.execute(
-                """
-                INSERT INTO course_teachers (
-                    course_id,
-                    teacher_id,
-                    teacher_role,
-                    status,
-                    created_at
-                ) VALUES (%s, %s, 'owner', 'active', %s)
-                """,
-                (course_id, owner_teacher_id, now),
+            connection.execute(
+                CourseTeacher.__table__.insert().values(
+                    course_id=course_id,
+                    teacher_id=owner_teacher_id,
+                    teacher_role="owner",
+                    status="active",
+                    created_at=now,
+                )
             )
-            cursor.execute(
-                """
-                SELECT
-                    course_id,
-                    course_name,
-                    description,
-                    owner_teacher_id,
-                    invite_code,
-                    invite_code_expires_at,
-                    invite_code_created_at,
-                    status,
-                    created_at,
-                    updated_at
-                FROM courses
-                WHERE course_id = %s
-                """,
-                (course_id,),
-            )
-            created_course = course_row_to_dict(cursor.fetchone())
-        connection.commit()
+            created_row = connection.execute(
+                select(*_COURSE_COLUMNS).where(Course.course_id == course_id)
+            ).fetchone()
+            created_course = course_row_to_dict(created_row)
         return created_course
-    except Exception:
-        connection.rollback()
+    except Exception as error:
+        _raise_if_course_name_unique_conflict(error)
         raise
-    finally:
-        connection.close()
 
 
 def _list_all_courses_sync() -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    course_id,
-                    course_name,
-                    description,
-                    owner_teacher_id,
-                    invite_code,
-                    invite_code_expires_at,
-                    invite_code_created_at,
-                    status,
-                    created_at,
-                    updated_at
-                FROM courses
-                WHERE status = 'active'
-                ORDER BY created_at DESC
-                """
-            )
-            return [course_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+        rows = connection.execute(
+            select(*_COURSE_COLUMNS)
+            .where(Course.status == "active")
+            .order_by(Course.created_at.desc())
+        ).fetchall()
+        return [course_row_to_dict(row) for row in rows]
 
 
 def _list_teacher_courses_sync(teacher_id: str) -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    c.course_id,
-                    c.course_name,
-                    c.description,
-                    c.owner_teacher_id,
-                    c.invite_code,
-                    c.invite_code_expires_at,
-                    c.invite_code_created_at,
-                    c.status,
-                    c.created_at,
-                    c.updated_at
-                FROM courses c
-                JOIN course_teachers t ON c.course_id = t.course_id
-                WHERE t.teacher_id = %s
-                  AND t.status = 'active'
-                  AND c.status = 'active'
-                ORDER BY c.created_at DESC
-                """,
-                (teacher_id,),
+        rows = connection.execute(
+            select(*_COURSE_COLUMNS)
+            .join(
+                CourseTeacher,
+                Course.course_id == CourseTeacher.course_id,
             )
-            return [course_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+            .where(
+                CourseTeacher.teacher_id == teacher_id,
+                CourseTeacher.status == "active",
+                Course.status == "active",
+            )
+            .order_by(Course.created_at.desc())
+        ).fetchall()
+        return [course_row_to_dict(row) for row in rows]
 
 
 def _list_student_courses_sync(student_id: str) -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    c.course_id,
-                    c.course_name,
-                    c.description,
-                    c.owner_teacher_id,
-                    c.invite_code,
-                    c.invite_code_expires_at,
-                    c.invite_code_created_at,
-                    c.status,
-                    c.created_at,
-                    c.updated_at
-                FROM courses c
-                JOIN course_students s ON c.course_id = s.course_id
-                WHERE s.student_id = %s
-                  AND s.status = 'active'
-                  AND c.status = 'active'
-                ORDER BY c.created_at DESC
-                """,
-                (student_id,),
+        rows = connection.execute(
+            select(*_COURSE_COLUMNS)
+            .join(
+                CourseStudent,
+                Course.course_id == CourseStudent.course_id,
             )
-            return [course_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+            .where(
+                CourseStudent.student_id == student_id,
+                CourseStudent.status == "active",
+                Course.status == "active",
+            )
+            .order_by(Course.created_at.desc())
+        ).fetchall()
+        return [course_row_to_dict(row) for row in rows]
 
 
 def _list_available_courses_sync(student_id: Optional[str]) -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        params: tuple = ()
-        exclude_joined = ""
+        statement = select(*_COURSE_COLUMNS).where(Course.status == "active")
         if student_id:
-            exclude_joined = """
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM course_students s
-                    WHERE s.course_id = c.course_id
-                      AND s.student_id = %s
-                      AND s.status = 'active'
+            statement = statement.where(
+                ~exists(
+                    select(literal(1)).where(
+                        CourseStudent.course_id == Course.course_id,
+                        CourseStudent.student_id == student_id,
+                        CourseStudent.status == "active",
+                    )
                 )
-            """
-            params = (student_id,)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT
-                    c.course_id,
-                    c.course_name,
-                    c.description,
-                    c.owner_teacher_id,
-                    c.invite_code,
-                    c.invite_code_expires_at,
-                    c.invite_code_created_at,
-                    c.status,
-                    c.created_at,
-                    c.updated_at
-                FROM courses c
-                WHERE c.status = 'active'
-                {exclude_joined}
-                ORDER BY c.created_at DESC
-                """,
-                params,
             )
-            return [course_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+        rows = connection.execute(
+            statement.order_by(Course.created_at.desc())
+        ).fetchall()
+        return [course_row_to_dict(row) for row in rows]
 
 
 def _get_course_by_invite_code_sync(invite_code: str) -> Optional[Dict[str, object]]:
@@ -344,36 +260,19 @@ def _get_course_by_invite_code_sync(invite_code: str) -> Optional[Dict[str, obje
     if not invite_code:
         return None
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    now = datetime.now()
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    c.course_id,
-                    c.course_name,
-                    c.description,
-                    c.owner_teacher_id,
-                    c.invite_code,
-                    c.invite_code_expires_at,
-                    c.invite_code_created_at,
-                    c.status,
-                    c.created_at,
-                    c.updated_at
-                FROM courses c
-                WHERE c.invite_code = %s
-                  AND c.invite_code_expires_at > %s
-                  AND c.status = 'active'
-                LIMIT 1
-                """,
-                (invite_code, now),
+        row = connection.execute(
+            select(*_COURSE_COLUMNS)
+            .where(
+                Course.invite_code == invite_code,
+                Course.invite_code_expires_at > now,
+                Course.status == "active",
             )
-            row = cursor.fetchone()
-            return course_row_to_dict(row) if row else None
-    finally:
-        connection.close()
+            .limit(1)
+        ).fetchone()
+        return course_row_to_dict(row) if row else None
 
 
 def _reset_course_invite_code_sync(
@@ -381,56 +280,34 @@ def _reset_course_invite_code_sync(
     invite_code_valid_times: int,
 ) -> Optional[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
     valid_times = _normalize_invite_code_valid_times(invite_code_valid_times)
-    expires_at = (datetime.now() + timedelta(seconds=valid_times)).strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    expires_at = datetime.now() + timedelta(seconds=valid_times)
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _clear_expired_course_invite_codes(cursor, now)
-            invite_code = _generate_unique_course_invite_code(cursor, now)
-            cursor.execute(
-                """
-                UPDATE courses
-                SET invite_code = %s,
-                    invite_code_expires_at = %s,
-                    invite_code_created_at = %s,
-                    updated_at = %s
-                WHERE course_id = %s
-                  AND status = 'active'
-                """,
-                (invite_code, expires_at, now, now, course_id),
+        _clear_expired_course_invite_codes(connection, now)
+        invite_code = _generate_unique_course_invite_code(connection, now)
+        result = connection.execute(
+            update(Course)
+            .where(
+                Course.course_id == course_id,
+                Course.status == "active",
             )
-            if cursor.rowcount == 0:
-                connection.rollback()
-                return None
-            cursor.execute(
-                """
-                SELECT
-                    course_id,
-                    course_name,
-                    description,
-                    owner_teacher_id,
-                    invite_code,
-                    invite_code_expires_at,
-                    invite_code_created_at,
-                    status,
-                    created_at,
-                    updated_at
-                FROM courses
-                WHERE course_id = %s
-                """,
-                (course_id,),
+            .values(
+                invite_code=invite_code,
+                invite_code_expires_at=expires_at,
+                invite_code_created_at=now,
+                updated_at=now,
             )
-            updated_course = course_row_to_dict(cursor.fetchone())
-        connection.commit()
-        return updated_course
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+        if result.rowcount == 0:
+            connection.rollback()
+            return None
+        updated_row = connection.execute(
+            select(*_COURSE_COLUMNS).where(Course.course_id == course_id)
+        ).fetchone()
+        updated_course = course_row_to_dict(updated_row)
+    return updated_course
 
 
 def _update_course_sync(
@@ -440,152 +317,119 @@ def _update_course_sync(
     description: Optional[str],
 ) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now()
     try:
-        ensure_tables(connection)
-        set_clauses = []
-        values = []
-        with connection.cursor() as cursor:
+        with get_engine().begin() as connection:
+            ensure_tables(connection)
+            values: Dict[str, object] = {}
             if course_name is not None:
                 course_name = _normalize_course_name(course_name)
-                _raise_if_course_name_exists(cursor, course_name, exclude_course_id=course_id)
-                set_clauses.append("course_name = %s")
-                values.append(course_name)
+                _raise_if_course_name_exists(
+                    connection, course_name, owner_teacher_id, exclude_course_id=course_id
+                )
+                values["course_name"] = course_name
             if description is not None:
-                set_clauses.append("description = %s")
-                values.append(description)
-            if not set_clauses:
+                values["description"] = description
+            if not values:
                 return True
-            set_clauses.append("updated_at = %s")
-            values.append(now)
-            values.extend([course_id, owner_teacher_id])
-            cursor.execute(
-                f"""
-                UPDATE courses
-                SET {', '.join(set_clauses)}
-                WHERE course_id = %s
-                  AND owner_teacher_id = %s
-                  AND status = 'active'
-                """,
-                values,
+            values["updated_at"] = now
+            result = connection.execute(
+                update(Course)
+                .where(
+                    Course.course_id == course_id,
+                    Course.owner_teacher_id == owner_teacher_id,
+                    Course.status == "active",
+                )
+                .values(**values)
             )
-            updated = cursor.rowcount > 0
-        connection.commit()
+            updated = result.rowcount > 0
         return updated
-    except Exception:
-        connection.rollback()
+    except Exception as error:
+        _raise_if_course_name_unique_conflict(error)
         raise
-    finally:
-        connection.close()
 
 
 def _delete_course_sync(course_id: str, owner_teacher_id: str) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    now = datetime.now()
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE courses
-                SET status = 'deleted',
-                    updated_at = %s
-                WHERE course_id = %s
-                  AND owner_teacher_id = %s
-                  AND status = 'active'
-                """,
-                (now, course_id, owner_teacher_id),
+        result = connection.execute(
+            update(Course)
+            .where(
+                Course.course_id == course_id,
+                Course.owner_teacher_id == owner_teacher_id,
+                Course.status == "active",
             )
-            deleted = cursor.rowcount > 0
-        connection.commit()
-        return deleted
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            .values(status="deleted", updated_at=now)
+        )
+        deleted = result.rowcount > 0
+    return deleted
 
 
 def _request_join_course_sync(course_id: str, user_id: str) -> str:
     ensure_database()
-    connection = connect(use_database=True)
     request_id = str(uuid.uuid4())
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    now = datetime.now()
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT 1
-                FROM courses
-                WHERE course_id = %s
-                  AND status = 'active'
-                LIMIT 1
-                """,
-                (course_id,),
+        course_row = connection.execute(
+            select(Course.course_id)
+            .where(
+                Course.course_id == course_id,
+                Course.status == "active",
             )
-            if cursor.fetchone() is None:
-                raise ValueError("COURSE_NOT_FOUND")
+            .limit(1)
+        ).fetchone()
+        if course_row is None:
+            raise ValueError("COURSE_NOT_FOUND")
 
-            _raise_if_active_course_member_exists(cursor, course_id, user_id)
+        _raise_if_active_course_member_exists(connection, course_id, user_id)
 
-            cursor.execute(
-                """
-                SELECT request_id
-                FROM course_join_requests
-                WHERE course_id = %s
-                  AND user_id = %s
-                  AND status = 'pending'
-                LIMIT 1
-                """,
-                (course_id, user_id),
+        pending_row = connection.execute(
+            select(CourseJoinRequest.request_id)
+            .where(
+                CourseJoinRequest.course_id == course_id,
+                CourseJoinRequest.user_id == user_id,
+                CourseJoinRequest.status == "pending",
             )
-            row = cursor.fetchone()
-            if row is not None:
-                return row[0]
+            .limit(1)
+        ).fetchone()
+        if pending_row is not None:
+            return pending_row[0]
 
-            cursor.execute(
-                """
-                INSERT INTO course_join_requests (
-                    request_id,
-                    course_id,
-                    user_id,
-                    status,
-                    requested_at
-                ) VALUES (%s, %s, %s, 'pending', %s)
-                """,
-                (request_id, course_id, user_id, now),
+        connection.execute(
+            CourseJoinRequest.__table__.insert().values(
+                request_id=request_id,
+                course_id=course_id,
+                user_id=user_id,
+                status="pending",
+                requested_at=now,
             )
-        connection.commit()
-        return request_id
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+    return request_id
 
 
-def _raise_if_active_course_member_exists(cursor, course_id: str, user_id: str) -> None:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM course_students
-        WHERE course_id = %s
-          AND student_id = %s
-          AND status = 'active'
-        UNION ALL
-        SELECT 1
-        FROM course_teachers
-        WHERE course_id = %s
-          AND teacher_id = %s
-          AND status = 'active'
-        LIMIT 1
-        """,
-        (course_id, user_id, course_id, user_id),
-    )
-    if cursor.fetchone() is not None:
+def _raise_if_active_course_member_exists(connection, course_id: str, user_id: str) -> None:
+    student_row = connection.execute(
+        select(literal(1))
+        .where(
+            CourseStudent.course_id == course_id,
+            CourseStudent.student_id == user_id,
+            CourseStudent.status == "active",
+        )
+        .limit(1)
+    ).fetchone()
+    teacher_row = connection.execute(
+        select(literal(1))
+        .where(
+            CourseTeacher.course_id == course_id,
+            CourseTeacher.teacher_id == user_id,
+            CourseTeacher.status == "active",
+        )
+        .limit(1)
+    ).fetchone()
+    if student_row is not None or teacher_row is not None:
         raise ValueError("COURSE_ALREADY_JOINED")
 
 
@@ -606,64 +450,65 @@ def _normalize_invite_code_valid_times(invite_code_valid_times: int) -> int:
     return valid_times
 
 
-def _clear_expired_course_invite_codes(cursor, now: str) -> None:
-    cursor.execute(
-        """
-        UPDATE courses
-        SET invite_code = NULL,
-            invite_code_expires_at = NULL,
-            invite_code_created_at = NULL
-        WHERE invite_code IS NOT NULL
-          AND (invite_code_expires_at IS NULL OR invite_code_expires_at <= %s)
-        """,
-        (now,),
+def _clear_expired_course_invite_codes(connection, now: datetime) -> None:
+    connection.execute(
+        update(Course)
+        .where(
+            Course.invite_code.isnot(None),
+            (Course.invite_code_expires_at.is_(None)) | (Course.invite_code_expires_at <= now),
+        )
+        .values(
+            invite_code=None,
+            invite_code_expires_at=None,
+            invite_code_created_at=None,
+        )
     )
 
 
-def _generate_unique_course_invite_code(cursor, now: str) -> str:
+def _generate_unique_course_invite_code(connection, now: datetime) -> str:
     characters = string.ascii_letters + string.digits
     for _ in range(20):
         invite_code = "".join(secrets.choice(characters) for _ in range(5))
-        cursor.execute(
-            """
-            SELECT 1
-            FROM courses
-            WHERE invite_code = %s
-              AND status = 'active'
-              AND invite_code_expires_at > %s
-            LIMIT 1
-            """,
-            (invite_code, now),
-        )
-        if cursor.fetchone() is None:
+        row = connection.execute(
+            select(literal(1))
+            .where(
+                Course.invite_code == invite_code,
+                Course.status == "active",
+                Course.invite_code_expires_at > now,
+            )
+            .limit(1)
+        ).fetchone()
+        if row is None:
             return invite_code
     raise RuntimeError("Unable to generate a unique course invite code")
 
 
-def _raise_if_course_name_exists(cursor, course_name: str, exclude_course_id: Optional[str] = None) -> None:
+def _raise_if_course_name_exists(
+    connection,
+    course_name: str,
+    owner_teacher_id: str,
+    exclude_course_id: Optional[str] = None,
+) -> None:
+    conditions = [
+        Course.course_name == course_name,
+        Course.owner_teacher_id == owner_teacher_id,
+        Course.status == "active",
+    ]
     if exclude_course_id:
-        cursor.execute(
-            """
-            SELECT 1
-            FROM courses
-            WHERE course_name = %s
-              AND course_id <> %s
-            LIMIT 1
-            """,
-            (course_name, exclude_course_id),
-        )
-    else:
-        cursor.execute(
-            """
-            SELECT 1
-            FROM courses
-            WHERE course_name = %s
-            LIMIT 1
-            """,
-            (course_name,),
-        )
-    if cursor.fetchone() is not None:
+        conditions.append(Course.course_id != exclude_course_id)
+    row = connection.execute(
+        select(literal(1)).where(*conditions).limit(1)
+    ).fetchone()
+    if row is not None:
         raise ValueError("COURSE_NAME_EXISTS")
+
+
+def _raise_if_course_name_unique_conflict(error: Exception) -> None:
+    if (
+        mysql_error_code(error) == 1062
+        and "uniq_courses_owner_active_name" in str(error)
+    ):
+        raise ValueError("COURSE_NAME_EXISTS") from error
 
 
 def _list_course_join_requests_sync(
@@ -671,39 +516,31 @@ def _list_course_join_requests_sync(
     course_id: Optional[str],
 ) -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        course_filter = ""
-        params: tuple = (teacher_id,)
+        conditions = [
+            CourseTeacher.teacher_id == teacher_id,
+            CourseTeacher.status == "active",
+        ]
         if course_id:
-            course_filter = "AND r.course_id = %s"
-            params = (teacher_id, course_id)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"""
-                SELECT
-                    r.request_id,
-                    r.course_id,
-                    c.course_name,
-                    r.user_id,
-                    r.status,
-                    r.requested_at,
-                    r.reviewed_at,
-                    r.reviewed_by
-                FROM course_join_requests r
-                JOIN courses c ON r.course_id = c.course_id
-                JOIN course_teachers t ON r.course_id = t.course_id
-                WHERE t.teacher_id = %s
-                  AND t.status = 'active'
-                  {course_filter}
-                ORDER BY r.requested_at DESC
-                """,
-                params,
+            conditions.append(CourseJoinRequest.course_id == course_id)
+        rows = connection.execute(
+            select(
+                CourseJoinRequest.request_id,
+                CourseJoinRequest.course_id,
+                Course.course_name,
+                CourseJoinRequest.user_id,
+                CourseJoinRequest.status,
+                CourseJoinRequest.requested_at,
+                CourseJoinRequest.reviewed_at,
+                CourseJoinRequest.reviewed_by,
             )
-            return [join_request_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+            .join(Course, Course.course_id == CourseJoinRequest.course_id)
+            .join(CourseTeacher, CourseTeacher.course_id == CourseJoinRequest.course_id)
+            .where(*conditions)
+            .order_by(CourseJoinRequest.requested_at.desc())
+        ).fetchall()
+        return [join_request_row_to_dict(row) for row in rows]
 
 
 def _approve_course_join_request_by_user_sync(
@@ -713,147 +550,124 @@ def _approve_course_join_request_by_user_sync(
     reviewer_id: str,
 ) -> Optional[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    now = datetime.now()
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.request_id
-                FROM course_join_requests r
-                JOIN courses c ON r.course_id = c.course_id
-                WHERE r.course_id = %s
-                  AND r.user_id = %s
-                  AND r.status = 'pending'
-                  AND c.status = 'active'
-                LIMIT 1
-                FOR UPDATE
-                """,
-                (course_id, user_id),
+        row = connection.execute(
+            select(CourseJoinRequest.request_id)
+            .join(Course, Course.course_id == CourseJoinRequest.course_id)
+            .where(
+                CourseJoinRequest.course_id == course_id,
+                CourseJoinRequest.user_id == user_id,
+                CourseJoinRequest.status == "pending",
+                Course.status == "active",
             )
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            request_id = row[0]
+            .limit(1)
+            .with_for_update()
+        ).fetchone()
+        if row is None:
+            return None
+        request_id = row[0]
 
-            _raise_if_active_course_member_exists(cursor, course_id, user_id)
+        _raise_if_active_course_member_exists(connection, course_id, user_id)
 
-            if user_role == "teacher":
-                cursor.execute(
-                    """
-                    INSERT INTO course_teachers (
-                        course_id,
-                        teacher_id,
-                        teacher_role,
-                        status,
-                        created_at
-                    ) VALUES (%s, %s, 'teacher', 'active', %s)
-                    ON DUPLICATE KEY UPDATE
-                        teacher_role = IF(teacher_role = 'owner', teacher_role, VALUES(teacher_role)),
-                        status = 'active',
-                        created_at = VALUES(created_at)
-                    """,
-                    (course_id, user_id, now),
-                )
-            elif user_role == "student":
-                cursor.execute(
-                    """
-                    INSERT INTO course_students (
-                        course_id,
-                        student_id,
-                        status,
-                        joined_at
-                    ) VALUES (%s, %s, 'active', %s)
-                    ON DUPLICATE KEY UPDATE
-                        status = 'active',
-                        joined_at = VALUES(joined_at)
-                    """,
-                    (course_id, user_id, now),
-                )
-            else:
-                raise ValueError("USER_ROLE_UNSUPPORTED")
-            create_pending_exam_sessions_for_user(connection, course_id, user_id)
-
-            cursor.execute(
-                """
-                UPDATE course_join_requests
-                SET status = 'approved',
-                    reviewed_at = %s,
-                    reviewed_by = %s
-                WHERE request_id = %s
-                """,
-                (now, reviewer_id, request_id),
+        if user_role == "teacher":
+            statement = mysql_insert(CourseTeacher).values(
+                course_id=course_id,
+                teacher_id=user_id,
+                teacher_role="teacher",
+                status="active",
+                created_at=now,
             )
-        connection.commit()
-        return {
-            "request_id": request_id,
-            "course_id": course_id,
-            "user_id": user_id,
-            "role": user_role,
-        }
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            connection.execute(
+                statement.on_duplicate_key_update(
+                    teacher_role=func.if_(
+                        CourseTeacher.teacher_role == "owner",
+                        CourseTeacher.teacher_role,
+                        statement.inserted.teacher_role,
+                    ),
+                    status="active",
+                    created_at=statement.inserted.created_at,
+                )
+            )
+        elif user_role == "student":
+            statement = mysql_insert(CourseStudent).values(
+                course_id=course_id,
+                student_id=user_id,
+                status="active",
+                joined_at=now,
+            )
+            connection.execute(
+                statement.on_duplicate_key_update(
+                    status="active",
+                    joined_at=statement.inserted.joined_at,
+                )
+            )
+        else:
+            raise ValueError("USER_ROLE_UNSUPPORTED")
+        create_pending_exam_sessions_for_user(connection, course_id, user_id)
+
+        connection.execute(
+            update(CourseJoinRequest)
+            .where(CourseJoinRequest.request_id == request_id)
+            .values(
+                status="approved",
+                reviewed_at=now,
+                reviewed_by=reviewer_id,
+            )
+        )
+    return {
+        "request_id": request_id,
+        "course_id": course_id,
+        "user_id": user_id,
+        "role": user_role,
+    }
 
 
 def _review_join_request_sync(request_id: str, teacher_id: str, target_status: str) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
+    now = datetime.now()
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT r.course_id, r.user_id
-                FROM course_join_requests r
-                JOIN course_teachers t ON r.course_id = t.course_id
-                WHERE r.request_id = %s
-                  AND r.status = 'pending'
-                  AND t.teacher_id = %s
-                  AND t.status = 'active'
-                LIMIT 1
-                """,
-                (request_id, teacher_id),
+        row = connection.execute(
+            select(CourseJoinRequest.course_id, CourseJoinRequest.user_id)
+            .join(
+                CourseTeacher,
+                CourseTeacher.course_id == CourseJoinRequest.course_id,
             )
-            row = cursor.fetchone()
-            if row is None:
-                return False
-            course_id, user_id = row
+            .where(
+                CourseJoinRequest.request_id == request_id,
+                CourseJoinRequest.status == "pending",
+                CourseTeacher.teacher_id == teacher_id,
+                CourseTeacher.status == "active",
+            )
+            .limit(1)
+        ).fetchone()
+        if row is None:
+            return False
+        course_id, user_id = row
 
-            cursor.execute(
-                """
-                UPDATE course_join_requests
-                SET status = %s,
-                    reviewed_at = %s,
-                    reviewed_by = %s
-                WHERE request_id = %s
-                """,
-                (target_status, now, teacher_id, request_id),
+        connection.execute(
+            update(CourseJoinRequest)
+            .where(CourseJoinRequest.request_id == request_id)
+            .values(
+                status=target_status,
+                reviewed_at=now,
+                reviewed_by=teacher_id,
             )
-            if target_status == "approved":
-                cursor.execute(
-                    """
-                    INSERT INTO course_students (
-                        course_id,
-                        student_id,
-                        status,
-                        joined_at
-                    ) VALUES (%s, %s, 'active', %s)
-                    ON DUPLICATE KEY UPDATE
-                        status = 'active',
-                        joined_at = VALUES(joined_at)
-                    """,
-                    (course_id, user_id, now),
+        )
+        if target_status == "approved":
+            statement = mysql_insert(CourseStudent).values(
+                course_id=course_id,
+                student_id=user_id,
+                status="active",
+                joined_at=now,
+            )
+            connection.execute(
+                statement.on_duplicate_key_update(
+                    status="active",
+                    joined_at=statement.inserted.joined_at,
                 )
-                create_pending_exam_sessions_for_user(connection, course_id, user_id)
-        connection.commit()
-        return True
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            )
+            create_pending_exam_sessions_for_user(connection, course_id, user_id)
+    return True

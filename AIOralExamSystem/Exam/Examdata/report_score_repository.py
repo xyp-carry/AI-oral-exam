@@ -4,8 +4,25 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from .connection import connect, ensure_database
+from sqlalchemy import select, update
+
+from .connection import ensure_database, get_engine
+from .models import CourseExamItem, ExamReportScore
 from .schema import ensure_tables
+
+_REPORT_SCORE_COLUMNS = (
+    ExamReportScore.report_score_id,
+    ExamReportScore.course_id,
+    ExamReportScore.exam_item_id,
+    ExamReportScore.user_id,
+    ExamReportScore.exam_id,
+    ExamReportScore.report_score,
+    ExamReportScore.report_total_score,
+    ExamReportScore.report_result_json,
+    ExamReportScore.status,
+    ExamReportScore.created_at,
+    ExamReportScore.updated_at,
+)
 
 
 async def create_report_score(
@@ -72,60 +89,36 @@ def _create_report_score_sync(
     report_result = _sanitize_report_result(report_result)
     report_score_id = str(uuid.uuid4())
     now = _now()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _raise_if_exam_item_missing(cursor, course_id, exam_item_id)
-            cursor.execute(
-                """
-                UPDATE exam_report_scores
-                SET status = 'deleted',
-                    updated_at = %s
-                WHERE course_id = %s
-                  AND exam_item_id = %s
-                  AND user_id = %s
-                  AND status = 'active'
-                """,
-                (now, course_id, exam_item_id, user_id),
+        _raise_if_exam_item_missing(connection, course_id, exam_item_id)
+        connection.execute(
+            update(ExamReportScore)
+            .where(
+                ExamReportScore.course_id == course_id,
+                ExamReportScore.exam_item_id == exam_item_id,
+                ExamReportScore.user_id == user_id,
+                ExamReportScore.status == "active",
             )
-            cursor.execute(
-                """
-                INSERT INTO exam_report_scores (
-                    report_score_id,
-                    course_id,
-                    exam_item_id,
-                    user_id,
-                    exam_id,
-                    report_score,
-                    report_total_score,
-                    report_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)
-                """,
-                (
-                    report_score_id,
-                    course_id,
-                    exam_item_id,
-                    user_id,
-                    exam_id,
-                    report_score,
-                    report_total_score,
-                    _to_json(report_result),
-                    now,
-                    now,
-                ),
+            .values(status="deleted", updated_at=now)
+        )
+        connection.execute(
+            ExamReportScore.__table__.insert().values(
+                report_score_id=report_score_id,
+                course_id=course_id,
+                exam_item_id=exam_item_id,
+                user_id=user_id,
+                exam_id=exam_id,
+                report_score=report_score,
+                report_total_score=report_total_score,
+                report_result_json=_to_json(report_result),
+                status="active",
+                created_at=now,
+                updated_at=now,
             )
-            created = _select_report_score_by_id(cursor, report_score_id)
-        connection.commit()
-        return created
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+        created = _select_report_score_by_id(connection, report_score_id)
+    return created
 
 
 def _get_latest_report_score_sync(
@@ -134,38 +127,20 @@ def _get_latest_report_score_sync(
     user_id: str,
 ) -> Optional[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    report_score_id,
-                    course_id,
-                    exam_item_id,
-                    user_id,
-                    exam_id,
-                    report_score,
-                    report_total_score,
-                    report_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                FROM exam_report_scores
-                WHERE course_id = %s
-                  AND exam_item_id = %s
-                  AND user_id = %s
-                  AND status = 'active'
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (course_id, exam_item_id, user_id),
+        row = connection.execute(
+            select(*_REPORT_SCORE_COLUMNS)
+            .where(
+                ExamReportScore.course_id == course_id,
+                ExamReportScore.exam_item_id == exam_item_id,
+                ExamReportScore.user_id == user_id,
+                ExamReportScore.status == "active",
             )
-            row = cursor.fetchone()
-            return _report_score_row_to_dict(row) if row else None
-    finally:
-        connection.close()
+            .order_by(ExamReportScore.updated_at.desc())
+            .limit(1)
+        ).fetchone()
+        return _report_score_row_to_dict(row) if row else None
 
 
 def _list_report_scores_by_course_item_sync(
@@ -173,77 +148,42 @@ def _list_report_scores_by_course_item_sync(
     exam_item_id: str,
 ) -> List[Dict[str, object]]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                    report_score_id,
-                    course_id,
-                    exam_item_id,
-                    user_id,
-                    exam_id,
-                    report_score,
-                    report_total_score,
-                    report_result_json,
-                    status,
-                    created_at,
-                    updated_at
-                FROM exam_report_scores
-                WHERE course_id = %s
-                  AND exam_item_id = %s
-                  AND status = 'active'
-                ORDER BY updated_at DESC
-                """,
-                (course_id, exam_item_id),
+        rows = connection.execute(
+            select(*_REPORT_SCORE_COLUMNS)
+            .where(
+                ExamReportScore.course_id == course_id,
+                ExamReportScore.exam_item_id == exam_item_id,
+                ExamReportScore.status == "active",
             )
-            return [_report_score_row_to_dict(row) for row in cursor.fetchall()]
-    finally:
-        connection.close()
+            .order_by(ExamReportScore.updated_at.desc())
+        ).fetchall()
+        return [_report_score_row_to_dict(row) for row in rows]
 
 
-def _select_report_score_by_id(cursor, report_score_id: str) -> Dict[str, object]:
-    cursor.execute(
-        """
-        SELECT
-            report_score_id,
-            course_id,
-            exam_item_id,
-            user_id,
-            exam_id,
-            report_score,
-            report_total_score,
-            report_result_json,
-            status,
-            created_at,
-            updated_at
-        FROM exam_report_scores
-        WHERE report_score_id = %s
-        LIMIT 1
-        """,
-        (report_score_id,),
-    )
-    row = cursor.fetchone()
+def _select_report_score_by_id(connection, report_score_id: str) -> Dict[str, object]:
+    row = connection.execute(
+        select(*_REPORT_SCORE_COLUMNS)
+        .where(ExamReportScore.report_score_id == report_score_id)
+        .limit(1)
+    ).fetchone()
     if row is None:
         raise ValueError("REPORT_SCORE_NOT_FOUND")
     return _report_score_row_to_dict(row)
 
 
-def _raise_if_exam_item_missing(cursor, course_id: str, exam_item_id: str) -> None:
-    cursor.execute(
-        """
-        SELECT 1
-        FROM course_exam_items
-        WHERE course_id = %s
-          AND exam_item_id = %s
-          AND status = 'active'
-        LIMIT 1
-        """,
-        (course_id, exam_item_id),
-    )
-    if cursor.fetchone() is None:
+def _raise_if_exam_item_missing(connection, course_id: str, exam_item_id: str) -> None:
+    row = connection.execute(
+        select(CourseExamItem.exam_item_id)
+        .where(
+            CourseExamItem.course_id == course_id,
+            CourseExamItem.exam_item_id == exam_item_id,
+            CourseExamItem.status == "active",
+        )
+        .limit(1)
+    ).fetchone()
+    if row is None:
         raise ValueError("EXAM_ITEM_NOT_FOUND")
 
 
@@ -335,5 +275,5 @@ def _json_loads(value, default):
         return default
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _now() -> datetime:
+    return datetime.now()

@@ -428,7 +428,10 @@ class ExamAFlow:
         judge_config: Dict[str, Any],
         source: str,
     ) -> StandardAnswerJudgerAgent:
-        model_settings = judge_config["report_judger"]["runtime_model_settings"]
+        scorers = judge_config.get("scorers") or []
+        if not scorers:
+            raise ValueError("JUDGE_MODEL_REQUIRED")
+        model_settings = scorers[0]["runtime_model_settings"]
         return StandardAnswerJudgerAgent(
             model_settings,
             source,

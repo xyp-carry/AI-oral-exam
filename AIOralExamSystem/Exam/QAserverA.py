@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from AIOralExamSystem.Exam.Examdata.exam_item_repository import get_exam_item_by_id
 from AIOralExamSystem.Exam.Examdata.exam_repository import get_exam_session_by_exam_id
 from AIOralExamSystem.Exam.Examdata.preset_question_repository import (
-    list_user_preset_questions_by_exam_item,
+    list_preset_questions_by_exam_item,
 )
 from AIOralExamSystem.Agent.Textfix import TextfixAgent
 from AIOralExamSystem.Exam.Judger import MainJudgerAgent, StandardAnswerJudgerAgent
@@ -116,10 +116,9 @@ class QAserverA:
             "COURSE_ID_REQUIRED",
         )
 
-        self.preset_questions = await list_user_preset_questions_by_exam_item(
+        self.preset_questions = await list_preset_questions_by_exam_item(
             course_id=course_id,
             exam_item_id=exam_item_id,
-            user_id=user_id,
         )
         self.question_queue, self.question_bank = build_mode_b_question_sets(
             self.preset_questions,
@@ -176,7 +175,7 @@ class QAserverA:
 
     def _build_text_fixer(self) -> TextfixAgent:
         judge_config = self._require_judge_config(self.current_user.get("judge_config"))
-        model_settings = self._require_agent_settings(judge_config, "report_judger")
+        model_settings = self._require_scorer_settings(judge_config)
         source = self._normalize_required_text(
             self.current_user.get("uuid")
             or self.current_user.get("id")
@@ -194,9 +193,7 @@ class QAserverA:
 
     def _build_standard_answer_judger(self) -> StandardAnswerJudgerAgent:
         judge_config = self._require_judge_config(self.current_user.get("judge_config"))
-        model_settings = self._optional_agent_settings(judge_config, "report_judger")
-        if model_settings is None:
-            model_settings = self._require_agent_settings(judge_config, "report_judger")
+        model_settings = self._require_scorer_settings(judge_config)
         source = self._normalize_required_text(
             self.current_user.get("uuid")
             or self.current_user.get("id")
@@ -214,7 +211,7 @@ class QAserverA:
 
     def _build_main_judger(self) -> MainJudgerAgent:
         judge_config = self._require_judge_config(self.current_user.get("judge_config"))
-        model_settings = self._require_agent_settings(judge_config, "report_judger")
+        model_settings = self._require_agent_settings(judge_config, "main_judger")
         source = self._normalize_required_text(
             self.current_user.get("uuid")
             or self.current_user.get("id")
@@ -242,6 +239,15 @@ class QAserverA:
         if model_settings is None:
             raise ValueError("MODEL_CONFIG_REQUIRED")
         return model_settings
+
+    @staticmethod
+    def _require_scorer_settings(judge_config: Dict[str, object]) -> Dict[str, object]:
+        scorers = judge_config.get("scorers")
+        if isinstance(scorers, list) and scorers:
+            settings = QAserverA._optional_agent_settings({"scorer": scorers[0]}, "scorer")
+            if settings is not None:
+                return settings
+        raise ValueError("MODEL_CONFIG_REQUIRED")
 
     @staticmethod
     def _optional_agent_settings(judge_config: Dict[str, object], role: str) -> Optional[Dict[str, object]]:
@@ -377,7 +383,7 @@ def extract_required_question_difficulty(
     if normalized == "middle":
         normalized = "medium"
     if not normalized:
-        raise ValueError(f"QUESTION_DIFFICULTY_REQUIRED: {path}")
+        normalized = START_DIFFICULTY
     if normalized not in DIFFICULTY_ORDER:
         raise ValueError(f"QUESTION_DIFFICULTY_INVALID: {path}")
     return normalized

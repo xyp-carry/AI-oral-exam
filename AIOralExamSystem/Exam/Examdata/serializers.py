@@ -185,6 +185,8 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
         "created_by",
         "created_at",
         "updated_at",
+        "c_max_probe_turns",
+        "analysis_question_count",
     )
     result = dict(zip(fields, row))
     result["dimension_names"] = _json_loads(result.pop("dimension_names_json"), [])
@@ -195,6 +197,7 @@ def exam_item_row_to_dict(row) -> Dict[str, object]:
     result["need_code_repository"] = bool(result.get("need_code_repository"))
     result["use_preset_questions"] = bool(result.get("use_preset_questions"))
     result["enable_report_analysis"] = bool(result.get("enable_report_analysis"))
+    result["analysis_question_count"] = int(result["analysis_question_count"])
     result.pop("created_by", None)
     available_from = result.get("exam_available_from")
     available_until = result.get("exam_available_until")

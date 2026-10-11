@@ -148,7 +148,7 @@ class LocalStreamingSTTService:
             if self.sample_rate is None:
                 self.sample_rate = sample_rate
                 self.channels = channels
-            elif not self.sample_rate == sample_rate or not self.channels == channels:
+            elif not self.sample_rate == sample_rate or not self.channels == channels:  # 音频格式变化时先处理旧缓冲区，避免不同采样率或声道的数据混用
                 events.extend(await self.flush())
                 self.sample_rate = sample_rate
                 self.channels = channels
@@ -213,6 +213,7 @@ class LocalStreamingSTTService:
 
     async def _finish_current_speech(self, sample_rate: int, channels: int, reason: str) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
+        had_speech = self.is_speaking or bool(self.stt_window_audio) or bool(self.pending_transcriptions)
         if self.is_speaking:
             self.is_speaking = False
             events.append({'type': 'speech_end', 'reason': reason})
@@ -224,6 +225,9 @@ class LocalStreamingSTTService:
         if self.transcribe_on_speech_end and self.stt_window_audio:
             self._schedule_stt_window(sample_rate, channels, is_final=True, reason=reason)
         events.extend(await self._drain_pending_transcriptions())
+        # 即使最后一段音频恰好凑满 STT 窗口，也要在所有转写完成后通知下游。
+        if self.transcribe_on_speech_end and had_speech:
+            events.append({'type': 'stt_segment_complete', 'reason': reason})
         return events
 
     async def _run_vad(self, chunk: bytes, channels: int, is_final: bool) -> Any:

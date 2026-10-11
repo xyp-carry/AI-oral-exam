@@ -1,29 +1,32 @@
 import asyncio
 from typing import List, Optional
 
-from .connection import connect, ensure_database
+from sqlalchemy import ColumnElement, literal, select
+
+from .connection import ensure_database, get_engine
+from .models import Course, CourseStudent, CourseTeacher
 from .schema import ensure_tables
 
 
-def build_exam_scope_filter(
+def build_exam_scope_conditions(
     user_id: Optional[str],
     course_ids: Optional[List[str]],
     allow_course_scope: bool,
     allow_all: bool,
-    table_alias: str = "",
-) -> tuple[str, tuple]:
-    prefix = f"{table_alias}." if table_alias else ""
+    user_id_column: ColumnElement,
+    course_id_column: ColumnElement,
+) -> list[ColumnElement]:
+    """生成 user/course/all 三级数据范围的过滤条件（空列表表示不加限制）。"""
     if allow_all:
-        return "", ()
+        return []
     if allow_course_scope:
-        course_ids = [str(course_id) for course_id in (course_ids or []) if course_id]
-        if not course_ids:
-            return f"WHERE 1 = 0", ()
-        placeholders = ", ".join(["%s"] * len(course_ids))
-        return f"WHERE {prefix}course_id IN ({placeholders})", tuple(course_ids)
+        normalized = [str(course_id) for course_id in (course_ids or []) if course_id]
+        if not normalized:
+            return [literal(0).self_group() == 1]
+        return [course_id_column.in_(normalized)]
     if not user_id:
         raise ValueError("user_id is required for user scoped query")
-    return f"WHERE {prefix}user_id = %s", (user_id,)
+    return [user_id_column == user_id]
 
 
 async def get_teacher_course_ids(teacher_id: str) -> List[str]:
@@ -48,105 +51,73 @@ async def is_course_owner(user_id: str, course_id: str) -> bool:
 
 def _get_teacher_course_ids_sync(teacher_id: str) -> List[str]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT course_id
-                FROM course_teachers
-                WHERE teacher_id = %s
-                  AND status = 'active'
-                """,
-                (teacher_id,),
+        rows = connection.execute(
+            select(CourseTeacher.course_id).where(
+                CourseTeacher.teacher_id == teacher_id,
+                CourseTeacher.status == "active",
             )
-            return [row[0] for row in cursor.fetchall()]
-    finally:
-        connection.close()
+        ).fetchall()
+        return [row[0] for row in rows]
 
 
 def _get_student_course_ids_sync(student_id: str) -> List[str]:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT course_id
-                FROM course_students
-                WHERE student_id = %s
-                  AND status = 'active'
-                """,
-                (student_id,),
+        rows = connection.execute(
+            select(CourseStudent.course_id).where(
+                CourseStudent.student_id == student_id,
+                CourseStudent.status == "active",
             )
-            return [row[0] for row in cursor.fetchall()]
-    finally:
-        connection.close()
+        ).fetchall()
+        return [row[0] for row in rows]
 
 
 def _is_teacher_of_course_sync(teacher_id: str, course_id: str) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT 1
-                FROM course_teachers
-                WHERE teacher_id = %s
-                  AND course_id = %s
-                  AND status = 'active'
-                LIMIT 1
-                """,
-                (teacher_id, course_id),
+        row = connection.execute(
+            select(literal(1))
+            .where(
+                CourseTeacher.teacher_id == teacher_id,
+                CourseTeacher.course_id == course_id,
+                CourseTeacher.status == "active",
             )
-            return cursor.fetchone() is not None
-    finally:
-        connection.close()
+            .limit(1)
+        ).fetchone()
+        return row is not None
 
 
 def _is_student_in_course_sync(student_id: str, course_id: str) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT 1
-                FROM course_students
-                WHERE student_id = %s
-                  AND course_id = %s
-                  AND status = 'active'
-                LIMIT 1
-                """,
-                (student_id, course_id),
+        row = connection.execute(
+            select(literal(1))
+            .where(
+                CourseStudent.student_id == student_id,
+                CourseStudent.course_id == course_id,
+                CourseStudent.status == "active",
             )
-            return cursor.fetchone() is not None
-    finally:
-        connection.close()
+            .limit(1)
+        ).fetchone()
+        return row is not None
 
 
 def _is_course_owner_sync(user_id: str, course_id: str) -> bool:
     ensure_database()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT 1
-                FROM courses
-                WHERE owner_teacher_id = %s
-                  AND course_id = %s
-                  AND status = 'active'
-                LIMIT 1
-                """,
-                (user_id, course_id),
+        row = connection.execute(
+            select(literal(1))
+            .where(
+                Course.owner_teacher_id == user_id,
+                Course.course_id == course_id,
+                Course.status == "active",
             )
-            return cursor.fetchone() is not None
-    finally:
-        connection.close()
+            .limit(1)
+        ).fetchone()
+        return row is not None

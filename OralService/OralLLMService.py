@@ -8,14 +8,13 @@ from pipecat.frames.frames import (
     LLMContextFrame,
     StartFrame
     )
-from typing import List, Dict, Optional
+from typing import List, Dict
 import httpx
 import json
 from datetime import datetime
 import websockets
 from AIOralExamSystem.Agent.Interviewer import InterviewerAgent
 from AIOralExamSystem.Exam.Judger import JudgerAgent, MainJudgerAgent
-from AIOralExamSystem.Exam.examObject import CandidateExamState
 
 import asyncio
 from config import get_settings
@@ -28,11 +27,9 @@ class LLMService(FrameProcessor):
         self,
         current_user: dict,
         history: List[Dict[str, str]] = [],
-        exam_state: Optional[CandidateExamState] = None,
     ):
         super().__init__()
         self.history: List[Dict[str, str]] = history
-        self.exam_state = exam_state
         self.nickname = current_user['nickname']
         self.task_queue = asyncio.Queue()
         settings = get_settings()

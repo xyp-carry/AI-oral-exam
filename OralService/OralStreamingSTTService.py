@@ -13,7 +13,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from stt.local_stt import LocalStreamingSTTService
 
 
-class StreamingMetricsFrameLogger(FrameProcessor):
+class StreamingSTTServicer(FrameProcessor):
     """Continuously listen to input audio and emit text when FunASR VAD ends speech."""
 
     def __init__(
@@ -105,4 +105,4 @@ class StreamingMetricsFrameLogger(FrameProcessor):
         )
 
 
-MetricsFrameLogger = StreamingMetricsFrameLogger
+STTServicer = StreamingSTTServicer

@@ -1,28 +1,41 @@
 """
 database.py
 ===========
-基于 MySQL 的用户数据存储，使用 pymysql 驱动。
+基于 MySQL 的用户数据存储，通过 SQLAlchemy（pymysql 驱动）访问。
 启动时自动检查并创建所需的数据库表。
 """
 
-import pymysql
-from pymysql.cursors import DictCursor
 from datetime import datetime
 from typing import Optional
+from urllib.parse import quote_plus
 from uuid import uuid4
+
+from sqlalchemy import (
+    CHAR,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    create_engine,
+    delete,
+    func,
+    literal,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import DeclarativeBase
+
 from Authentication.models import UserInfo
 
-import os
-
-# 默认值用于本机直跑；容器部署时通过 MYSQL_HOST 等环境变量指向 mysql 服务
 MYSQL_CONFIG = {
-    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
-    "port": int(os.getenv("MYSQL_PORT", "3306")),
-    "user": os.getenv("MYSQL_USER", "root"),
-    "password": os.getenv("MYSQL_PASSWORD", "123456"),
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "root",
+    "password": "123456",
     "database": "ai_oral_exam_user",
     "charset": "utf8mb4",
-    "cursorclass": DictCursor,
 }
 
 CREATE_USERS_TABLE = """
@@ -42,75 +55,147 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 """
 
+_USER_COLUMNS = (
+    "uuid",
+    "username",
+    "email",
+    "hashed_password",
+    "nickname",
+    "role",
+    "created_at",
+    "last_login",
+    "is_active",
+    "confirm_flag",
+    "login_count",
+)
+
+
+def _build_url(database: Optional[str] = None) -> str:
+    config = MYSQL_CONFIG
+    credentials = quote_plus(str(config["user"]))
+    password = quote_plus(str(config["password"]))
+    url = f"mysql+pymysql://{credentials}:{password}@{config['host']}:{config['port']}"
+    if database:
+        url += f"/{database}"
+    url += f"?charset={config.get('charset') or 'utf8mb4'}"
+    return url
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class UserModel(Base):
+    """users 表：平台账号资料与登录状态。"""
+
+    __tablename__ = "users"
+
+    uuid = Column(CHAR(36), primary_key=True)
+    username = Column(String(32), nullable=False)
+    email = Column(String(255), nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    nickname = Column(String(64))
+    role = Column(String(32), nullable=False, default="student")
+    created_at = Column(DateTime, nullable=False)
+    last_login = Column(DateTime)
+    is_active = Column(Integer, nullable=False, default=1)
+    confirm_flag = Column(Integer, nullable=False, default=0)
+    login_count = Column(Integer, nullable=False, default=0)
 
 
 class UserDatabase:
-    """MySQL 数据库，支持自动建表"""
+    """MySQL 数据库（SQLAlchemy 引擎），支持自动建库建表"""
 
     def __init__(self):
-        self._conn = None
+        self._engine = create_engine(
+            _build_url(MYSQL_CONFIG["database"]),
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
         self._sessions: dict[str, dict] = {}
-        self._connect()
+        self._ensure_database()
         self.init_tables()
 
-    def _connect(self):
+    def _ensure_database(self):
         try:
-            self._conn = pymysql.connect(**MYSQL_CONFIG, autocommit=True)
+            with self._engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
             print(f"[DB] 已连接 MySQL: {MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}")
-        except pymysql.err.OperationalError as e:
-            if e.args[0] == 1049:
+        except OperationalError as exc:
+            orig_code = getattr(getattr(exc, "orig", None), "args", (None,))[0]
+            if orig_code == 1049:
                 print(f"[DB] 数据库 '{MYSQL_CONFIG['database']}' 不存在，正在自动创建...")
-                config_without_db = {k: v for k, v in MYSQL_CONFIG.items() if k != "database"}
-                conn = pymysql.connect(**config_without_db)
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        f"CREATE DATABASE `{MYSQL_CONFIG['database']}` "
-                        f"DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                    )
-                conn.close()
+                bootstrap = create_engine(_build_url(None))
+                try:
+                    with bootstrap.begin() as connection:
+                        connection.execute(
+                            text(
+                                f"CREATE DATABASE `{MYSQL_CONFIG['database']}` "
+                                "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            )
+                        )
+                finally:
+                    bootstrap.dispose()
                 print(f"[DB] 数据库 '{MYSQL_CONFIG['database']}' 创建成功")
-                self._conn = pymysql.connect(**MYSQL_CONFIG)
+                with self._engine.connect() as connection:
+                    connection.execute(text("SELECT 1"))
                 print(f"[DB] 已连接 MySQL: {MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}")
             else:
                 raise
 
-    def _ensure_connection(self):
-        try:
-            self._conn.ping(reconnect=True)
-        except Exception:
-            self._connect()
-
     def init_tables(self):
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute(CREATE_USERS_TABLE)
-            cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'users' AND COLUMN_NAME = 'uuid'", (MYSQL_CONFIG["database"],))
-            if cursor.fetchone() is None:
-                cursor.execute("ALTER TABLE users ADD COLUMN uuid CHAR(36) NOT NULL DEFAULT '' UNIQUE AFTER username")
-                cursor.execute("UPDATE users SET uuid = UUID() WHERE uuid = ''")
-                cursor.execute("ALTER TABLE users ADD INDEX idx_uuid (uuid)")
+        with self._engine.begin() as connection:
+            connection.execute(text(CREATE_USERS_TABLE))
+            row = connection.execute(
+                text(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = 'users' AND COLUMN_NAME = 'uuid'"
+                ),
+                {"schema": MYSQL_CONFIG["database"]},
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN uuid CHAR(36) NOT NULL DEFAULT '' UNIQUE AFTER username")
+                )
+                connection.execute(text("UPDATE users SET uuid = UUID() WHERE uuid = ''"))
+                connection.execute(text("ALTER TABLE users ADD INDEX idx_uuid (uuid)"))
                 print("[DB] 已为 users 表添加 uuid 字段")
-            cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'users' AND COLUMN_NAME = 'role'", (MYSQL_CONFIG["database"],))
-            if cursor.fetchone() is None:
-                cursor.execute("ALTER TABLE users ADD COLUMN role VARCHAR(32) NOT NULL DEFAULT 'student' AFTER nickname")
+            row = connection.execute(
+                text(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = 'users' AND COLUMN_NAME = 'role'"
+                ),
+                {"schema": MYSQL_CONFIG["database"]},
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN role VARCHAR(32) NOT NULL DEFAULT 'student' AFTER nickname")
+                )
                 print("[DB] 已为 users 表添加 role 字段")
-            cursor.execute("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'users' AND COLUMN_NAME = 'confirm_flag'", (MYSQL_CONFIG["database"],))
-            if cursor.fetchone() is None:
-                cursor.execute("ALTER TABLE users ADD COLUMN confirm_flag TINYINT(1) NOT NULL DEFAULT 0 AFTER is_active")
+            row = connection.execute(
+                text(
+                    "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = 'users' AND COLUMN_NAME = 'confirm_flag'"
+                ),
+                {"schema": MYSQL_CONFIG["database"]},
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    text("ALTER TABLE users ADD COLUMN confirm_flag TINYINT(1) NOT NULL DEFAULT 0 AFTER is_active")
+                )
                 print("[DB] 已为 users 表添加 confirm_flag 字段")
-        self._conn.commit()
         print("[DB] 数据表检查完成，users 表已就绪")
 
     # ──────────────── 用户管理 ────────────────
 
     def user_exists(self, username: str) -> bool:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute("SELECT 1 FROM users WHERE username = %s", (username,))
-            return cursor.fetchone() is not None
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                select(literal(1)).where(UserModel.username == username)
+            ).fetchone()
+            return row is not None
 
     def create_user(self, user: UserInfo, hashed_password: str) -> dict:
-        self._ensure_connection()
         user_uuid = str(uuid4())
         user_dict = {
             "uuid": user_uuid,
@@ -125,96 +210,81 @@ class UserDatabase:
             "confirm_flag": 0,
             "login_count": 0,
         }
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO users (uuid, username, email, hashed_password, nickname, role, created_at, last_login, is_active, confirm_flag, login_count) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (
-                    user_dict["uuid"],
-                    user_dict["username"],
-                    user_dict["email"],
-                    user_dict["hashed_password"],
-                    user_dict["nickname"],
-                    user_dict["role"],
-                    user_dict["created_at"],
-                    user_dict["last_login"],
-                    user_dict["is_active"],
-                    user_dict["confirm_flag"],
-                    user_dict["login_count"],
-                ),
+        with self._engine.begin() as connection:
+            connection.execute(
+                UserModel.__table__.insert().values(
+                    uuid=user_dict["uuid"],
+                    username=user_dict["username"],
+                    email=user_dict["email"],
+                    hashed_password=user_dict["hashed_password"],
+                    nickname=user_dict["nickname"],
+                    role=user_dict["role"],
+                    created_at=user_dict["created_at"],
+                    last_login=user_dict["last_login"],
+                    is_active=1 if user_dict["is_active"] else 0,
+                    confirm_flag=user_dict["confirm_flag"],
+                    login_count=user_dict["login_count"],
+                )
             )
-        self._conn.commit()
         user_dict["created_at"] = user_dict["created_at"].isoformat()
         if user_dict["last_login"]:
             user_dict["last_login"] = user_dict["last_login"].isoformat()
         return user_dict
 
     def get_user(self, username: str) -> Optional[dict]:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT uuid, username, email, hashed_password, nickname, role, created_at, last_login, is_active, confirm_flag, login_count "
-                "FROM users WHERE username = %s",
-                (username,),
-            )
-            row = cursor.fetchone()
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                select(*[getattr(UserModel, name) for name in _USER_COLUMNS]).where(
+                    UserModel.username == username
+                )
+            ).fetchone()
         if not row:
             return None
-        return self._format_user(row)
+        return self._format_user(row._mapping)
 
     def get_user_by_uuid(self, uuid: str) -> Optional[dict]:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT uuid, username, email, hashed_password, nickname, role, created_at, last_login, is_active, confirm_flag, login_count "
-                "FROM users WHERE uuid = %s",
-                (uuid,),
-            )
-            row = cursor.fetchone()
+        with self._engine.begin() as connection:
+            row = connection.execute(
+                select(*[getattr(UserModel, name) for name in _USER_COLUMNS]).where(
+                    UserModel.uuid == uuid
+                )
+            ).fetchone()
         if not row:
             return None
-        return self._format_user(row)
+        return self._format_user(row._mapping)
 
     def update_user(self, username: str, **kwargs) -> Optional[dict]:
-        self._ensure_connection()
         if not kwargs:
             return self.get_user(username)
-        set_clauses = []
-        values = []
-        for key, value in kwargs.items():
-            set_clauses.append(f"{key} = %s")
-            values.append(value)
-        values.append(username)
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                f"UPDATE users SET {', '.join(set_clauses)} WHERE username = %s",
-                values,
+        with self._engine.begin() as connection:
+            connection.execute(
+                update(UserModel)
+                .where(UserModel.username == username)
+                .values(**kwargs)
             )
-        self._conn.commit()
         return self.get_user(username)
 
     def get_all_users_info(self) -> list[dict]:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT uuid, username, email, nickname, role, created_at, last_login, is_active, confirm_flag, login_count FROM users"
-            )
-            rows = cursor.fetchall()
-        return [self._format_user_public(row) for row in rows]
+        public_columns = tuple(
+            name for name in _USER_COLUMNS if name != "hashed_password"
+        )
+        with self._engine.begin() as connection:
+            rows = connection.execute(
+                select(*[getattr(UserModel, name) for name in public_columns])
+            ).fetchall()
+        return [self._format_user_public(row._mapping) for row in rows]
 
     def get_user_count(self) -> int:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) AS cnt FROM users")
-            row = cursor.fetchone()
-        return row["cnt"] if row else 0
+        with self._engine.begin() as connection:
+            row = connection.execute(select(func.count().label("cnt"))).fetchone()
+        return row[0] if row else 0
 
     def delete_user(self, username: str) -> bool:
-        self._ensure_connection()
-        with self._conn.cursor() as cursor:
-            cursor.execute("DELETE FROM users WHERE username = %s", (username,))
-            affected = cursor.rowcount
-        self._conn.commit()
+        with self._engine.begin() as connection:
+            result = connection.execute(
+                delete(UserModel).where(UserModel.username == username)
+            )
+            affected = result.rowcount
         return affected > 0
 
     # ──────────────── 会话管理（内存存储） ────────────────

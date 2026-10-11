@@ -13,6 +13,7 @@ interface ParamDef {
 interface ModelDef {
   label: string
   model_name: string
+  model_type?: string
   params_schema: Record<string, ParamDef>
 }
 
@@ -30,10 +31,28 @@ interface SavedModel {
   base_url: string
   model_api_key?: string
   display_name: string
+  model_type?: string
   params: Record<string, unknown>
   last_test_result?: { success: boolean; duration_ms: number; response_preview: string }
   created_at?: string
 }
+
+/** 模型类型选项（model_type） */
+const MODEL_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'chat', label: '对话模型' },
+  { value: 'embedding', label: '嵌入模型' },
+  { value: 'file', label: '文件模型' },
+  { value: 'tts', label: 'TTS 语音模型' },
+]
+
+/** TTS 语音模型参数：发音人与语速（speech_rate ∈ [-50,100]，100=2.0 倍速，-50=0.5 倍速） */
+const TTS_SPEAKERS: Array<{ value: string; label: string }> = [
+  { value: 'zh_male_jieshuoxiaoming_uranus_bigtts', label: '解说小明' },
+]
+const TTS_SPEECH_RATE_MIN = -50
+const TTS_SPEECH_RATE_MAX = 100
+/** speech_rate 数值换算倍速：-50→0.5x、0→1.0x、100→2.0x */
+const ttsRateToSpeed = (rate: number) => 1 + rate / 100
 
 export default function ModelSettings() {
   const { user } = useAuth()
@@ -47,6 +66,7 @@ export default function ModelSettings() {
   const [modelKey, setModelKey] = useState('')
   const [modelApiKey, setModelApiKey] = useState('')
   const [displayName, setDisplayName] = useState('')
+  const [modelType, setModelType] = useState('chat')
   const [paramValues, setParamValues] = useState<Record<string, unknown>>({})
 
   // 操作状态
@@ -67,24 +87,56 @@ export default function ModelSettings() {
       let json: unknown
       try { json = JSON.parse(text) } catch { throw new Error('供应商接口返回非JSON数据') }
       const data = (json as Record<string, unknown>)?.providers ?? {}
-      setProviders(data as Record<string, ProviderDef>)
+      // 规范化：响应中的 model_type（可能在供应商级或模型级）统一带到每个模型上
+      const raw = data as Record<string, ProviderDef>
+      const normalized: Record<string, ProviderDef> = {}
+      for (const [k, p] of Object.entries(raw)) {
+        const providerType = (p as unknown as Record<string, unknown>).model_type as string | undefined
+        normalized[k] = {
+          ...p,
+          models: Object.fromEntries(
+            Object.entries(p.models ?? {}).map(([mk, m]) => [
+              mk,
+              { ...m, model_type: m.model_type ?? providerType },
+            ])
+          ),
+        }
+      }
+      setProviders(normalized)
     } catch (err) {
       setError(err instanceof Error ? err.message : '获取供应商失败')
     }
   }, [])
 
+  /** 拉取某一类型的模型列表：失败返回 null，成功返回数组（含兜底 model_type） */
+  const fetchModelsByType = async (path: string, type: string): Promise<SavedModel[] | null> => {
+    try {
+      const res = await fetch(`${API_BASE}/${path}`, { credentials: 'include' })
+      if (!res.ok) return null
+      const text = await res.text()
+      let json: unknown
+      try { json = JSON.parse(text) } catch { return null }
+      const data = (json as Record<string, unknown>)?.models ?? []
+      return (data as SavedModel[]).map(m => ({ ...m, model_type: m.model_type || type }))
+    } catch {
+      return null
+    }
+  }
+
   const fetchSavedModels = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await fetch(`${API_BASE}/models`, { credentials: 'include' })
-      if (!res.ok) throw new Error(`获取模型列表失败 (HTTP ${res.status})`)
-      const text = await res.text()
-      let json: unknown
-      try { json = JSON.parse(text) } catch { throw new Error('模型接口返回非JSON数据') }
-      const data = (json as Record<string, unknown>)?.models ?? []
-      setSavedModels(data as SavedModel[])
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '获取模型列表失败')
+      const [chat, embedding, file, tts] = await Promise.all([
+        fetchModelsByType('chat_model', 'chat'),
+        fetchModelsByType('embedding_model', 'embedding'),
+        fetchModelsByType('file_model', 'file'),
+        fetchModelsByType('tts_model', 'tts'),
+      ])
+      if (!chat && !embedding && !file && !tts) {
+        setError('获取模型列表失败')
+        return
+      }
+      setSavedModels([...(chat ?? []), ...(embedding ?? []), ...(file ?? []), ...(tts ?? [])])
     } finally {
       setLoading(false)
     }
@@ -94,6 +146,34 @@ export default function ModelSettings() {
     fetchProviders()
     fetchSavedModels()
   }, [fetchProviders, fetchSavedModels])
+
+  // DEBUG: 目录加载后打印所有供应商的全部模型及 model_type（F12 控制台查看）；验证后删除
+  useEffect(() => {
+    if (Object.keys(providers).length === 0) return
+    console.log('[目录全部模型]', Object.entries(providers).map(([pk, p]) => ({
+      供应商: pk,
+      模型: Object.entries(p.models ?? {}).map(([mk, m]) => `${mk}(${m.model_type})`),
+    })))
+  }, [providers])
+
+  /** 某类型可用的供应商 key 集合：严格按目录 model_type 匹配（供应商至少有一个该类型的模型） */
+  const typeAvailableProviders = (type: string): Set<string> =>
+    new Set(
+      Object.entries(providers)
+        .filter(([, p]) => Object.values(p.models ?? {}).some(m => m.model_type === type))
+        .map(([k]) => k)
+    )
+
+  // 切换类型：供应商不含新类型的模型则清空；模型选择总是重置
+  const handleTypeChange = (val: string) => {
+    setModelType(val)
+    if (providerKey && !typeAvailableProviders(val).has(providerKey)) {
+      setProviderKey('')
+    }
+    setModelKey('')
+    setParamValues({})
+    setTestResult(null)
+  }
 
   // 切换供应商：清空模型选择，用 params_schema 默认值初始化参数
   const handleProviderChange = (val: string) => {
@@ -112,6 +192,14 @@ export default function ModelSettings() {
       for (const [k, def] of Object.entries(model.params_schema)) {
         defaults[k] = def.default
       }
+      // TTS：确保 speaker / speech_rate 有默认值（schema 未提供时），并彻底删除无关参数
+      if (modelType === 'tts') {
+        if (!defaults.speaker) defaults.speaker = TTS_SPEAKERS[0].value
+        if (typeof defaults.speech_rate !== 'number') defaults.speech_rate = 0
+        delete defaults.app_id
+        delete defaults.sample_rate
+        delete defaults.timeout_seconds
+      }
       setParamValues(defaults)
     } else {
       setParamValues({})
@@ -124,6 +212,7 @@ export default function ModelSettings() {
     setModelKey('')
     setModelApiKey('')
     setDisplayName('')
+    setModelType('chat')
     setParamValues({})
     setTestResult(null)
   }
@@ -191,6 +280,7 @@ export default function ModelSettings() {
           provider_model_key: selectedModel!.model_name,
           model_api_key: modelApiKey || undefined,
           display_name: displayName || selectedModel!.label,
+          model_type: modelType,
           params: buildParams(),
         }),
       })
@@ -232,11 +322,35 @@ export default function ModelSettings() {
     return <div className="model-settings-page"><p>仅教师可访问此页面</p></div>
   }
 
+  // 供应商下拉：严格只显示目录中含 model_type === 所选类型 模型的供应商
   const providerOptions = Object.entries(providers)
-  const modelOptions = selectedProvider ? Object.entries(selectedProvider.models) : []
+    .filter(([k]) => typeAvailableProviders(modelType).has(k))
+  // 模型下拉：同样严格按 model_type 过滤所选供应商的模型
+  const modelOptions = selectedProvider
+    ? Object.entries(selectedProvider.models).filter(([, m]) => m.model_type === modelType)
+    : []
 
-  // 不需要渲染的参数
-  const SKIP_PARAMS = new Set(['max_tokens', 'reasoning_effort'])
+  // DEBUG: 打印过滤结果，浏览器控制台（F12）查看；验证后可删除
+  console.log(
+    `[模型过滤] type=${modelType}`,
+    {
+      供应商下拉: providerOptions.map(([k, v]) => k),
+      供应商全部模型: selectedProvider
+        ? Object.entries(selectedProvider.models).map(([k, m]) => `${k}(${m.model_type})`)
+        : [],
+      过滤后模型: modelOptions.map(([k]) => k),
+    }
+  )
+
+  // 不需要渲染的参数（TTS 的 speaker/speech_rate 由专属表单渲染，避免重复；app_id/sample_rate/timeout_seconds 不展示）
+  const SKIP_PARAMS = new Set<string>(['max_tokens', 'reasoning_effort'])
+  if (modelType === 'tts') {
+    SKIP_PARAMS.add('speaker')
+    SKIP_PARAMS.add('speech_rate')
+    SKIP_PARAMS.add('app_id')
+    SKIP_PARAMS.add('sample_rate')
+    SKIP_PARAMS.add('timeout_seconds')
+  }
 
   // 渲染动态参数字段
   const renderParamFields = () => {
@@ -331,6 +445,15 @@ export default function ModelSettings() {
           <h3><i className="fas fa-plus-circle"></i> 添加模型</h3>
 
           <div className="model-form-group">
+            <label>模型类型</label>
+            <select value={modelType} onChange={e => handleTypeChange(e.target.value)}>
+              {MODEL_TYPE_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="model-form-group">
             <label>模型供应商</label>
             <select value={providerKey} onChange={e => handleProviderChange(e.target.value)}>
               <option value="">选择供应商</option>
@@ -363,6 +486,40 @@ export default function ModelSettings() {
           </div>
 
           {renderParamFields()}
+
+          {/* TTS 专属参数：发音人与语速 */}
+          {modelType === 'tts' && selectedModel && (() => {
+            const speaker = String(paramValues.speaker ?? TTS_SPEAKERS[0].value)
+            const speechRate = Number(paramValues.speech_rate ?? 0)
+            return (
+              <>
+                <div className="model-form-group">
+                  <label>发音人 (speaker)</label>
+                  <select value={speaker} onChange={e => handleParamChange('speaker', e.target.value)}>
+                    {TTS_SPEAKERS.map(s => (
+                      <option key={s.value} value={s.value}>{s.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="model-form-group">
+                  <label>语速 (speech_rate)：{speechRate}（≈ {ttsRateToSpeed(speechRate).toFixed(2)} 倍速）</label>
+                  <input
+                    type="range"
+                    min={TTS_SPEECH_RATE_MIN}
+                    max={TTS_SPEECH_RATE_MAX}
+                    step={5}
+                    value={speechRate}
+                    onChange={e => handleParamChange('speech_rate', parseInt(e.target.value, 10))}
+                  />
+                  <div className="model-temp-labels">
+                    <span>-50（0.5 倍速）</span>
+                    <span>0（正常）</span>
+                    <span>100（2.0 倍速）</span>
+                  </div>
+                </div>
+              </>
+            )
+          })()}
 
           <div className="model-form-group">
             <label>API Key</label>
@@ -425,35 +582,44 @@ export default function ModelSettings() {
             </div>
           ) : (
             <div className="model-list">
-              {savedModels.map(m => {
-                const provLabel = providers[m.provider]?.label || m.provider
-                let modelLabel = m.display_name || m.provider_model_key
-                const testOk = m.last_test_result?.success
+              {MODEL_TYPE_OPTIONS.map(o => {
+                const group = savedModels.filter(m => (m.model_type || 'chat') === o.value)
+                if (group.length === 0) return null
                 return (
-                  <div key={m.model_id} className="model-list-item">
-                    <div className="model-list-item-header">
-                      <span className="model-list-name">{modelLabel}</span>
-                      <div className="model-list-header-right">
-                        {testOk !== undefined && (
-                          <span className={`model-test-badge ${testOk ? 'ok' : 'fail'}`} title={testOk ? '测试通过' : '测试失败'}>
-                            <i className={`fas ${testOk ? 'fa-check-circle' : 'fa-times-circle'}`}></i>
-                          </span>
-                        )}
-                        <span className="model-list-provider">{provLabel}</span>
-                      </div>
-                    </div>
-                    <div className="model-list-item-detail">
-                      <span><i className="fas fa-code"></i> {m.provider_model_key}</span>
-                      {m.params?.temperature != null && (
-                        <span><i className="fas fa-thermometer-half"></i> 温度 {Number(m.params.temperature)}</span>
-                      )}
-                      <span className="model-list-url" title={m.base_url}><i className="fas fa-link"></i> {m.base_url}</span>
-                    </div>
-                    <div className="model-list-item-actions">
-                      <button className="model-btn-sm delete" onClick={() => handleDelete(m.model_id)} title="删除">
-                        <i className="fas fa-trash"></i>
-                      </button>
-                    </div>
+                  <div key={o.value} className="model-list-group">
+                    <div className="model-list-group-title">{o.label} <span>{group.length}</span></div>
+                    {group.map(m => {
+                      const provLabel = providers[m.provider]?.label || m.provider
+                      const modelLabel = m.display_name || m.provider_model_key
+                      const testOk = m.last_test_result?.success
+                      return (
+                        <div key={m.model_id} className="model-list-item">
+                          <div className="model-list-item-header">
+                            <span className="model-list-name">{modelLabel}</span>
+                            <div className="model-list-header-right">
+                              {testOk !== undefined && (
+                                <span className={`model-test-badge ${testOk ? 'ok' : 'fail'}`} title={testOk ? '测试通过' : '测试失败'}>
+                                  <i className={`fas ${testOk ? 'fa-check-circle' : 'fa-times-circle'}`}></i>
+                                </span>
+                              )}
+                              <span className="model-list-provider">{provLabel}</span>
+                            </div>
+                          </div>
+                          <div className="model-list-item-detail">
+                            <span><i className="fas fa-code"></i> {m.provider_model_key}</span>
+                            {m.params?.temperature != null && (
+                              <span><i className="fas fa-thermometer-half"></i> 温度 {Number(m.params.temperature)}</span>
+                            )}
+                            <span className="model-list-url" title={m.base_url}><i className="fas fa-link"></i> {m.base_url}</span>
+                          </div>
+                          <div className="model-list-item-actions">
+                            <button className="model-btn-sm delete" onClick={() => handleDelete(m.model_id)} title="删除">
+                              <i className="fas fa-trash"></i>
+                            </button>
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
                 )
               })}

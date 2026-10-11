@@ -13,12 +13,17 @@ interface JoinRequest {
   created_at: string
 }
 
+/** "通过"离场动画时长（ms），需与 CSS 中 joinRowApprove 动画保持一致 */
+const APPROVE_ANIM_MS = 600
+
 export default function JoinRequestManagement() {
   const { user } = useAuth()
   const [requests, setRequests] = useState<JoinRequest[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [actionLoading, setActionLoading] = useState<string | null>(null)
+  /** 正在播放"通过"离场动画的申请 ID，动画结束后行从列表移除 */
+  const [approvingIds, setApprovingIds] = useState<string[]>([])
 
   const fetchRequests = useCallback(async () => {
     setLoading(true)
@@ -49,7 +54,8 @@ export default function JoinRequestManagement() {
         if (a.status !== 'pending' && b.status === 'pending') return 1
         return b.created_at?.localeCompare(a.created_at ?? '') ?? 0
       })
-      setRequests(allRequests)
+      // 已通过的申请不在列表中展示（通过后即播放动画消失）
+      setRequests(allRequests.filter(r => r.status !== 'approved'))
     } catch (err) {
       setError(err instanceof Error ? err.message : '获取申请列表失败')
     } finally {
@@ -76,7 +82,16 @@ export default function JoinRequestManagement() {
         }),
       })
       if (!res.ok) throw new Error('操作失败')
-      setRequests(prev => prev.map(r => r.request_id === requestId ? { ...r, status: action === 'approve' ? 'approved' : 'rejected' } : r))
+      if (action === 'approve') {
+        // 通过：播放离场动画后从列表移除，不显示 approved 状态
+        setApprovingIds(prev => [...prev, requestId])
+        setTimeout(() => {
+          setRequests(prev => prev.filter(r => r.request_id !== requestId))
+          setApprovingIds(prev => prev.filter(id => id !== requestId))
+        }, APPROVE_ANIM_MS)
+      } else {
+        setRequests(prev => prev.map(r => r.request_id === requestId ? { ...r, status: 'rejected' } : r))
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '操作失败')
     } finally {
@@ -149,15 +164,18 @@ export default function JoinRequestManagement() {
           {requests.map(req => {
             const st = statusMap[req.status] ?? { label: req.status, cls: '' }
             const isLoading = actionLoading === req.request_id
+            const isApproving = approvingIds.includes(req.request_id)
             return (
-              <div key={req.request_id} className={`join-mgmt-table-row ${st.cls}`}>
+              <div key={req.request_id} className={`join-mgmt-table-row ${st.cls} ${isApproving ? 'approving' : ''}`}>
                 <span className="join-mgmt-user">
                   <i className="fas fa-user-circle"></i>
                   {req.nickname || req.username}
                 </span>
                 <span>{req.course_name}</span>
                 <span className="join-mgmt-time">{req.created_at?.slice(0, 16)}</span>
-                <span className={`join-mgmt-status ${st.cls}`}>{st.label}</span>
+                <span className={`join-mgmt-status ${st.cls}`}>
+                  {isApproving ? '已通过' : st.label}
+                </span>
                 <span className="join-mgmt-actions">
                   {req.status === 'pending' ? (
                     <>

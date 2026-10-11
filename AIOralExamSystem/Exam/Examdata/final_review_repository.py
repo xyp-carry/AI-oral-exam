@@ -3,7 +3,10 @@ import hashlib
 import json
 from contextlib import asynccontextmanager
 
-from .connection import connect
+from sqlalchemy import func, select, text, update
+
+from .connection import get_engine
+from .models import ExamSession
 from .serializers import to_json
 
 
@@ -18,12 +21,10 @@ async def _database_call(function, *args):
 
 
 def _read_report(connection, exam_id):
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT final_review_html, final_review_json FROM exam_sessions WHERE exam_id = %s",
-            (exam_id,),
-        )
-        row = cursor.fetchone()
+    row = connection.execute(
+        select(ExamSession.final_review_html, ExamSession.final_review_json)
+        .where(ExamSession.exam_id == exam_id)
+    ).fetchone()
     if row is None:
         raise ValueError("EXAM_SESSION_NOT_FOUND")
     if not row[0]:
@@ -34,11 +35,8 @@ def _read_report(connection, exam_id):
 
 async def get_final_review(exam_id):
     def read():
-        connection = connect(use_database=True)
-        try:
+        with get_engine().connect() as connection:
             return _read_report(connection, exam_id)
-        finally:
-            connection.close()
     return await asyncio.to_thread(read)
 
 
@@ -54,22 +52,29 @@ class FinalReviewWriter:
     def _save(self, review, html):
         scores = review["scores"]
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE exam_sessions
-                    SET final_review_html = %s, final_review_json = %s,
-                        exam_score = %s, exam_dimension_scores_json = %s,
-                        question_count = %s, exam_completed = %s,
-                        ended_at = COALESCE(ended_at, NOW())
-                    WHERE exam_id = %s AND final_review_html IS NULL
-                    """,
-                    (html, to_json(review), scores["total"], to_json(scores["dimensions"]),
-                     sum(len(item.get("question_chain") or []) for item in review["question_reviews"]),
-                     int(review["status"] == "finished"), self.exam_id),
+            result = self.connection.execute(
+                update(ExamSession)
+                .where(
+                    ExamSession.exam_id == self.exam_id,
+                    ExamSession.final_review_html.is_(None),
                 )
-                if cursor.rowcount != 1:
-                    raise RuntimeError("FINAL_REVIEW_SAVE_CONFLICT")
+                .values(
+                    final_review_html=html,
+                    final_review_json=to_json(review),
+                    total_score=scores["max_total"],
+                    dimension_scores_json=to_json(scores["max_dimensions"]),
+                    exam_score=scores["total"],
+                    exam_dimension_scores_json=to_json(scores["dimensions"]),
+                    question_count=sum(
+                        len(item.get("question_chain") or [])
+                        for item in review["question_reviews"]
+                    ),
+                    exam_completed=int(review["status"] == "finished"),
+                    ended_at=func.coalesce(ExamSession.ended_at, func.now()),
+                )
+            )
+            if result.rowcount != 1:
+                raise RuntimeError("FINAL_REVIEW_SAVE_CONFLICT")
             self.connection.commit()
         except Exception:
             self.connection.rollback()
@@ -79,20 +84,22 @@ class FinalReviewWriter:
 
 
 def _claim(exam_id, user_id):
-    connection = connect(use_database=True)
+    connection = get_engine().connect()
     try:
         # A connection-scoped lock prevents duplicate Agent calls across workers.
         lock_name = "final-review:" + hashlib.sha256(exam_id.encode()).hexdigest()[:48]
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT GET_LOCK(%s, 0)", (lock_name,))
-            if cursor.fetchone()[0] != 1:
-                raise RuntimeError("FINAL_REVIEW_BUSY")
-            cursor.execute("SELECT user_id FROM exam_sessions WHERE exam_id = %s", (exam_id,))
-            row = cursor.fetchone()
-            if row is None:
-                raise ValueError("EXAM_SESSION_NOT_FOUND")
-            if str(row[0]) != str(user_id):
-                raise PermissionError("FINAL_REVIEW_ACCESS_DENIED")
+        lock_result = connection.execute(
+            text("SELECT GET_LOCK(:lock_name, 0)"), {"lock_name": lock_name}
+        ).fetchone()
+        if lock_result[0] != 1:
+            raise RuntimeError("FINAL_REVIEW_BUSY")
+        row = connection.execute(
+            select(ExamSession.user_id).where(ExamSession.exam_id == exam_id)
+        ).fetchone()
+        if row is None:
+            raise ValueError("EXAM_SESSION_NOT_FOUND")
+        if str(row[0]) != str(user_id):
+            raise PermissionError("FINAL_REVIEW_ACCESS_DENIED")
         saved = _read_report(connection, exam_id)
         connection.commit()
         return FinalReviewWriter(connection, exam_id, saved)

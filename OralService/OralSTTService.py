@@ -12,7 +12,7 @@ from stt.local_stt import LocalStreamingSTTService
 from typing import List, Dict, Optional
 
 
-class MetricsFrameLogger(FrameProcessor):
+class STTServicer(FrameProcessor):
     """Get User audio and transform text"""
 
     def __init__(
@@ -26,12 +26,12 @@ class MetricsFrameLogger(FrameProcessor):
         self.Framelist = []
         self.current_user = current_user or {}
         self.exam_type = str(self.current_user.get("exam_type") or "").strip().upper()
-        self.requires_mic_window = self.exam_type == "C"
+        self.requires_mic_window = self.exam_type in {"B", "C"}
         self.history: List[Dict[str, str]] = history if history is not None else []
         self.streaming_stt = LocalStreamingSTTService(
             vad_chunk_ms=vad_chunk_ms,
             transcribe_on_speech_end=True,
-            save_audio_segments=self.requires_mic_window,
+            save_audio_segments=self.exam_type == "C",
         )
 
 
@@ -100,7 +100,12 @@ class MetricsFrameLogger(FrameProcessor):
             data = message.get("data") if isinstance(message.get("data"), dict) else {}
             text = str(data.get("text") or message.get("text") or "")
             logger.info(f"User text: {text}")
-            await self.push_user_text(text, direction)
+            if self.requires_mic_window:
+                if text.strip():
+                    self.history.append({"role": "user", "content": text.strip()})
+                await self.push_frame(frame, direction)
+            else:
+                await self.push_user_text(text, direction)
             return True
 
         return False
@@ -132,6 +137,15 @@ class MetricsFrameLogger(FrameProcessor):
                 path = str(event.get("path") or "")
                 if path:
                     print(f"FunASR audio saved: {path}", flush=True)
+                continue
+            if event_type == "stt_segment_complete":
+                if self.requires_mic_window:
+                    await self.push_frame(
+                        InputTransportMessageFrame(
+                            message={"type": event_type, "data": {"reason": event.get("reason")}}
+                        ),
+                        direction,
+                    )
                 continue
             if event_type == "text":
                 text = str(event.get("text") or "")

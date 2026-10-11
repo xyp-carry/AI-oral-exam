@@ -4,14 +4,38 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from LLM.model_repository import ensure_models_exist, model_row_to_dict
+from sqlalchemy import delete, literal, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-from .connection import connect, ensure_database
+from LLM.model_repository import ensure_models_exist, model_row_to_dict
+from LLM.models import UserModelLibrary
+
+from .connection import ensure_database, get_engine
 from .schema import ensure_tables
 from .exam_item_repository import ensure_exam_item_editable
-
+from .models import CourseExamItem, ExamJudgeConfig, ExamJudgeConfigAgent, ExamSession
 
 MODEL_INPUT_TOKEN_BUDGET_RATIO = 0.75
+
+_AGENT_MODEL_COLUMNS = (
+    ExamJudgeConfigAgent.agent_role,
+    ExamJudgeConfigAgent.agent_index,
+    ExamJudgeConfigAgent.model_settings_json,
+    UserModelLibrary.model_id,
+    UserModelLibrary.owner_user_id,
+    UserModelLibrary.model_name,
+    UserModelLibrary.model_type,
+    UserModelLibrary.model_api_key,
+    UserModelLibrary.provider,
+    UserModelLibrary.provider_model_key,
+    UserModelLibrary.base_url,
+    UserModelLibrary.display_name,
+    UserModelLibrary.params_json,
+    UserModelLibrary.last_test_result_json,
+    UserModelLibrary.status,
+    UserModelLibrary.created_at,
+    UserModelLibrary.updated_at,
+)
 
 
 async def upsert_exam_judge_config(
@@ -22,7 +46,6 @@ async def upsert_exam_judge_config(
     adjudicator_model_id: Optional[str] = None,
     fail_policy: str = "majority",
     model_settings_by_agent: Optional[Dict[str, Dict[str, object]]] = None,
-    setter_model_id: Optional[str] = None,
     main_judger_model_id: Optional[str] = None,
     report_judger_model_id: Optional[str] = None,
     mineru_model_id: Optional[str] = None,
@@ -39,7 +62,6 @@ async def upsert_exam_judge_config(
         adjudicator_model_id,
         fail_policy,
         model_settings_by_agent,
-        setter_model_id,
         main_judger_model_id,
         report_judger_model_id,
         mineru_model_id,
@@ -120,7 +142,6 @@ def _upsert_exam_judge_config_sync(
     adjudicator_model_id: Optional[str],
     fail_policy: str,
     model_settings_by_agent: Optional[Dict[str, Dict[str, object]]],
-    setter_model_id: Optional[str],
     main_judger_model_id: Optional[str],
     report_judger_model_id: Optional[str],
     mineru_model_id: Optional[str],
@@ -135,7 +156,6 @@ def _upsert_exam_judge_config_sync(
     flow_type = _normalize_flow_type(flow_type, len(scorer_model_ids))
     fail_policy = _normalize_optional_text(fail_policy) or "majority"
     adjudicator_model_id = _normalize_optional_text(adjudicator_model_id)
-    setter_model_id = _normalize_optional_text(setter_model_id)
     main_judger_model_id = _normalize_optional_text(main_judger_model_id)
     report_judger_model_id = _normalize_optional_text(report_judger_model_id)
     mineru_model_id = _normalize_optional_text(mineru_model_id)
@@ -153,175 +173,136 @@ def _upsert_exam_judge_config_sync(
     model_settings_by_agent = model_settings_by_agent or {}
     config_id = str(uuid.uuid4())
     now = _now()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _ensure_exam_item_exists(cursor, exam_item_id)
-            ensure_models_exist(
-                cursor,
-                (
-                    scorer_model_ids
-                    + ([adjudicator_model_id] if adjudicator_model_id else [])
-                    + ([setter_model_id] if setter_model_id else [])
-                    + ([main_judger_model_id] if main_judger_model_id else [])
-                    + ([report_judger_model_id] if report_judger_model_id else [])
-                    + ([mineru_model_id] if mineru_model_id else [])
-                    + ([embedding_model_id] if embedding_model_id else [])
-                    + ([tts_model_id] if tts_model_id else [])
-                ),
-                created_by,
+        _ensure_exam_item_exists(connection, exam_item_id)
+        ensure_models_exist(
+            connection,
+            (
+                scorer_model_ids
+                + ([adjudicator_model_id] if adjudicator_model_id else [])
+                + ([main_judger_model_id] if main_judger_model_id else [])
+                + ([report_judger_model_id] if report_judger_model_id else [])
+                + ([mineru_model_id] if mineru_model_id else [])
+                + ([embedding_model_id] if embedding_model_id else [])
+                + ([tts_model_id] if tts_model_id else [])
+            ),
+            created_by,
+        )
+        statement = mysql_insert(ExamJudgeConfig).values(
+            config_id=config_id,
+            exam_item_id=exam_item_id,
+            flow_type=flow_type,
+            judge_count=len(scorer_model_ids),
+            adjudicator_enabled=1 if adjudicator_model_id else 0,
+            fail_policy=fail_policy,
+            status="active",
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            statement.on_duplicate_key_update(
+                flow_type=statement.inserted.flow_type,
+                judge_count=statement.inserted.judge_count,
+                adjudicator_enabled=statement.inserted.adjudicator_enabled,
+                fail_policy=statement.inserted.fail_policy,
+                status="active",
+                updated_at=statement.inserted.updated_at,
             )
-            cursor.execute(
-                """
-                INSERT INTO exam_judge_configs (
-                    config_id,
-                    exam_item_id,
-                    flow_type,
-                    judge_count,
-                    adjudicator_enabled,
-                    fail_policy,
-                    status,
-                    created_by,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    flow_type = VALUES(flow_type),
-                    judge_count = VALUES(judge_count),
-                    adjudicator_enabled = VALUES(adjudicator_enabled),
-                    fail_policy = VALUES(fail_policy),
-                    status = 'active',
-                    updated_at = VALUES(updated_at)
-                """,
-                (
-                    config_id,
-                    exam_item_id,
-                    flow_type,
-                    len(scorer_model_ids),
-                    1 if adjudicator_model_id else 0,
-                    fail_policy,
-                    created_by,
-                    now,
-                    now,
-                ),
+        )
+        active_config_id = connection.execute(
+            select(ExamJudgeConfig.config_id)
+            .where(ExamJudgeConfig.exam_item_id == exam_item_id)
+            .limit(1)
+        ).fetchone()[0]
+        roles_to_replace = ["scorer", "adjudicator", "setter", "main_judger"]
+        if report_judger_model_id:
+            roles_to_replace.append("report_judger")
+        if mineru_model_id:
+            roles_to_replace.append("mineru")
+        if embedding_model_id:
+            roles_to_replace.append("embedding")
+        if tts_model_id:
+            roles_to_replace.append("tts")
+        roles_to_replace.extend(clear_optional_roles)
+        connection.execute(
+            delete(ExamJudgeConfigAgent).where(
+                ExamJudgeConfigAgent.config_id == active_config_id,
+                ExamJudgeConfigAgent.agent_role.in_(roles_to_replace),
             )
-            cursor.execute(
-                """
-                SELECT config_id
-                FROM exam_judge_configs
-                WHERE exam_item_id = %s
-                LIMIT 1
-                """,
-                (exam_item_id,),
+        )
+        for index, model_id in enumerate(scorer_model_ids, start=1):
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "scorer",
+                index,
+                model_id,
+                model_settings_by_agent.get(f"scorer:{index}"),
+                now,
             )
-            row = cursor.fetchone()
-            active_config_id = row[0]
-            roles_to_replace = ["scorer", "adjudicator", "setter", "main_judger"]
-            if report_judger_model_id:
-                roles_to_replace.append("report_judger")
-            if mineru_model_id:
-                roles_to_replace.append("mineru")
-            if embedding_model_id:
-                roles_to_replace.append("embedding")
-            if tts_model_id:
-                roles_to_replace.append("tts")
-            roles_to_replace.extend(clear_optional_roles)
-            cursor.execute(
-                f"""
-                DELETE FROM exam_judge_config_agents
-                WHERE config_id = %s
-                  AND agent_role IN ({", ".join(["%s"] * len(roles_to_replace))})
-                """,
-                (active_config_id, *roles_to_replace),
+        if adjudicator_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "adjudicator",
+                0,
+                adjudicator_model_id,
+                model_settings_by_agent.get("adjudicator"),
+                now,
             )
-            for index, model_id in enumerate(scorer_model_ids, start=1):
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "scorer",
-                    index,
-                    model_id,
-                    model_settings_by_agent.get(f"scorer:{index}"),
-                    now,
-                )
-            if adjudicator_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "adjudicator",
-                    0,
-                    adjudicator_model_id,
-                    model_settings_by_agent.get("adjudicator"),
-                    now,
-                )
-            if setter_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "setter",
-                    0,
-                    setter_model_id,
-                    model_settings_by_agent.get("setter"),
-                    now,
-                )
-            if main_judger_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "main_judger",
-                    0,
-                    main_judger_model_id,
-                    model_settings_by_agent.get("main_judger"),
-                    now,
-                )
-            if report_judger_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "report_judger",
-                    0,
-                    report_judger_model_id,
-                    model_settings_by_agent.get("report_judger"),
-                    now,
-                )
-            if mineru_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "mineru",
-                    0,
-                    mineru_model_id,
-                    model_settings_by_agent.get("mineru"),
-                    now,
-                )
-            if embedding_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "embedding",
-                    0,
-                    embedding_model_id,
-                    model_settings_by_agent.get("embedding"),
-                    now,
-                )
-            if tts_model_id:
-                _insert_config_agent(
-                    cursor,
-                    active_config_id,
-                    "tts",
-                    0,
-                    tts_model_id,
-                    model_settings_by_agent.get("tts"),
-                    now,
-                )
-        connection.commit()
-        return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        if main_judger_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "main_judger",
+                0,
+                main_judger_model_id,
+                model_settings_by_agent.get("main_judger"),
+                now,
+            )
+        if report_judger_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "report_judger",
+                0,
+                report_judger_model_id,
+                model_settings_by_agent.get("report_judger"),
+                now,
+            )
+        if mineru_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "mineru",
+                0,
+                mineru_model_id,
+                model_settings_by_agent.get("mineru"),
+                now,
+            )
+        if embedding_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "embedding",
+                0,
+                embedding_model_id,
+                model_settings_by_agent.get("embedding"),
+                now,
+            )
+        if tts_model_id:
+            _insert_config_agent(
+                connection,
+                active_config_id,
+                "tts",
+                0,
+                tts_model_id,
+                model_settings_by_agent.get("tts"),
+                now,
+            )
+    return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
 
 
 def _upsert_exam_report_model_config_sync(
@@ -339,73 +320,49 @@ def _upsert_exam_report_model_config_sync(
     )
     config_id = str(uuid.uuid4())
     now = _now()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _ensure_exam_item_exists(cursor, exam_item_id)
-            ensure_models_exist(cursor, [report_judger_model_id], created_by)
-            cursor.execute(
-                """
-                INSERT INTO exam_judge_configs (
-                    config_id,
-                    exam_item_id,
-                    flow_type,
-                    judge_count,
-                    adjudicator_enabled,
-                    fail_policy,
-                    status,
-                    created_by,
-                    created_at,
-                    updated_at
-                ) VALUES (%s, %s, 'single', 0, 0, 'majority', 'active', %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    status = 'active',
-                    updated_at = VALUES(updated_at)
-                """,
-                (
-                    config_id,
-                    exam_item_id,
-                    created_by,
-                    now,
-                    now,
-                ),
+        _ensure_exam_item_exists(connection, exam_item_id)
+        ensure_models_exist(connection, [report_judger_model_id], created_by)
+        statement = mysql_insert(ExamJudgeConfig).values(
+            config_id=config_id,
+            exam_item_id=exam_item_id,
+            flow_type="single",
+            judge_count=0,
+            adjudicator_enabled=0,
+            fail_policy="majority",
+            status="active",
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            statement.on_duplicate_key_update(
+                status="active",
+                updated_at=statement.inserted.updated_at,
             )
-            cursor.execute(
-                """
-                SELECT config_id
-                FROM exam_judge_configs
-                WHERE exam_item_id = %s
-                LIMIT 1
-                """,
-                (exam_item_id,),
+        )
+        active_config_id = connection.execute(
+            select(ExamJudgeConfig.config_id)
+            .where(ExamJudgeConfig.exam_item_id == exam_item_id)
+            .limit(1)
+        ).fetchone()[0]
+        connection.execute(
+            delete(ExamJudgeConfigAgent).where(
+                ExamJudgeConfigAgent.config_id == active_config_id,
+                ExamJudgeConfigAgent.agent_role == "report_judger",
             )
-            row = cursor.fetchone()
-            active_config_id = row[0]
-            cursor.execute(
-                """
-                DELETE FROM exam_judge_config_agents
-                WHERE config_id = %s
-                  AND agent_role = 'report_judger'
-                """,
-                (active_config_id,),
-            )
-            _insert_config_agent(
-                cursor,
-                active_config_id,
-                "report_judger",
-                0,
-                report_judger_model_id,
-                model_settings,
-                now,
-            )
-        connection.commit()
-        return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+        )
+        _insert_config_agent(
+            connection,
+            active_config_id,
+            "report_judger",
+            0,
+            report_judger_model_id,
+            model_settings,
+            now,
+        )
+    return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
 
 
 def _upsert_exam_optional_agent_models_sync(
@@ -425,73 +382,64 @@ def _upsert_exam_optional_agent_models_sync(
     }
     model_ids = [model_id for model_id in normalized_models.values() if model_id]
     now = _now()
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            _ensure_exam_item_exists(cursor, exam_item_id)
-            if model_ids:
-                ensure_models_exist(cursor, model_ids, created_by)
-            cursor.execute(
-                """
-                SELECT config_id
-                FROM exam_judge_configs
-                WHERE exam_item_id = %s
-                LIMIT 1
-                FOR UPDATE
-                """,
-                (exam_item_id,),
+        _ensure_exam_item_exists(connection, exam_item_id)
+        if model_ids:
+            ensure_models_exist(connection, model_ids, created_by)
+        existing_config = connection.execute(
+            select(ExamJudgeConfig.config_id)
+            .where(ExamJudgeConfig.exam_item_id == exam_item_id)
+            .limit(1)
+            .with_for_update()
+        ).fetchone()
+        if not existing_config and not model_ids:
+            return {}
+        if model_ids:
+            config_id = str(uuid.uuid4())
+            statement = mysql_insert(ExamJudgeConfig).values(
+                config_id=config_id,
+                exam_item_id=exam_item_id,
+                flow_type="single",
+                judge_count=0,
+                adjudicator_enabled=0,
+                fail_policy="majority",
+                status="active",
+                created_by=created_by,
+                created_at=now,
+                updated_at=now,
             )
-            existing_config = cursor.fetchone()
-            if not existing_config and not model_ids:
-                connection.commit()
-                return {}
-            if model_ids:
-                config_id = str(uuid.uuid4())
-                cursor.execute(
-                    """
-                    INSERT INTO exam_judge_configs (
-                        config_id, exam_item_id, flow_type, judge_count,
-                        adjudicator_enabled, fail_policy, status, created_by,
-                        created_at, updated_at
-                    ) VALUES (%s, %s, 'single', 0, 0, 'majority', 'active', %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        status = 'active',
-                        updated_at = VALUES(updated_at)
-                    """,
-                    (config_id, exam_item_id, created_by, now, now),
+            connection.execute(
+                statement.on_duplicate_key_update(
+                    status="active",
+                    updated_at=statement.inserted.updated_at,
                 )
-                cursor.execute(
-                    "SELECT config_id FROM exam_judge_configs WHERE exam_item_id = %s",
-                    (exam_item_id,),
+            )
+            active_config_id = connection.execute(
+                select(ExamJudgeConfig.config_id).where(
+                    ExamJudgeConfig.exam_item_id == exam_item_id
                 )
-                active_config_id = cursor.fetchone()[0]
-            else:
-                active_config_id = existing_config[0]
-                cursor.execute(
-                    "UPDATE exam_judge_configs SET updated_at = %s WHERE config_id = %s",
-                    (now, active_config_id),
-                )
+            ).fetchone()[0]
+        else:
+            active_config_id = existing_config[0]
+            connection.execute(
+                update(ExamJudgeConfig)
+                .where(ExamJudgeConfig.config_id == active_config_id)
+                .values(updated_at=now)
+            )
 
-            for role, model_id in normalized_models.items():
-                cursor.execute(
-                    """
-                    DELETE FROM exam_judge_config_agents
-                    WHERE config_id = %s AND agent_role = %s
-                    """,
-                    (active_config_id, role),
+        for role, model_id in normalized_models.items():
+            connection.execute(
+                delete(ExamJudgeConfigAgent).where(
+                    ExamJudgeConfigAgent.config_id == active_config_id,
+                    ExamJudgeConfigAgent.agent_role == role,
                 )
-                if model_id:
-                    _insert_config_agent(
-                        cursor, active_config_id, role, 0, model_id, None, now,
-                    )
-        connection.commit()
-        return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+            )
+            if model_id:
+                _insert_config_agent(
+                    connection, active_config_id, role, 0, model_id, None, now,
+                )
+    return _get_exam_judge_config_by_exam_item_sync(exam_item_id, include_api_key=True) or {}
 
 
 def _get_exam_judge_config_by_exam_item_sync(
@@ -500,13 +448,9 @@ def _get_exam_judge_config_by_exam_item_sync(
 ) -> Optional[Dict[str, object]]:
     ensure_database()
     exam_item_id = _normalize_required_text(exam_item_id, "EXAM_ITEM_ID_REQUIRED")
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            return _fetch_exam_judge_config_by_exam_item(cursor, exam_item_id, include_api_key)
-    finally:
-        connection.close()
+        return _fetch_exam_judge_config_by_exam_item(connection, exam_item_id, include_api_key)
 
 
 def _get_exam_judge_config_by_exam_id_sync(
@@ -515,101 +459,71 @@ def _get_exam_judge_config_by_exam_id_sync(
 ) -> Optional[Dict[str, object]]:
     ensure_database()
     exam_id = _normalize_required_text(exam_id, "EXAM_ID_REQUIRED")
-    connection = connect(use_database=True)
-    try:
+    with get_engine().begin() as connection:
         ensure_tables(connection)
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT exam_item_id
-                FROM exam_sessions
-                WHERE exam_id = %s
-                LIMIT 1
-                """,
-                (exam_id,),
-            )
-            row = cursor.fetchone()
-            if not row or not row[0]:
-                return None
-            return _fetch_exam_judge_config_by_exam_item(cursor, row[0], include_api_key)
-    finally:
-        connection.close()
+        row = connection.execute(
+            select(ExamSession.exam_item_id)
+            .where(ExamSession.exam_id == exam_id)
+            .limit(1)
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return _fetch_exam_judge_config_by_exam_item(connection, row[0], include_api_key)
 
 
 def _fetch_exam_judge_config_by_exam_item(
-    cursor,
+    connection,
     exam_item_id: str,
     include_api_key: bool,
 ) -> Optional[Dict[str, object]]:
-    cursor.execute(
-        """
-        SELECT
-            config_id,
-            exam_item_id,
-            flow_type,
-            judge_count,
-            adjudicator_enabled,
-            fail_policy,
-            status,
-            created_by,
-            created_at,
-            updated_at
-        FROM exam_judge_configs
-        WHERE exam_item_id = %s
-          AND status = 'active'
-        LIMIT 1
-        """,
-        (exam_item_id,),
-    )
-    row = cursor.fetchone()
+    row = connection.execute(
+        select(
+            ExamJudgeConfig.config_id,
+            ExamJudgeConfig.exam_item_id,
+            ExamJudgeConfig.flow_type,
+            ExamJudgeConfig.judge_count,
+            ExamJudgeConfig.adjudicator_enabled,
+            ExamJudgeConfig.fail_policy,
+            ExamJudgeConfig.status,
+            ExamJudgeConfig.created_by,
+            ExamJudgeConfig.created_at,
+            ExamJudgeConfig.updated_at,
+        )
+        .where(
+            ExamJudgeConfig.exam_item_id == exam_item_id,
+            ExamJudgeConfig.status == "active",
+        )
+        .limit(1)
+    ).fetchone()
     if not row:
         return None
     config = _config_row_to_dict(row)
-    cursor.execute(
-        """
-        SELECT
-            a.agent_role,
-            a.agent_index,
-            a.model_settings_json,
-            m.model_id,
-            m.owner_user_id,
-            m.model_name,
-            m.model_type,
-            m.model_api_key,
-            m.provider,
-            m.provider_model_key,
-            m.base_url,
-            m.display_name,
-            m.params_json,
-            m.last_test_result_json,
-            m.status,
-            m.created_at,
-            m.updated_at
-        FROM exam_judge_config_agents a
-        JOIN user_model_library m
-          ON a.model_id = m.model_id
-        WHERE a.config_id = %s
-          AND a.status = 'active'
-          AND m.status = 'active'
-        ORDER BY a.agent_role, a.agent_index
-        """,
-        (config["config_id"],),
-    )
+    agent_rows = connection.execute(
+        select(*_AGENT_MODEL_COLUMNS)
+        .select_from(ExamJudgeConfigAgent)
+        .join(
+            UserModelLibrary,
+            ExamJudgeConfigAgent.model_id == UserModelLibrary.model_id,
+        )
+        .where(
+            ExamJudgeConfigAgent.config_id == config["config_id"],
+            ExamJudgeConfigAgent.status == "active",
+            UserModelLibrary.status == "active",
+        )
+        .order_by(ExamJudgeConfigAgent.agent_role, ExamJudgeConfigAgent.agent_index)
+    ).fetchall()
     scorers = []
     adjudicator = None
-    setter = None
     main_judger = None
     report_judger = None
     mineru = None
     embedding = None
     tts = None
-    for row in cursor.fetchall():
-        agent = _agent_row_to_dict(row, include_api_key)
+    for agent_row in agent_rows:
+        agent = _agent_row_to_dict(agent_row, include_api_key)
         agent_role = agent["agent_role"]
         if agent_role == "adjudicator":
             adjudicator = agent
-        elif agent_role == "setter":
-            setter = agent
         elif agent_role == "main_judger":
             main_judger = agent
         elif agent_role == "report_judger":
@@ -624,7 +538,6 @@ def _fetch_exam_judge_config_by_exam_item(
             scorers.append(agent)
     config["scorers"] = scorers
     config["adjudicator"] = adjudicator
-    config["setter"] = setter
     config["main_judger"] = main_judger
     config["report_judger"] = report_judger
     config["mineru"] = mineru
@@ -634,47 +547,41 @@ def _fetch_exam_judge_config_by_exam_item(
 
 
 def _insert_config_agent(
-    cursor,
+    connection,
     config_id: str,
     agent_role: str,
     agent_index: int,
     model_id: str,
     model_settings: Optional[Dict[str, object]],
-    now: str,
+    now: datetime,
 ) -> None:
-    cursor.execute(
-        """
-        INSERT INTO exam_judge_config_agents (
-            config_id,
-            agent_role,
-            agent_index,
-            model_id,
-            model_settings_json,
-            status,
-            created_at,
-            updated_at
-        ) VALUES (%s, %s, %s, %s, %s, 'active', %s, %s)
-        """,
-        (
-            config_id,
-            agent_role,
-            agent_index,
-            model_id,
-            json.dumps(model_settings or {}, ensure_ascii=False),
-            now,
-            now,
-        ),
+    connection.execute(
+        ExamJudgeConfigAgent.__table__.insert().values(
+            config_id=config_id,
+            agent_role=agent_role,
+            agent_index=agent_index,
+            model_id=model_id,
+            model_settings_json=json.dumps(model_settings or {}, ensure_ascii=False),
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
     )
 
 
-def _ensure_exam_item_exists(cursor, exam_item_id: str) -> None:
-    cursor.execute(
-        "SELECT 1 FROM course_exam_items WHERE exam_item_id = %s AND status = 'active' LIMIT 1 FOR UPDATE",
-        (exam_item_id,),
-    )
-    if cursor.fetchone() is None:
+def _ensure_exam_item_exists(connection, exam_item_id: str) -> None:
+    row = connection.execute(
+        select(literal(1))
+        .where(
+            CourseExamItem.exam_item_id == exam_item_id,
+            CourseExamItem.status == "active",
+        )
+        .limit(1)
+        .with_for_update()
+    ).fetchone()
+    if row is None:
         raise ValueError("EXAM_ITEM_NOT_FOUND")
-    ensure_exam_item_editable(cursor, exam_item_id)
+    ensure_exam_item_editable(connection, exam_item_id)
 
 
 def _config_row_to_dict(row) -> Dict[str, object]:
@@ -849,5 +756,5 @@ def _json_loads(value, default):
         return default
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _now() -> datetime:
+    return datetime.now()
