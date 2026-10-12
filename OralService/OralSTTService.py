@@ -99,13 +99,12 @@ class STTServicer(FrameProcessor):
         if message.get("type") == "user-text":
             data = message.get("data") if isinstance(message.get("data"), dict) else {}
             text = str(data.get("text") or message.get("text") or "")
-            logger.info(f"User text: {text}")
             if self.requires_mic_window:
                 if text.strip():
                     self.history.append({"role": "user", "content": text.strip()})
                 await self.push_frame(frame, direction)
             else:
-                await self.push_user_text(text, direction)
+                await self.push_user_text(text, direction, input_source="text")
             return True
 
         return False
@@ -134,9 +133,7 @@ class STTServicer(FrameProcessor):
                     )
                 continue
             if event_type == "audio_saved":
-                path = str(event.get("path") or "")
-                if path:
-                    print(f"FunASR audio saved: {path}", flush=True)
+                logger.info("FunASR 音频保存成功")
                 continue
             if event_type == "stt_segment_complete":
                 if self.requires_mic_window:
@@ -151,15 +148,21 @@ class STTServicer(FrameProcessor):
                 text = str(event.get("text") or "")
                 if text.strip():
                     self.answer_text_seen = True
-                    print(f"FunASR STT text: {text}", flush=True)
                 await self.push_user_text(text, direction)
 
-    async def push_user_text(self, text: str, direction: FrameDirection) -> None:
+    async def push_user_text(
+        self, text: str, direction: FrameDirection, input_source: str = "voice"
+    ) -> None:
         text = (text or "").strip()
         if not text:
             return
 
         self.history.append({"role": "user", "content": text})
+        if input_source == "text":
+            await self.push_frame(
+                InputTransportMessageFrame(message={"type": "stt-input-source", "data": {"source": "text"}}),
+                direction,
+            )
         user_input = LLMContextFrame(
             context=LLMContext(messages=[{"role": "user", "content": text}])
         )

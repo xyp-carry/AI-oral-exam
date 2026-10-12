@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useParams, useLocation, useNavigate } from 'react-router-dom'
 import { useWebRTC } from '../hooks/useWebRTC'
 import { useMicrophone } from '../hooks/useMicrophone'
@@ -6,11 +6,9 @@ import { useToast } from '../hooks/useToast'
 import { useExamSession } from '../hooks/useExamSession'
 import { useCModeExam } from '../hooks/useCModeExam'
 import Sidebar from '../components/Sidebar'
-import ChatPanel from '../components/ChatPanel'
-import type { ChatPanelHandle } from '../components/ChatPanel'
 import CModePanel from '../components/CModePanel'
 
-/** A 模式用于驱动 UI 状态的哨兵串，C 模式下直接忽略 */
+/** 后端哨兵串（驱动 UI 状态切换），不作为题目正文渲染 */
 const BOT_TEXT_SENTINELS = new Set([
   'AI口试开始思考',
   'AI口试开始回答',
@@ -25,7 +23,6 @@ export default function Exam() {
   const location = useLocation()
   const navigate = useNavigate()
   const examType = (location.state as { exam_type?: string } | null)?.exam_type ?? null
-  const cModeActive = examType === 'C'
   const { toasts, showToast } = useToast()
   const { sessionId, chatStatus, starting, remoteAudioStarted, audioDetected, dcOpen, startSession, closeSession, sendDCMessage, onDCMessage, replaceAudioTrack, cleanupConnection } = useWebRTC(showToast)
   const {
@@ -34,16 +31,15 @@ export default function Exam() {
   } = useMicrophone(showToast)
   const { setExamActive } = useExamSession()
 
+  // 所有考试模式（A/B/C）统一使用同一套交互与输入方式
   const cMode = useCModeExam({
-    enabled: cModeActive,
+    enabled: true,
     sendDCMessage,
     onDCMessage,
     showToast,
   })
 
   const [pttActive, setPttActive] = useState(false)
-  const chatPanelRef = useRef<ChatPanelHandle>(null)
-  const evaluatingRef = useRef(false)
 
   useEffect(() => {
     setExamActive(!!sessionId)
@@ -102,45 +98,16 @@ export default function Exam() {
     }
   }, [])
 
-  onDCMessage('user-llm-text', useCallback((data: Record<string, unknown>) => {
-    const text = (data.data as Record<string, unknown>)?.text as string
-    if (!text) return
-    if (cModeActive) {
-      // C 模式：后端回显的用户文本不回传。
-      // 语音 STT 由后端自行处理；若此处中继会形成 user-text ↔ user-llm-text 死循环
-      return
-    }
-    chatPanelRef.current?.receiveUserMessage(text)
-  }, [cModeActive]))
+  // 后端回显的用户文本不回传：语音 STT 由后端自行处理，
+  // 若此处中继会形成 user-text ↔ user-llm-text 死循环，直接忽略
+  onDCMessage('user-llm-text', useCallback((_data: Record<string, unknown>) => { /* ignore */ }, []))
 
+  // 题目正文经 bot-llm-text 以 HTML 片段推送，哨兵串忽略，其余累积到当前题目
   onDCMessage('bot-llm-text', useCallback((data: Record<string, unknown>) => {
     const text = (data.data as Record<string, unknown>)?.text as string
     if (!text) return
-    if (cModeActive) {
-      // C 模式：题目正文经 bot-llm-text 以 HTML 片段推送，累积到当前题目；A 模式哨兵串忽略
-      if (!BOT_TEXT_SENTINELS.has(text)) cMode.receiveBotText(text)
-      return
-    }
-    if (text === 'AI口试开始思考') {
-      chatPanelRef.current?.startAIThinking()
-    } else if (text === 'AI口试开始回答') {
-      chatPanelRef.current?.startAIAnswering()
-    } else if (text === 'AI口试结束回答') {
-      chatPanelRef.current?.finishAIResponse()
-    } else if (text === 'AI评审开始评估') {
-      evaluatingRef.current = true
-      chatPanelRef.current?.startEvaluating()
-    } else if (text === 'AI评审结束评估') {
-      evaluatingRef.current = false
-      chatPanelRef.current?.stopEvaluating()
-    } else if (text === 'AI考试全部结束') {
-      closeSession()
-    } else if (evaluatingRef.current) {
-      chatPanelRef.current?.appendEvaluatingHtml(text)
-    } else {
-      chatPanelRef.current?.appendAIText(text)
-    }
-  }, [closeSession, cModeActive, cMode.receiveBotText]))
+    if (!BOT_TEXT_SENTINELS.has(text)) cMode.receiveBotText(text)
+  }, [cMode.receiveBotText]))
 
   const handleStart = useCallback(() => {
     console.log('[Exam] 点击 Start, micStream:', micStream ? '已就绪' : '未就绪')
@@ -149,56 +116,22 @@ export default function Exam() {
     startSession(micStream, examInfo)
   }, [startSession, micStream, examId, examType])
 
-  // C 模式：DataChannel 打开后自动发送 start，获取第一道根问题
+  // DataChannel 打开后自动发送 start，获取第一道根问题
   useEffect(() => {
-    if (cModeActive && dcOpen) {
-      console.log('[Exam][C] DC 已打开, 发送 start')
+    if (dcOpen) {
+      console.log('[Exam] DC 已打开, 发送 start')
       cMode.start()
     }
-  }, [cModeActive, dcOpen, cMode.start])
+  }, [dcOpen, cMode.start])
 
   const handleSendText = useCallback((text: string) => {
     if (!sessionId) {
       showToast('error', '请先点击 Start 开始会话')
       return
     }
-    if (cModeActive) {
-      // C 模式：文字输入作为一段回答提交
-      cMode.sendAnswerChunk(text)
-      return
-    }
-    sendDCMessage({ type: 'user-text', data: { text } })
-  }, [sessionId, sendDCMessage, showToast, cModeActive, cMode.sendAnswerChunk])
-
-  // 回答完毕确认事件：B/C 模式都会收到，此处统一注册后按模式分流
-  // （onDCMessage 为单槽注册，C 模式不再自行注册该类型，避免相互覆盖）
-  const [bConfirmPrompt, setBConfirmPrompt] = useState<{ questionId: string; message: string; idleTimeoutSecs: number } | null>(null)
-
-  onDCMessage('answer_finish_confirmation_required', useCallback((data: Record<string, unknown>) => {
-    if (cModeActive) {
-      // C 模式：转发回 C 模式事件分发（confirmPrompt 弹窗）
-      cMode.handleEvent(data)
-      return
-    }
-    // B 模式：本地弹窗确认，选择后回发 answer_finish_confirmation 信号
-    setBConfirmPrompt({
-      questionId: String(data.question_id ?? ''),
-      message: String(data.message ?? '你是否已经回答完毕？'),
-      idleTimeoutSecs: typeof data.idle_timeout_secs === 'number' ? data.idle_timeout_secs : 0,
-    })
-  }, [cModeActive, cMode.handleEvent]))
-
-  /** B 模式：回发回答完毕确认信号（与 C 模式 sendFinishConfirmation 一致） */
-  const sendBFinishConfirmation = useCallback((finished: boolean) => {
-    setBConfirmPrompt(null)
-    if (finished) deactivateMic()
-    sendDCMessage({ type: 'answer_finish_confirmation', data: { finished } })
-  }, [deactivateMic, sendDCMessage])
-
-  // 会话结束后清理 B 模式确认弹窗
-  useEffect(() => {
-    if (!sessionId) setBConfirmPrompt(null)
-  }, [sessionId])
+    // 文字输入作为一段回答提交
+    cMode.sendAnswerChunk(text)
+  }, [sessionId, showToast, cMode.sendAnswerChunk])
 
   /** 收到 finished 事件（考试全部结束）：直接结束会话并返回考试列表 */
   const examFinished = cMode.examFinished
@@ -211,39 +144,6 @@ export default function Exam() {
   return (
     <>
       <audio id="remoteAudio" autoPlay />
-
-      {/* B 模式：回答完毕确认弹窗（后端 answer_finish_confirmation_required 触发，与 C 模式同款） */}
-      {bConfirmPrompt && !cModeActive && (
-        <div className="cmode-confirm-overlay">
-          <div className="cmode-confirm-dialog">
-            <div className="cmode-confirm-title">
-              <i className="fas fa-circle-question"></i> 回答完毕确认
-            </div>
-            <div className="cmode-confirm-message">
-              {bConfirmPrompt.message}
-              {bConfirmPrompt.idleTimeoutSecs > 0 && (
-                <span className="cmode-confirm-hint">
-                  （已 {bConfirmPrompt.idleTimeoutSecs} 秒未检测到语音输入）
-                </span>
-              )}
-            </div>
-            <div className="cmode-confirm-actions">
-              <button
-                className="cmode-confirm-btn continue"
-                onClick={() => sendBFinishConfirmation(false)}
-              >
-                <i className="fas fa-pen-nib"></i> 继续作答
-              </button>
-              <button
-                className="cmode-confirm-btn finish"
-                onClick={() => sendBFinishConfirmation(true)}
-              >
-                <i className="fas fa-check"></i> 结束回答
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       <main className="exam-layout">
         <Sidebar
@@ -258,44 +158,30 @@ export default function Exam() {
           onMicSelect={selectDevice}
         />
 
-        {cModeActive ? (
-          <CModePanel
-            chatStatus={chatStatus}
-            connected={!!sessionId}
-            starting={starting}
-            remoteAudioStarted={remoteAudioStarted}
-            audioDetected={audioDetected}
-            pttActive={pttActive}
-            onTogglePTT={togglePTT}
-            onSendText={handleSendText}
-            phase={cMode.phase}
-            currentQuestion={cMode.currentQuestion}
-            answerRaw={cMode.answerRaw}
-            answerCorrected={cMode.answerCorrected}
-            judgement={cMode.judgement}
-            completedInfo={cMode.completedInfo}
-            errorMsg={cMode.errorMsg}
-            waitingReason={cMode.waitingReason}
-            closedInfo={cMode.closedInfo}
-            confirmPrompt={cMode.confirmPrompt}
-            finalReport={cMode.finalReport}
-            onAnswerEnd={() => { deactivateMic(); cMode.sendAnswerEnd() }}
-            onFinish={cMode.finish}
-            onConfirmAnswerFinish={(finished) => { if (finished) deactivateMic(); cMode.sendFinishConfirmation(finished) }}
-          />
-        ) : (
-          <ChatPanel
-            ref={chatPanelRef}
-            chatStatus={chatStatus}
-            onTogglePTT={togglePTT}
-            pttActive={pttActive}
-            onSendText={handleSendText}
-            connected={!!sessionId}
-            starting={starting}
-            remoteAudioStarted={remoteAudioStarted}
-            audioDetected={audioDetected}
-          />
-        )}
+        <CModePanel
+          chatStatus={chatStatus}
+          connected={!!sessionId}
+          starting={starting}
+          remoteAudioStarted={remoteAudioStarted}
+          audioDetected={audioDetected}
+          pttActive={pttActive}
+          onTogglePTT={togglePTT}
+          onSendText={handleSendText}
+          phase={cMode.phase}
+          currentQuestion={cMode.currentQuestion}
+          answerRaw={cMode.answerRaw}
+          answerCorrected={cMode.answerCorrected}
+          judgement={cMode.judgement}
+          completedInfo={cMode.completedInfo}
+          errorMsg={cMode.errorMsg}
+          waitingReason={cMode.waitingReason}
+          closedInfo={cMode.closedInfo}
+          confirmPrompt={cMode.confirmPrompt}
+          finalReport={cMode.finalReport}
+          onAnswerEnd={() => { deactivateMic(); cMode.sendAnswerEnd() }}
+          onFinish={cMode.finish}
+          onConfirmAnswerFinish={(finished) => { if (finished) deactivateMic(); cMode.sendFinishConfirmation(finished) }}
+        />
       </main>
 
       <div className="toast-container">

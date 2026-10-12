@@ -32,8 +32,6 @@ from AIOralExamSystem.Exam.Examdata.c_question_repository import save_c_exam_que
 from AIOralExamSystem.Exam.Examdata.c_score_repository import initialize_c_score_limits
 from OralService.CAnswerBoundaryProcessor import CAnswerEventFrame
 
-import time
-
 class InterviewServiceC(FrameProcessor):
     """Run the C-mode exam session and publish its output."""
 
@@ -411,10 +409,13 @@ class InterviewServiceC(FrameProcessor):
 
     async def speak_question(self, question: Mapping[str, Any]) -> None:
         speech_content = self.render_question_speech(question)
-        print(f"Rendering question speech: {speech_content}")
         if speech_content:
             await self.push_frame(TTSSpeakFrame(speech_content), FrameDirection.DOWNSTREAM)
-        await self.stream_question_display(question)
+        logger.info("开始流式输出")
+        try:
+            await self.stream_question_display(question)
+        finally:
+            logger.info("结束流式输出")
 
     async def stream_question_display(self, question: Mapping[str, Any]) -> None:
         content = self.get_question_content(question)
@@ -456,10 +457,8 @@ class InterviewServiceC(FrameProcessor):
 
     async def stream_question_text_block(self, text: str) -> None:
         await self.push_frame(LLMTextFrame("<p>"), FrameDirection.DOWNSTREAM)
-        start_time = time.time()
         for chunk in self.iter_question_display_chunks(text):
             await self.push_frame(LLMTextFrame(escape(chunk)), FrameDirection.DOWNSTREAM)
-            print(f"sent chunk: {chunk} in time: {time.time() - start_time}")
             await self.sleep_question_display(chunk)
         await self.push_frame(LLMTextFrame("</p>"), FrameDirection.DOWNSTREAM)
 

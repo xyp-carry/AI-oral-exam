@@ -3,9 +3,11 @@ import json
 from html import escape
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from pipecat.frames.frames import (
     EndFrame,
     Frame,
+    InputTransportMessageFrame,
     LLMContextFrame,
     LLMTextFrame,
     OutputTransportMessageFrame,
@@ -147,11 +149,22 @@ class InterviewServiceA(FrameProcessor):
         self.current_question_id = ""
         self.current_question_sequence_id: Optional[int] = None
         self.judge_order_id = 0
+        self.next_input_source = "voice"
+        self.pending_answer_logs: Dict[int, tuple[str, str, str]] = {}
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, InputTransportMessageFrame):
+            message = frame.message or {}
+            if message.get("type") == "stt-input-source":
+                data = message.get("data") if isinstance(message.get("data"), dict) else {}
+                self.next_input_source = "text" if data.get("source") == "text" else "voice"
+                return
+
         if isinstance(frame, LLMContextFrame):
+            input_source = self.next_input_source
+            self.next_input_source = "voice"
             if self.startup_error:
                 await self.push_startup_error(direction)
                 return
@@ -161,17 +174,24 @@ class InterviewServiceA(FrameProcessor):
             answer = self.extract_latest_user_answer(frame.context.get_messages())
 
             self.judge_order_id += 1
+            judge_order_id = self.judge_order_id
             await self.push_frame(LLMTextFrame("AI口试开始思考"), direction)
-            output_events = await exam_graph.handle_message(
-                {
-                    "type": ExamAFlow.EVENT_SUBMIT_FEEDBACK,
-                    "question_id": self.current_question_id,
-                    "question_sequence_id": self.current_question_sequence_id,
-                    "judge_order_id": self.judge_order_id,
-                    "answer": answer,
-                    "feedback": {"answer": answer},
-                }
-            )
+            if answer:
+                self.pending_answer_logs[judge_order_id] = (self.current_question_id, input_source, answer)
+            try:
+                output_events = await exam_graph.handle_message(
+                    {
+                        "type": ExamAFlow.EVENT_SUBMIT_FEEDBACK,
+                        "question_id": self.current_question_id,
+                        "question_sequence_id": self.current_question_sequence_id,
+                        "judge_order_id": judge_order_id,
+                        "answer": answer,
+                        "feedback": {"answer": answer},
+                    }
+                )
+            except Exception:
+                self.pending_answer_logs.pop(judge_order_id, None)
+                raise
             await self.push_output_events(output_events, direction)
             return
 
@@ -193,6 +213,7 @@ class InterviewServiceA(FrameProcessor):
 
         if isinstance(frame, EndFrame):
             await self.stop_exam_output_listener()
+            self.pending_answer_logs.clear()
             if self.exam_graph is not None:
                 try:
                     await self.exam_graph.handle_message({"type": ExamAFlow.EVENT_STOP})
@@ -381,6 +402,11 @@ class InterviewServiceA(FrameProcessor):
                 continue
 
             if event_type == "judged":
+                answer_log = self.pending_answer_logs.pop(event.get("judge_order_id"), None)
+                if answer_log is not None:
+                    question_id, input_source, answer = answer_log
+                    source_label = "文字输入" if input_source == "text" else "语音输入"
+                    logger.info("本轮问题回答完整文字 ({}，{}): {}", question_id, source_label, answer)
                 await self.push_frame(LLMTextFrame("AI口试结束思考"), direction)
                 continue
 
@@ -395,6 +421,7 @@ class InterviewServiceA(FrameProcessor):
                 continue
 
             if event_type == "analysis_error":
+                self.pending_answer_logs.pop(event.get("judge_order_id"), None)
                 error = str(event.get("error") or "JUDGING_FAILED")
                 content = f"回答判断失败：{error}"
                 await self.push_frame(LLMTextFrame(escape(content)), direction)

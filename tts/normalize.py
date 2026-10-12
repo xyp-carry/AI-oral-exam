@@ -16,7 +16,6 @@ def _decode_audio(payload: AudioPayload):
     encoding = payload.encoding
     sample_rate = payload.sample_rate
     channels = payload.channels
-    print(f"Decoding {encoding} audio with sample rate {sample_rate} and {channels} channels")
     if encoding == "wav":
         with wave.open(io.BytesIO(data), "rb") as wav:
             if wav.getcomptype() != "NONE":

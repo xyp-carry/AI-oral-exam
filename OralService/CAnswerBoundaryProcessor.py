@@ -43,6 +43,9 @@ class CAnswerBoundaryProcessor(FrameProcessor):
         self.current_question_id = ""
         self.active = False
         self.answer_buffer = ""
+        self.answer_full_text = ""
+        self.answer_sources: set[str] = set()
+        self.answer_logged = False
         self.question_started_at = 0.0
         self.answer_started_at = 0.0
         self.last_chunk_sent_at = 0.0
@@ -80,6 +83,9 @@ class CAnswerBoundaryProcessor(FrameProcessor):
                 self.current_question_id = frame.question_id
                 self.active = bool(frame.question_id)
                 self.answer_buffer = ""
+                self.answer_full_text = ""
+                self.answer_sources.clear()
+                self.answer_logged = False
                 self.question_started_at = monotonic()
                 self.answer_started_at = 0.0
                 self.last_chunk_sent_at = 0.0
@@ -106,6 +112,9 @@ class CAnswerBoundaryProcessor(FrameProcessor):
         self.current_question_id = ""
         self.active = False
         self.answer_buffer = ""
+        self.answer_full_text = ""
+        self.answer_sources.clear()
+        self.answer_logged = False
         self.answer_finish_confirming = False
 
     async def handle_input_message(self, frame: InputTransportMessageFrame) -> bool:
@@ -126,7 +135,8 @@ class CAnswerBoundaryProcessor(FrameProcessor):
             return True
         if event_type in {"user-stt", "answer_chunk", "answer_text", "user-text"}:
             text = str(data.get("text") or message.get("text") or "")
-            await self.receive_answer_delta(text, source="message")
+            source = "voice_message" if event_type == "user-stt" else "message"
+            await self.receive_answer_delta(text, source=source)
             if text.strip():
                 await self.handle_stt_segment_complete()
             return True
@@ -175,6 +185,8 @@ class CAnswerBoundaryProcessor(FrameProcessor):
             if self.answer_finished or not text.strip():
                 return
             self.answer_buffer += text
+            self.answer_full_text += text
+            self.answer_sources.add("voice" if source in {"local_stt", "voice_message"} else "text")
             if not self.answer_started_at:
                 self.answer_started_at = monotonic()
             self.has_answer_text = True
@@ -205,8 +217,10 @@ class CAnswerBoundaryProcessor(FrameProcessor):
                 return
             if text:
                 self.answer_buffer += text
+                self.answer_full_text += text
                 if text.strip():
                     self.has_answer_text = True
+                    self.answer_sources.add("text")
             if finished:
                 await self.finish_buffered_answer_locked("finish_confirmation_done")
                 return
@@ -225,9 +239,20 @@ class CAnswerBoundaryProcessor(FrameProcessor):
         self.answer_buffer = ""
         self.answer_finished = True
         self.answer_finish_confirming = False
+        answer_log = None
+        if not self.answer_logged:
+            source_label = (
+                "语音及文字输入" if len(self.answer_sources) > 1
+                else "语音输入" if "voice" in self.answer_sources
+                else "文字输入"
+            )
+            answer_log = (self.current_question_id, source_label, self.answer_full_text.strip())
+            self.answer_logged = True
         await self.emit(CAnswerEventFrame(
             kind="answer_end", question_id=self.current_question_id, text=text, reason=reason
         ))
+        if answer_log is not None:
+            logger.info("本轮问题回答完整文字 ({}，{}): {}", *answer_log)
 
     def reset_answer_idle_timer(self) -> None:
         self.cancel_answer_idle_timer()

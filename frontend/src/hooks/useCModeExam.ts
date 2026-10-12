@@ -51,9 +51,7 @@ export interface CModeConfirmPrompt {
 
 const POLL_INTERVAL_MS = 1500
 
-/** C 模式需要处理的后端事件类型（文档第 9 节）
- *  注意：answer_finish_confirmation_required 不在此列——B/C 模式都会收到该事件，
- *  由 Exam.tsx 统一注册 handler 后按模式分流（C 模式转发回本 hook 的 handleEvent） */
+/** C 模式需要处理的后端事件类型（文档第 9 节）；所有考试模式统一走此事件流 */
 export const C_MODE_EVENT_TYPES = [
   'question',
   'answer_received',
@@ -64,6 +62,7 @@ export const C_MODE_EVENT_TYPES = [
   'generated_question_ready',
   'followup_generation_error',
   'question_probe_completed',
+  'answer_finish_confirmation_required',
   'waiting',
   'error',
   'closed',
@@ -394,8 +393,6 @@ export function useCModeExam(params: {
     confirmPrompt,
     finalReport,
     examFinished,
-    /** 统一事件分发入口：供 Exam.tsx 将 answer_finish_confirmation_required 转发回 C 模式处理 */
-    handleEvent,
     start,
     sendAnswerChunk,
     sendAnswerEnd,
