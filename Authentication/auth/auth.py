@@ -104,11 +104,8 @@ def extract_token_from_cookie(request: Request) -> str | None:
 
 # ──────────────── 登录状态检查（依赖注入） ────────────────
 
-async def get_current_user(request: Request) -> dict:
-    """
-    FastAPI 依赖项：检查请求中的 Cookie，返回当前登录用户信息。
-    如果未登录或会话无效，抛出 401 异常。
-    """
+async def get_session_user(request: Request) -> dict:
+    """验证 Cookie 和会话；供待激活流程识别已验证密码的用户。"""
     token = extract_token_from_cookie(request)
     if not token:
         raise HTTPException(
@@ -127,7 +124,12 @@ async def get_current_user(request: Request) -> dict:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户不存在或已被禁用",
         )
-    
+    return user
+
+
+async def get_current_user(request: Request) -> dict:
+    """完整业务权限：会话有效且账号已经激活。"""
+    user = await get_session_user(request)
     if int(user.get("confirm_flag", 0) or 0) != 1:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

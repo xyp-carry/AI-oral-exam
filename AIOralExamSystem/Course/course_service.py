@@ -165,8 +165,9 @@ class CourseService:
             raise PermissionError("当前用户缺少 user_id")
         if not course_id:
             raise ValueError("course_id is required")
-
         if action == "create":
+            if int(current_user.get("confirm_flag", 0) or 0) != 1 and role not in cls.STUDENT_ROLES:
+                raise PermissionError("未激活账号仅学生可申请加入课程")
             request_id = await request_join_course(course_id=course_id, user_id=user_id)
             return {"request_id": request_id}
 

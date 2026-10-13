@@ -1,7 +1,6 @@
-# 构建后端镜像时不需要的内容
+# Docker 构建上下文中不需要的内容
 .git
 docker
-frontend
 node_modules
 **/__pycache__
 **/*.pyc

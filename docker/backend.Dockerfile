@@ -20,7 +20,8 @@ COPY requirements.txt .
 # cryptography: pymysql 连接 MySQL 8 的 caching_sha2_password 认证需要
 # email-validator: Authentication 中 pydantic EmailStr 需要
 # argon2-cffi: passlib 的 argon2 密码哈希需要
-RUN pip install -r requirements.txt \
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cu129 "torch==2.8.0+cu129" \
+    && python -m pip install --index-url https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt \
         cryptography \
         email-validator \
         argon2-cffi

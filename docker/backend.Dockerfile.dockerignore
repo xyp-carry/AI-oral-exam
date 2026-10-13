@@ -1,0 +1,14 @@
+# 后端镜像构建时排除前端和运行生成文件
+.git
+docker
+frontend
+node_modules
+**/__pycache__
+**/*.pyc
+.env
+*.pem
+updateFile
+exam_records
+mysql_data
+logs.md
+开发日志.md

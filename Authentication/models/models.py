@@ -4,7 +4,7 @@ models.py
 Pydantic 数据模型定义
 """
 
-from pydantic import BaseModel, EmailStr, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator
 import re
 
 
@@ -17,6 +17,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     role: str
     nickname: str | None = None
+    teacher_registration_code: str | None = Field(default=None, max_length=128)
 
     @field_validator("username")
     @classmethod

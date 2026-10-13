@@ -6,7 +6,8 @@ database.py
 """
 
 from datetime import datetime
-from typing import Optional
+import re
+from typing import Callable, Optional
 from urllib.parse import quote_plus
 from uuid import uuid4
 
@@ -28,15 +29,11 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase
 
 from Authentication.models import UserInfo
+from mysql_config import get_mysql_config
 
-MYSQL_CONFIG = {
-    "host": "127.0.0.1",
-    "port": 3306,
-    "user": "root",
-    "password": "123456",
-    "database": "ai_oral_exam_user",
-    "charset": "utf8mb4",
-}
+MYSQL_CONFIG = get_mysql_config(
+    database_env="MYSQL_AUTH_DATABASE", default_database="ai_oral_exam_user"
+)
 
 CREATE_USERS_TABLE = """
 CREATE TABLE IF NOT EXISTS users (
@@ -195,7 +192,52 @@ class UserDatabase:
             ).fetchone()
             return row is not None
 
-    def create_user(self, user: UserInfo, hashed_password: str) -> dict:
+    def ensure_admin_user(
+        self, username: str, password: Optional[str], hash_password: Callable[[str], str]
+    ) -> bool:
+        """Create the initial administrator without modifying existing accounts."""
+        with self._engine.begin() as connection:
+            existing_admin = connection.execute(
+                select(literal(1)).where(
+                    UserModel.role.in_(("admin", "administrator", "super_admin"))
+                ).limit(1)
+            ).fetchone()
+            if existing_admin is not None:
+                return False
+
+            if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", username):
+                raise ValueError("ADMIN_USERNAME 必须是 3-32 位字母、数字或下划线")
+            if password is None or not 12 <= len(password) <= 128:
+                raise ValueError("首次创建管理员前，须在 .env 设置 12-128 位的 ADMIN_PASSWORD")
+
+            email = f"{username}@local.invalid"
+            if connection.execute(
+                select(literal(1)).where(UserModel.username == username).limit(1)
+            ).fetchone() is not None:
+                raise RuntimeError(f"管理员用户名 '{username}' 已被其他账户占用")
+            if connection.execute(
+                select(literal(1)).where(UserModel.email == email).limit(1)
+            ).fetchone() is not None:
+                raise RuntimeError(f"管理员邮箱 '{email}' 已被其他账户占用")
+
+            connection.execute(
+                UserModel.__table__.insert().values(
+                    uuid=str(uuid4()),
+                    username=username,
+                    email=email,
+                    hashed_password=hash_password(password),
+                    nickname=username,
+                    role="admin",
+                    created_at=datetime.utcnow(),
+                    last_login=None,
+                    is_active=1,
+                    confirm_flag=1,
+                    login_count=0,
+                )
+            )
+        return True
+
+    def create_user(self, user: UserInfo, hashed_password: str, *, confirmed: bool = False) -> dict:
         user_uuid = str(uuid4())
         user_dict = {
             "uuid": user_uuid,
@@ -207,7 +249,7 @@ class UserDatabase:
             "created_at": datetime.utcnow(),
             "last_login": None,
             "is_active": True,
-            "confirm_flag": 0,
+            "confirm_flag": 1 if confirmed else 0,
             "login_count": 0,
         }
         with self._engine.begin() as connection:

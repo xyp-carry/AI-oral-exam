@@ -3,7 +3,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from AIOralExamSystem.Course import CourseService
-from Authentication.auth import get_current_user
+from Authentication.auth import get_current_user, get_session_user
 
 
 class CourseCreateRequest(BaseModel):
@@ -41,6 +41,7 @@ def raise_course_value_error(error: ValueError) -> None:
         "COURSE_NOT_FOUND": (404, "课程不存在"),
         "COURSE_ALREADY_JOINED": (400, "用户已加入该课程"),
         "USER_NOT_FOUND": (404, "用户不存在"),
+        "USER_DISABLED": (403, "账号已被禁用"),
         "USER_ROLE_UNSUPPORTED": (400, "用户身份不支持加入课程"),
         "EXAM_ITEM_NAME_EXISTS": (400, "考试项名称已存在"),
         "EXAM_ITEM_NAME_REQUIRED": (400, "考试项名称不能为空"),
@@ -131,7 +132,7 @@ def register_course_routes(app, args):
     @app.get("/courses/by_invite_code/{invite_code}")
     async def get_course_by_invite_code(
         invite_code: str,
-        current_user: dict = Depends(get_current_user),
+        current_user: dict = Depends(get_session_user),
     ):
         try:
             course = await CourseService.get_course_by_invite_code(invite_code)
@@ -182,7 +183,7 @@ def register_course_routes(app, args):
     @app.post("/courses/{course_id}/join_requests")
     async def create_course_join_request(
         course_id: str,
-        current_user: dict = Depends(get_current_user),
+        current_user: dict = Depends(get_session_user),
     ):
         try:
             result = await CourseService.manage_course_join_request(

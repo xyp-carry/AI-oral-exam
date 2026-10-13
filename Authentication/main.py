@@ -5,6 +5,10 @@ FastAPI 主应用：用户注册、登录、状态管理 API。
 端口：11024
 """
 
+import asyncio
+import os
+from contextlib import suppress
+
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import EmailStr
@@ -21,6 +25,7 @@ from Authentication.auth import (
     extract_token_from_cookie, get_current_user, get_optional_user,
 )
 from Authentication.database import db
+from Authentication.teacher_registration import FailedCodeLimiter, TeacherRegistrationCodeStore
 
 
 # ═══════════════════════════════════════════
@@ -32,6 +37,9 @@ def auth(app, args):
     #     description="基于 FastAPI 的完整用户认证与状态管理系统，支持注册、登录、Cookie 分发和会话管理。",
     #     version="1.0.0",
     # )
+    teacher_code_store = TeacherRegistrationCodeStore()
+    teacher_code_limiter = FailedCodeLimiter()
+
     origins = [
         "http://localhost:5173" ,  # 您的前端地址
         "http://127.0.0.1:5173" ,
@@ -54,12 +62,26 @@ def auth(app, args):
     @app.on_event("startup")
     async def startup_event():
         db.init_tables()
+        admin_username = os.getenv("ADMIN_USERNAME", "admin").strip()
+        if db.ensure_admin_user(admin_username, os.getenv("ADMIN_PASSWORD"), hash_password):
+            print(f"[DB] 已创建管理员账户: {admin_username}")
+        app.state.teacher_code_rotation_task = asyncio.create_task(
+            teacher_code_store.rotate_forever()
+        )
         print("\n" + "=" * 50)
         print("  🚀 用户状态管理系统已启动")
         print("  📍 访问地址: http://127.0.0.1:7860")
         print("  📖 API 文档: http://127.0.0.1:7860/docs")
         print("  🗄️ 数据库: MySQL")
         print("=" * 50 + "\n")
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        task = getattr(app.state, "teacher_code_rotation_task", None)
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 
     # ═══════════════════════════════════════════
@@ -104,13 +126,32 @@ def auth(app, args):
         status_code=status.HTTP_201_CREATED,
         tags=["认证"],
         summary="用户注册",
-        description="注册新用户，密码使用 bcrypt 加密存储。",
+        description="注册新用户；教师需提供注册码，验证通过后直接激活。",
         responses={
             400: {"description": "用户名或邮箱已存在 / 参数校验失败"},
+            403: {"description": "教师注册码无效或已过期"},
+            429: {"description": "教师注册码尝试过于频繁"},
             201: {"description": "注册成功"},
         },
     )
-    async def register(req: RegisterRequest):
+    async def register(req: RegisterRequest, request: Request):
+        if req.role == "teacher":
+            client = request.client.host if request.client else "unknown"
+            retry_after = teacher_code_limiter.retry_after(client)
+            if retry_after:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="教师注册码尝试过于频繁，请稍后重试",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            if not teacher_code_store.verify(req.teacher_registration_code):
+                teacher_code_limiter.record_failure(client)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="教师注册码无效或已过期",
+                )
+            teacher_code_limiter.clear(client)
+
         # 1️⃣ 检查用户名是否已存在
         if db.user_exists(req.username):
             raise HTTPException(
@@ -130,11 +171,17 @@ def auth(app, args):
         hashed_pw = hash_password(req.password)
 
         # 4️⃣ 存储用户
-        user_info = db.create_user(
+        db.create_user(
             user=req,
             hashed_password=hashed_pw,
+            confirmed=req.role == "teacher",
         )
 
+        if req.role == "teacher":
+            return MessageResponse(
+                message=f"教师注册成功，账号已激活：{req.nickname or req.username}",
+                success=True,
+            )
         return MessageResponse(
             message=f"注册成功，账号需要激活后才能登录：{req.nickname or req.username}",
             success=True,
@@ -153,10 +200,11 @@ def auth(app, args):
         response_model=MessageResponse,
         tags=["认证"],
         summary="用户登录",
-        description="验证用户名和密码，成功后通过 Cookie 分发会话。",
+        description="验证用户名和密码后分发会话 Cookie；未激活账号仅可申请加入课程。",
         responses={
             401: {"description": "用户名或密码错误"},
-            200: {"description": "登录成功"},
+            403: {"description": "账号已被禁用"},
+            200: {"description": "登录成功或账号待激活"},
         },
     )
     async def login(req: LoginRequest, response: Response):
@@ -182,13 +230,7 @@ def auth(app, args):
                 detail="账号已被禁用，请联系管理员",
             )
 
-        # 4️⃣ 生成会话 Token 并存储
-        if int(user.get("confirm_flag", 0) or 0) != 1:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={"code": "NEED_ACTIVATION", "message": "账号需要激活后才能登录"},
-            )
-
+        # 密码正确即可获得会话；未激活会话仅能访问待激活流程。
         session_token = generate_session_token()
         max_age = 30 * 24 * 3600 if req.remember_me else 3600
         db.create_session(
@@ -206,6 +248,13 @@ def auth(app, args):
 
         # 6️⃣ 设置 Cookie
         set_auth_cookie(response, session_token, remember_me=req.remember_me)
+
+        if int(user.get("confirm_flag", 0) or 0) != 1:
+            return MessageResponse(
+                message="账号未激活，暂无法登录；可输入课程邀请码并等待教师审核",
+                success=False,
+                code="NEED_ACTIVATION",
+            )
 
         remember_msg = "（已记住登录状态 30 天）" if req.remember_me else "（会话有效期 1 小时）"
         return MessageResponse(
@@ -261,6 +310,17 @@ def auth(app, args):
             login_count=current_user.get("login_count", 0),
             role=current_user["role"],
         )
+
+    @app.get("/admin/teacher-registration-code", tags=["管理"])
+    async def get_teacher_registration_code(
+        response: Response,
+        current_user: dict = Depends(get_current_user),
+    ):
+        role = str(current_user.get("role") or "").strip().lower()
+        if role not in {"admin", "administrator", "super_admin"}:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅管理员可查看教师注册码")
+        response.headers["Cache-Control"] = "no-store"
+        return teacher_code_store.snapshot()
 
 
     # ═══════════════════════════════════════════

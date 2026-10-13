@@ -5,14 +5,23 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
-from sqlalchemy import exists, func, literal, select, update
+from sqlalchemy import exists, func, literal, select, text, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-from .connection import ensure_database, get_engine, mysql_error_code
+from mysql_config import get_mysql_config
+
+from .connection import ensure_database, get_engine, mysql_error_code, quote_identifier
 from .exam_repository import create_pending_exam_sessions_for_user
 from .models import Course, CourseJoinRequest, CourseStudent, CourseTeacher
 from .schema import ensure_tables
 from .serializers import course_row_to_dict, join_request_row_to_dict
+
+_AUTH_USERS_TABLE = (
+    quote_identifier(get_mysql_config(
+        database_env="MYSQL_AUTH_DATABASE", default_database="ai_oral_exam_user"
+    )["database"])
+    + ".`users`"
+)
 
 _COURSE_COLUMNS = (
     Course.course_id,
@@ -543,6 +552,33 @@ def _list_course_join_requests_sync(
         return [join_request_row_to_dict(row) for row in rows]
 
 
+def _lock_join_request_user(connection, user_id: str, expected_role: str) -> bool:
+    """Lock the auth row on the same MySQL transaction as course approval."""
+    row = connection.execute(
+        text(
+            f"SELECT role, is_active, confirm_flag FROM {_AUTH_USERS_TABLE} "
+            "WHERE uuid = :user_id FOR UPDATE"
+        ),
+        {"user_id": user_id},
+    ).mappings().first()
+    if row is None:
+        raise ValueError("USER_NOT_FOUND")
+    if not row["is_active"]:
+        raise ValueError("USER_DISABLED")
+    role = str(row["role"] or "").strip().lower()
+    allowed_roles = {"student", "candidate", ""} if expected_role == "student" else {"teacher", "instructor"}
+    if role not in allowed_roles:
+        raise ValueError("USER_ROLE_UNSUPPORTED")
+    return expected_role == "student" and int(row["confirm_flag"] or 0) != 1
+
+
+def _activate_student(connection, user_id: str) -> None:
+    connection.execute(
+        text(f"UPDATE {_AUTH_USERS_TABLE} SET confirm_flag = 1 WHERE uuid = :user_id"),
+        {"user_id": user_id},
+    )
+
+
 def _approve_course_join_request_by_user_sync(
     course_id: str,
     user_id: str,
@@ -568,6 +604,20 @@ def _approve_course_join_request_by_user_sync(
         if row is None:
             return None
         request_id = row[0]
+
+        reviewer = connection.execute(
+            select(CourseTeacher.id)
+            .where(
+                CourseTeacher.course_id == course_id,
+                CourseTeacher.teacher_id == reviewer_id,
+                CourseTeacher.status == "active",
+            )
+            .limit(1)
+        ).fetchone()
+        if reviewer is None:
+            raise PermissionError("审批教师不是该课程的有效教师")
+
+        needs_activation = _lock_join_request_user(connection, user_id, user_role)
 
         _raise_if_active_course_member_exists(connection, course_id, user_id)
 
@@ -616,6 +666,8 @@ def _approve_course_join_request_by_user_sync(
                 reviewed_by=reviewer_id,
             )
         )
+        if needs_activation:
+            _activate_student(connection, user_id)
     return {
         "request_id": request_id,
         "course_id": course_id,
@@ -647,6 +699,10 @@ def _review_join_request_sync(request_id: str, teacher_id: str, target_status: s
             return False
         course_id, user_id = row
 
+        needs_activation = False
+        if target_status == "approved":
+            needs_activation = _lock_join_request_user(connection, user_id, "student")
+
         connection.execute(
             update(CourseJoinRequest)
             .where(CourseJoinRequest.request_id == request_id)
@@ -670,4 +726,6 @@ def _review_join_request_sync(request_id: str, teacher_id: str, target_status: s
                 )
             )
             create_pending_exam_sessions_for_user(connection, course_id, user_id)
+            if needs_activation:
+                _activate_student(connection, user_id)
     return True

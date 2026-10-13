@@ -1,6 +1,3 @@
-# CUDA 12.9 wheel index for the project's existing PyTorch build.
---extra-index-url https://download.pytorch.org/whl/cu129
-
 aiofiles==25.1.0
 aiohttp==3.13.4
 bleach==6.3.0
@@ -21,7 +18,8 @@ numpy==2.4.4
 onnx==1.21.0
 onnxruntime==1.23.2
 passlib==1.7.4
-pipecat-ai[runner]==0.0.108
+pipecat-ai[webrtc]
+pipecat-ai[daily]
 pipecat-ai-small-webrtc-prebuilt==2.4.0
 pydantic==2.13.4
 pydantic-settings==2.14.1
@@ -31,7 +29,6 @@ python-multipart
 PyYAML==6.0.3
 requests==2.34.0
 scipy
-torch==2.8.0+cu129
 uvicorn==0.46.0
 websockets==15.0.1
 sqlalchemy==2.0.43
